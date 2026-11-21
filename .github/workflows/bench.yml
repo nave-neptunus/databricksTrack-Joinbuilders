@@ -17,9 +17,7 @@ jobs:
       matrix:
         include:
           - { label: baseline, ref: ed40599 }
-          - { label: io-pfd, ref: 603a066 }
-          - { label: io-fuse, ref: 74d051a }
-          - { label: core-runpath, ref: ec7479b }
+          - { label: core-purchase, ref: 88a2088 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -67,14 +65,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { label: core-purchase, candidate_ref: 88a2088, image: core-purchase, setting: '', run_tests: 'true', pairs: '8' }
           # XL_ENDREL=1 is default conditional behavior; 2 actually forces release.
-          - { label: io-pfd-default, candidate_ref: 603a066, image: io-pfd, setting: '', pairs: '8' }
-          - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0, pairs: '8' }
-          - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048, pairs: '8' }
-          - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096, pairs: '8' }
           # 5f08834 only fixes test data; 74d051a is the identical engine timed below.
-          - { label: io-fuse, candidate_ref: 74d051a, test_ref: 5f08834, image: io-fuse, setting: '', run_tests: 'true', pairs: '8' }
-          - { label: core-runpath, candidate_ref: ec7479b, image: core-runpath, setting: '', run_tests: 'true', pairs: '8' }
     env:
       BASELINE_REF: ${{ matrix.baseline_ref || 'ed40599' }}
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
