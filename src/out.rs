@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn die(what: &str) -> ! {
     eprintln!("[v2b] write error: {what}");
-    unsafe { sys::_exit(1) }
+    unsafe { sys::exit(1) }
 }
 
 #[derive(Clone, Copy)]
@@ -298,7 +298,7 @@ fn write_campaign(g: &G, dir: &Path) {
         eprintln!("[v2b] check: sessions user={us} campaign={cs} revenue user={ur} campaign={cr} assisted={ca} credited_non_organic={}", cs - organic);
         if us != cs || ur != cr || ca < cs - organic {
             eprintln!("[v2b] CHECK FAILED");
-            unsafe { sys::_exit(5) }
+            unsafe { sys::exit(5) }
         }
     }
 }
@@ -609,7 +609,7 @@ pub fn stage45(g: &mut G, outdir: &str) {
         eprintln!("[v2b] check: sessions user={us} campaign={cs} revenue user={ur} campaign={cr} assisted={ca} credited_non_organic={}", cs - organic);
         if us != cs || ur != cr || ca < cs - organic {
             eprintln!("[v2b] CHECK FAILED");
-            unsafe { sys::_exit(5) }
+            unsafe { sys::exit(5) }
         }
     }
 }

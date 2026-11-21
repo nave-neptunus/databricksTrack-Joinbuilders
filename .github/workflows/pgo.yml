@@ -38,8 +38,9 @@ jobs:
         run: |
           mkdir -p "$PROFILE_DIR"
           export RUSTFLAGS='-C target-cpu=cascadelake -C relocation-model=static -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -Cprofile-generate='"$PROFILE_DIR"
-          cargo build --release --locked --features testkeys --target x86_64-unknown-linux-musl
+          cargo build --release --locked --features testkeys,pgo --target x86_64-unknown-linux-musl
           cp target/x86_64-unknown-linux-musl/release/pipeline "$HOME/pipeline-pgo"
+          unset RUSTFLAGS
           cargo build --release --locked --manifest-path fallback/Cargo.toml --target x86_64-unknown-linux-gnu
           sudo install -m 0755 fallback/target/x86_64-unknown-linux-gnu/release/pipeline /fallback
       - name: Derive deterministic corpus keys
@@ -85,6 +86,9 @@ jobs:
           LLVM_PROFDATA="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
           test -x "$LLVM_PROFDATA"
           "$LLVM_PROFDATA" merge --failure-mode=all -o pgo/fast.profdata "$PROFILE_DIR"/*.profraw
+          "$LLVM_PROFDATA" show --all-functions pgo/fast.profdata > pgo/fast.functions
+          grep -q 'ev_vec' pgo/fast.functions
+          grep -q 'stage1' pgo/fast.functions
           ls -lh pgo/fast.profdata
       - name: Build profile-use image
         if: hashFiles('pgo/fast.profdata') != ''
