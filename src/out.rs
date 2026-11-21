@@ -203,7 +203,7 @@ fn write_rows(v: &View, a: usize, b: usize, path: &Path, cats_off: &[u32], cats_
         ]
     };
     let opts = if RPG == 0 { Opts::default() } else { Opts { rows_per_group: RPG } };
-    if write_file(path, &cols, &opts, Method::Stream(1 << 20)).is_err() {
+    if write_file(path, &cols, &opts, Method::Stream(STREAM_BUF)).is_err() {
         die("user_daily");
     }
 }
@@ -458,6 +458,7 @@ fn cut(rows: &[(usize, usize)], np: usize) -> Vec<(usize, usize, usize)> {
 }
 
 const RPG: usize = crate::env_u32(option_env!("XL_RPG_DEF"), 0) as usize;
+const STREAM_BUF: usize = 4 << 20;
 
 fn cut_guided(rows: &[(usize, usize)], nt: usize) -> Vec<(usize, usize, usize)> {
     let total: usize = rows.iter().map(|&(a, b)| b - a).sum();
