@@ -1447,6 +1447,14 @@ fn campaign_number(c: &[u8]) -> Option<usize> {
     if d.is_empty() || d.len() > 9 || (d[0] == b'0' && d.len() > 1) {
         return None;
     }
+    if let &[a, b, c, d] = d {
+        let digits = u32::from_le_bytes([a, b, c, d]) ^ 0x3030_3030;
+        if (digits | digits.wrapping_add(0x0606_0606)) & 0xf0f0_f0f0 != 0 {
+            return None;
+        }
+        let pairs = (digits * 10 + (digits >> 8)) & 0x00ff_00ff;
+        return Some((pairs.wrapping_mul(0x0064_0001) >> 16) as usize);
+    }
     let mut n = 0usize;
     for &b in d {
         let x = b.wrapping_sub(b'0');
@@ -1487,12 +1495,6 @@ impl Click {
             std::slice::from_raw_parts(ptr, len)
         }
     }
-}
-
-struct PendingClick {
-    click: Click,
-    key: u64,
-    check: u32,
 }
 
 #[derive(Default)]
@@ -2100,19 +2102,18 @@ fn fast(seed: u64, nova: bool) -> bool {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
             let mut dates = nova::Dates::default();
-            let mut batch = Vec::with_capacity(16);
-            let mut flush = |batch: &mut Vec<PendingClick>| {
-                for PendingClick { mut click, key, check } in batch.drain(..) {
-                    // A user id not in the table has no valid event, so no session to credit.
-                    let Some(person) = users.find(key, check, &coll) else { continue };
-                    click.person = person;
-                    acc.push(click);
-                }
-            };
             clicks::rows(chunk, |[cid, user, cmp, ts]| {
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }
+                let (key, check) = if nova {
+                    // A supported link or event user always has a short key.
+                    let Some(key) = nova::user_key(user) else { return };
+                    (key, 0)
+                } else {
+                    hs(user, seed)
+                };
+                users.prefetch(key);
                 let Some(campaign) = campaign_of(cmp) else { return };
                 let ts = match dates.parse(ts) {
                     Some(t) if t >= click_start && t < w1 => (t - click_start) as u32,
@@ -2122,22 +2123,11 @@ fn fast(seed: u64, nova: bool) -> bool {
                 if ptr >> 48 != 0 {
                     coll.store(true, Relaxed);
                     return;
-                };
-                let (key, check) = if nova {
-                    // A supported link or event user always has a short key.
-                    let Some(key) = nova::user_key(user) else { return };
-                    (key, 0)
-                } else {
-                    hs(user, seed)
-                };
-                users.prefetch(key);
-                let tag = ptr | (u64::from(campaign) << 48);
-                batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
-                if batch.len() == 16 {
-                    flush(&mut batch);
                 }
+                let Some(person) = users.find(key, check, &coll) else { return };
+                let tag = ptr | (u64::from(campaign) << 48);
+                acc.push(Click { tag, person, ts });
             });
-            flush(&mut batch);
             acc
         },
     );
