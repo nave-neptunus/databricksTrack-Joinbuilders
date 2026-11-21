@@ -39,13 +39,12 @@ pub struct Part {
     blk: *mut u8,
     blk_end: *mut u8,
     popw: bool,
-    pend: Vec<Line>,
 }
 const NOCHUNK: usize = LINK_OFF;
 unsafe impl Send for Part {}
 impl Part {
     pub fn empty() -> Part {
-        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new() }
+        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false }
     }
     pub fn new_unbound(nb: usize) -> Part {
         Part::build(std::ptr::null(), nb)
@@ -68,7 +67,6 @@ impl Part {
             blk: std::ptr::null_mut(),
             blk_end: std::ptr::null_mut(),
             popw: popw(),
-            pend: vec![Line([0; 8]); 72],
         }
     }
     #[inline(always)]
@@ -93,74 +91,66 @@ impl Part {
     #[inline(always)]
     pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
         use std::arch::x86_64::*;
+        debug_assert!((m & (if n >= 64 { !0 } else { (1u64 << n) - 1 })) == m);
         let fill = self.fill.as_mut_ptr();
-        let full = self.pend.as_mut_ptr() as *mut u64;
-        let mut fp = full;
+        if m != 0 {
+            let first = m.trailing_zeros() as usize;
+            let b = *ob.add(first) as usize;
+            let mut q = m & (m - 1);
+            while q != 0 && *ob.add(q.trailing_zeros() as usize) as usize == b {
+                q &= q - 1;
+            }
+            if q == 0 {
+                let l = *lp.add(first) as *mut u8;
+                let mut f = *fill.add(b) as usize;
+                let mut q = m;
+                while q != 0 {
+                    let i = q.trailing_zeros() as usize;
+                    q &= q - 1;
+                    _mm_store_si128(l.add(f) as *mut __m128i, _mm_load_si128(rec.add(i) as *const __m128i));
+                    f += 16;
+                    if f == 64 {
+                        self.flush(b, l as *mut u64);
+                        f = 0;
+                    }
+                }
+                *fill.add(b) = f as u8;
+                return;
+            }
+        }
+
+        let mut last = usize::MAX;
+        let mut l = std::ptr::null_mut();
+        let mut f = 0usize;
         macro_rules! row {
             ($i:expr) => {{
                 let i = $i;
-                let l = *lp.add(i) as *mut u8;
                 let b = *ob.add(i) as usize;
-                let mut f = *fill.add(b) as usize;
-                if f == 64 {
-                    self.flush_full(full, fp.offset_from(full) as usize);
-                    fp = full;
-                    f = 0;
+                if b != last {
+                    if last != usize::MAX {
+                        *fill.add(last) = f as u8;
+                    }
+                    last = b;
+                    l = *lp.add(i) as *mut u8;
+                    f = *fill.add(b) as usize;
                 }
                 _mm_store_si128(l.add(f) as *mut __m128i, _mm_load_si128(rec.add(i) as *const __m128i));
-                let t = f + 16;
-                *fill.add(b) = t as u8;
-                *fp = b as u64;
-                fp = fp.add(t >> 6);
-            }};
-        }
-        if m == (if n >= 64 { !0 } else { (1u64 << n) - 1 }) {
-            for i in 0..n {
-                row!(i);
-            }
-        } else {
-            let mut m = m;
-            while m != 0 {
-                let i = m.trailing_zeros() as usize;
-                m &= m - 1;
-                row!(i);
-            }
-        }
-        self.flush_lines(full, fp.offset_from(full) as usize);
-    }
-    #[inline(always)]
-    unsafe fn flush_lines(&mut self, full: *const u64, k: usize) {
-        const _: () = assert!(LINK_OFF + 64 == CHUNK);
-        let cur = self.cur.as_mut_ptr();
-        let fill = self.fill.as_mut_ptr();
-        let lines = self.lines.as_ptr() as *const u8;
-        macro_rules! flush {
-            ($nt:literal) => {{
-                let mut j = 0;
-                while j != k {
-                    let b = *full.add(j) as usize;
-                    let cp = cur.add(b);
-                    let mut c = *cp;
-                    if (c as usize).wrapping_add(64) & (CHUNK - 1) == 0 {
-                        c = self.new_chunk(b, c);
-                    }
-                    line_out::<$nt>(c as *mut u8, lines.add(64 * b));
-                    *cp = c.add(8);
-                    *fill.add(b) = 0;
-                    j += 1;
+                f += 16;
+                if f == 64 {
+                    self.flush(b, l as *mut u64);
+                    f = 0;
                 }
             }};
         }
-        if NT {
-            flush!(true)
-        } else {
-            flush!(false)
+        let mut m = m;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            row!(i);
         }
-    }
-    #[cold]
-    #[inline(never)]
-    unsafe fn flush_full(&mut self, full: *const u64, k: usize) {
-        self.flush_lines(full, k)
+        if last != usize::MAX {
+            *fill.add(last) = f as u8;
+        }
     }
     #[inline(always)]
     unsafe fn flush(&mut self, b: usize, l: *mut u64) {
@@ -1765,6 +1755,44 @@ mod tests {
                 assert_eq!(v1, v2, "nb {nb} b {b}");
                 assert_eq!(v1.len(), p1.count(b));
             }
+        }
+    }
+
+    #[test]
+    fn push_many_matches_push_on_runs_edges_and_partials() {
+        let mut r = Rng(0x51A7_EBAD_F00D_1234);
+        let a1 = Arena::new(64 << 20);
+        let a2 = Arena::new(64 << 20);
+        let mut p1 = Part::new(&a1, 7);
+        let mut p2 = Part::new(&a2, 7);
+        let mut out = Out::new();
+        for round in 0..2000 {
+            let n = 1 + r.below(64) as usize;
+            let b = r.below(7);
+            let mut m = 0u64;
+            for i in 0..n {
+                out.ob[i] = if round % 3 != 0 || i < n.saturating_sub(3) { b } else { r.below(7) };
+                out.lp[i] = p2.lines_ptr() as u64 + 64 * out.ob[i];
+                out.rec[i] = [r.next(), r.next()];
+                if round % 5 == 0 { m |= 1 << i; } else if r.below(4) != 0 { m |= 1 << i; }
+            }
+            let mut mm = m;
+            while mm != 0 {
+                let i = mm.trailing_zeros() as usize;
+                mm &= mm - 1;
+                p1.push(out.ob[i] as usize, out.rec[i][0], out.rec[i][1]);
+            }
+            unsafe { p2.push_many(m, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
+        }
+        p1.finish();
+        p2.finish();
+        for b in 0..7 {
+            let mut v1 = Vec::new();
+            let mut v2 = Vec::new();
+            p1.for_each(b, |c| v1.extend(c.iter().map(|x| (x.w0, x.w1))));
+            p2.for_each(b, |c| v2.extend(c.iter().map(|x| (x.w0, x.w1))));
+            assert_eq!(v1, v2, "bucket {b}");
+            assert_eq!(p1.count(b), p2.count(b));
         }
     }
 }
