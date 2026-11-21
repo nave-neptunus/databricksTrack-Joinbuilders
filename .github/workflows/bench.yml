@@ -105,9 +105,11 @@ jobs:
           final_engine=$(sed -n 's/.*exit at \([0-9.]*\) ms.*/\1/p' "$work/final.stderr" | tail -1)
           final_rss=$(sed -n 's/.*peak_rss_kb=\([0-9]*\).*/\1/p' "$work/final.stderr" | tail -1)
           test -n "$final_engine"; test -n "$final_rss"
-          # Scratch image has no /bin/true. The fast binary on an empty input is
-          # the requested trivial-entrypoint proxy and must exit cleanly.
-          empty="$work/empty-input"; mkdir -p "$empty"
+          # Scratch image has no /bin/true. Supply only the mandatory lookup
+          # files and empty event/click/link directories as the clean proxy.
+          empty="$work/empty-input"; mkdir -p "$empty/events" "$empty/clicks" "$empty/links"
+          cp "$HOME/big20/products.csv" "$empty/products.csv"
+          cp "$HOME/big20/campaigns.csv" "$empty/campaigns.csv"
           begin=$(date +%s%N); docker_run /pipeline "$empty" "$work/empty-out" "$work/empty-scratch" "$work/empty.stderr"; end=$(date +%s%N)
           empty_s=$(seconds "$begin" "$end")
           find "$HOME/big20" -type f -exec cat {} + >/dev/null
