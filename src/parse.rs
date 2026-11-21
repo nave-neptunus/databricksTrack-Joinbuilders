@@ -515,21 +515,23 @@ impl<'a> Ctx<'a> {
         }
         let g = self.g;
         let p = EvP { ing_base: g.ing_base, ws: g.ws, wlen: g.wlen, ukey: g.ukey, ekey: g.ekey, ucap: g.ucap, ecap: g.ecap, ptab: self.tabs.prod.as_ptr(), lines: self.t.ev.lines_ptr() };
+        let stage = unsafe { SKIP } & 2048 != 0;
         let (okb, spb, bad) = unsafe {
             if (TS_BAD.wrapping_sub(p.ing_base) as u64) >= ING_MAX * 1000 {
-                ev_vec::<false>(&*self.eb, &mut *self.out, n, &p)
+                if stage { ev_vec::<false, true>(&*self.eb, &mut *self.out, &mut self.t.ev, n, &p) } else { ev_vec::<false, false>(&*self.eb, &mut *self.out, &mut self.t.ev, n, &p) }
+            } else if stage {
+                ev_vec::<true, true>(&*self.eb, &mut *self.out, &mut self.t.ev, n, &p)
             } else {
-                ev_vec::<true>(&*self.eb, &mut *self.out, n, &p)
+                ev_vec::<true, false>(&*self.eb, &mut *self.out, &mut self.t.ev, n, &p)
             }
         };
         if bad {
             fallback("ingest_ts bad or out of range");
         }
-        if unsafe { SKIP } & 2048 != 0 {
+        if stage {
             self.t.prof[7] = self.t.prof[7].wrapping_add(okb ^ spb ^ self.out.rec[3][0] ^ self.out.rec[5][1] ^ self.out.ob[7]);
             return;
         }
-        unsafe { self.t.ev.push_many(okb, n, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -609,13 +611,12 @@ impl<'a> Ctx<'a> {
         let p = CkP { cbase: g.cbase, clen: g.clen, ukey: g.ukey, ucap: g.ucap, ckey: g.ckey, ccap: g.ccap, ctab: self.tabs.camp.as_ptr(), crange: self.tabs.crange, lines: self.t.us.lines_ptr() };
         let (okb, spb) = unsafe {
             match (p.crange.is_some(), p.ccap != 0) {
-                (true, false) => ck_vec::<true, false>(&*self.cb, &mut *self.out, n, &p),
-                (false, false) => ck_vec::<false, false>(&*self.cb, &mut *self.out, n, &p),
-                (true, true) => ck_vec::<true, true>(&*self.cb, &mut *self.out, n, &p),
-                (false, true) => ck_vec::<false, true>(&*self.cb, &mut *self.out, n, &p),
+                (true, false) => ck_vec::<true, false, false>(&*self.cb, &mut *self.out, &mut self.t.us, n, &p),
+                (false, false) => ck_vec::<false, false, false>(&*self.cb, &mut *self.out, &mut self.t.us, n, &p),
+                (true, true) => ck_vec::<true, true, false>(&*self.cb, &mut *self.out, &mut self.t.us, n, &p),
+                (false, true) => ck_vec::<false, true, false>(&*self.cb, &mut *self.out, &mut self.t.us, n, &p),
             }
         };
-        unsafe { self.t.us.push_many(okb, n, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -639,7 +640,7 @@ struct EvP {
 }
 
 #[inline(always)]
-unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool) {
+unsafe fn ev_vec<const TSB: bool, const STAGE: bool>(eb: &EvBatch, out: &mut Out, part: &mut Part, n: usize, p: &EvP) -> (u64, u64, bool) {
     use std::arch::x86_64::*;
     let mut mk = [[0u8; 16]; 3];
     let s = |v: u64| _mm256_set1_epi64x(v as i64);
@@ -710,10 +711,29 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
         let w1v = _mm256_or_si256(_mm256_and_si256(v, slotm), _mm256_or_si256(_mm256_slli_epi64::<16>(ing_s), _mm256_slli_epi64::<37>(userv)));
         let ok = kandn(kandn(normal, valid), evok);
         let bv = _mm256_srli_epi64::<{ BB as i32 }>(v);
-        st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_lo, w1v));
-        st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_hi, w1v));
-        st4::<OB>(outp, j, bv);
-        st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
+        if STAGE {
+            st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_lo, w1v));
+            st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_hi, w1v));
+            st4::<OB>(outp, j, bv);
+            st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
+        } else {
+            macro_rules! push {
+                ($i:literal) => {
+                    if ok & (1 << $i) != 0 {
+                        let mut w0 = _mm256_extract_epi64::<$i>(w0v) as u64;
+                        if pm & (1 << $i) != 0 {
+                            let prod = (*eb.pp.get_unchecked(j + $i) as u32 as usize).min(PBOUND);
+                            w0 |= (*p.ptab.add(prod) as u64) << 4;
+                        }
+                        part.push(_mm256_extract_epi64::<$i>(bv) as usize, w0, _mm256_extract_epi64::<$i>(w1v) as u64);
+                    }
+                };
+            }
+            push!(0);
+            push!(1);
+            push!(2);
+            push!(3);
+        }
         kst(mk[0].as_mut_ptr(), g, bad);
         kst(mk[1].as_mut_ptr(), g, pm);
         kst(mk[2].as_mut_ptr(), g, ok);
@@ -724,12 +744,14 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
     let badb = mask64(&mk[0]);
     let okb = mask64(&mk[2]) & nm;
     let spb = !okb & nm;
-    let mut pmb = mask64(&mk[1]) & nm;
-    while pmb != 0 {
-        let i = pmb.trailing_zeros() as usize;
-        pmb &= pmb - 1;
-        let prod = (*eb.pp.get_unchecked(i) as u32 as usize).min(PBOUND);
-        out.rec.get_unchecked_mut(i)[0] |= (*p.ptab.add(prod) as u64) << 4;
+    if STAGE {
+        let mut pmb = mask64(&mk[1]) & nm;
+        while pmb != 0 {
+            let i = pmb.trailing_zeros() as usize;
+            pmb &= pmb - 1;
+            let prod = (*eb.pp.get_unchecked(i) as u32 as usize).min(PBOUND);
+            out.rec.get_unchecked_mut(i)[0] |= (*p.ptab.add(prod) as u64) << 4;
+        }
     }
     (okb, spb, badb & nm != 0)
 }
@@ -747,7 +769,7 @@ struct CkP {
 }
 
 #[inline(always)]
-unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut Out, n: usize, p: &CkP) -> (u64, u64) {
+unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool, const STAGE: bool>(cb: &CkBatch, out: &mut Out, part: &mut Part, n: usize, p: &CkP) -> (u64, u64) {
     use std::arch::x86_64::*;
     let mut mk = [[0u8; 16]; 2];
     let s = |v: u64| _mm256_set1_epi64x(v as i64);
@@ -811,10 +833,24 @@ unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool>(cb: &CkBatch, out: &mut
         let o0 = _mm256_or_si256(idw, _mm256_slli_epi64::<43>(_mm256_and_si256(u, ulo)));
         let o1 = _mm256_or_si256(key, alias);
         let bv = _mm256_srli_epi64::<{ UB as i32 }>(u);
-        st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, o1));
-        st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, o1));
-        st4::<OB>(outp, j, bv);
-        st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
+        if STAGE {
+            st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, o1));
+            st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, o1));
+            st4::<OB>(outp, j, bv);
+            st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
+        } else {
+            macro_rules! push {
+                ($i:literal) => {
+                    if ok & (1 << $i) != 0 {
+                        part.push(_mm256_extract_epi64::<$i>(bv) as usize, _mm256_extract_epi64::<$i>(o0) as u64, _mm256_extract_epi64::<$i>(o1) as u64);
+                    }
+                };
+            }
+            push!(0);
+            push!(1);
+            push!(2);
+            push!(3);
+        }
         kst(mk[0].as_mut_ptr(), g, ok);
         kst(mk[1].as_mut_ptr(), g, keep);
         j += 4;
