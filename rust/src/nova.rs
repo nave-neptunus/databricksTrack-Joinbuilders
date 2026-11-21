@@ -108,7 +108,7 @@ fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec
 
 /// A producer owns disjoint blocks within demand-paged slabs. Stream order is
 /// described by its block IDs. No initialized record moves when a stream grows.
-struct Streams<T, const N: usize> {
+pub(super) struct Streams<T, const N: usize> {
     slabs: Vec<memmap2::MmapMut>,
     blocks: [Vec<u32>; N],
     tails: [*mut T; N],
@@ -125,7 +125,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     const ROWS: usize = BLOCK_BYTES / size_of::<T>();
     const SLAB_BLOCKS: usize = SLAB_BYTES / BLOCK_BYTES;
 
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             slabs: Vec::new(),
             blocks: std::array::from_fn(|_| Vec::new()),
@@ -155,7 +155,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     }
 
     #[inline]
-    fn push(&mut self, stream: usize, row: T) {
+    pub(super) fn push(&mut self, stream: usize, row: T) {
         if self.used[stream] == Self::ROWS {
             self.extend(stream);
         }
@@ -180,7 +180,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         }
     }
 
-    fn chunks(&self, stream: usize) -> impl Iterator<Item = &[T]> {
+    pub(super) fn chunks(&self, stream: usize) -> impl Iterator<Item = &[T]> {
         let block_ids = &self.blocks[stream];
         block_ids.iter().enumerate().map(move |(i, &id)| {
             let id = id as usize;
@@ -197,7 +197,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         })
     }
 
-    fn len(&self, stream: usize) -> usize {
+    pub(super) fn len(&self, stream: usize) -> usize {
         let blocks = self.blocks[stream].len();
         if blocks == 0 {
             0
@@ -708,6 +708,7 @@ struct Router {
     bases: Vec<usize>,
     hash_ns: u64,
     scatter_ns: u64,
+    table_percent: usize,
 }
 
 impl Router {
@@ -719,6 +720,7 @@ impl Router {
             bases: Vec::new(),
             hash_ns: 0,
             scatter_ns: 0,
+            table_percent: std::env::var("BREAKER_TABLE_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(110),
         }
     }
 
@@ -741,7 +743,7 @@ impl Router {
             return None;
         }
         let shift = stride.trailing_zeros();
-        let mask = (count * 2).next_power_of_two() - 1;
+        let mask = (count * self.table_percent / 100).next_power_of_two() - 1;
         self.winners.clear();
         self.winners.resize(mask + 1, 0);
         self.losers.clear();

@@ -1416,10 +1416,10 @@ mod single_scatter_tests {
     #[test]
     fn later_duplicate_with_different_person_is_tombstoned() {
         let mut folds = [EventFold::new(0), EventFold::new(0)];
-        copy(&mut folds[0], 2, Some(1000));
+        copy(&mut folds[0], 2, Some(P - 1));
         copy(&mut folds[1], 1, Some(1));
         dedup(&folds);
-        assert!(folds[0].people.get(1000, 0).live().is_none());
+        assert!(folds[0].people.get(P - 1, 0).live().is_none());
         assert!(folds[1].people.get(1, 0).live().is_some());
     }
 
@@ -2140,9 +2140,9 @@ fn fast(seed: u64, nova: bool) -> bool {
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
     let cch = LazyChunks::new(&ckb, 1 << 20);
-    let caccs: Vec<Vec<Vec<Click>>> = pt_ordered(
+    let caccs: Vec<Box<nova::Streams<Click, P>>> = pt_ordered(
         cch.len(),
-        || (0..P).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
+        || Box::new(nova::Streams::new()),
         |mut acc, ci| {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
@@ -2153,7 +2153,7 @@ fn fast(seed: u64, nova: bool) -> bool {
                     // A user id not in the table has no valid event, so no session to credit.
                     let Some(person) = users.find(key, check, &coll) else { continue };
                     click.person = person;
-                    acc[person as usize & (P - 1)].push(click);
+                    acc.push(person as usize & (P - 1), click);
                 }
             };
             nova::click_rows(chunk, |_, [cid, user, cmp, ts]| {
@@ -2223,7 +2223,7 @@ fn fast(seed: u64, nova: bool) -> bool {
     let mut order = Vec::with_capacity(P);
     for partition in 0..P {
         let events: usize = paccs.iter().map(|fold| fold.len(partition)).sum();
-        let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
+        let clicks: usize = caccs.iter().map(|fold| fold.len(partition)).sum();
         order.push((std::cmp::Reverse(events + clicks), partition));
     }
     std::fs::create_dir_all(format!("{out}/user_daily")).unwrap();
@@ -2357,7 +2357,7 @@ impl PartitionState {
         partition: usize,
         people: u32,
         event_folds: &[People],
-        click_folds: &[Vec<Vec<Click>>],
+        click_folds: &[Box<nova::Streams<Click, P>>],
     ) {
         let Self { event_ends, click_ends, events, clicks, .. } = self;
         event_ends.clear();
@@ -2368,7 +2368,7 @@ impl PartitionState {
             .flat_map(|fold| fold.records(partition))
             .flatten()
             .filter_map(EvP::session_input);
-        let click_rows = || click_folds.iter().flat_map(|fold| &fold[partition]);
+        let click_rows = || click_folds.iter().flat_map(|fold| fold.chunks(partition)).flatten();
         for (person, _) in event_rows() {
             event_ends[(person >> PB) as usize] += 1;
         }
