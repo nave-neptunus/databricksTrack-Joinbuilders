@@ -786,7 +786,7 @@ impl Tab {
 // ------------------------------------------------------------------ records
 const SHB: u32 = 8;
 const SH: usize = 1 << SHB;
-const PB: u32 = 10;
+const PB: u32 = 8;
 const P: usize = 1 << PB;
 
 const TOMBSTONE: u32 = u32::MAX;
@@ -1129,8 +1129,7 @@ impl<'a> Users<'a> {
 }
 
 /// Valid event copies of one worker, by person partition. Each partition owns an initialized
-/// prefix of one anonymous mapping (huge pages on Linux, so the 1,024 write streams share a few
-/// TLB entries and fault in 2 MB steps) plus a growable overflow.
+/// prefix of one anonymous mapping (with huge-page advice on Linux) plus a growable overflow.
 struct People {
     storage: Option<memmap2::MmapMut>,
     stride: usize,
@@ -1156,11 +1155,6 @@ impl People {
         let stride = if storage.is_some() { reservation } else { 0 };
         let overflow = Box::new(std::array::from_fn(|_| if stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }));
         Self { storage, stride, lengths: Box::new([0; P]), overflow }
-    }
-
-    fn writer(&mut self) -> PeopleWriter<'_> {
-        let base = self.storage.as_mut().map_or(std::ptr::null_mut(), |m| m.as_mut_ptr().cast());
-        PeopleWriter { base, stride: self.stride, lengths: &mut self.lengths, overflow: &mut self.overflow }
     }
 
     #[inline]
@@ -1197,15 +1191,6 @@ impl People {
     }
 }
 
-/// Borrow the mapping once for a whole scatter pass. The masked person ID
-/// indexes fixed-size arrays and the common write needs no optional-map lookup.
-struct PeopleWriter<'a> {
-    base: *mut EvP,
-    stride: usize,
-    lengths: &'a mut [usize; P],
-    overflow: &'a mut [Vec<EvP>; P],
-}
-
 #[inline]
 fn prefetch_read(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
@@ -1214,27 +1199,6 @@ fn prefetch_read(ptr: *const u8) {
     unsafe { std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags)); }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = ptr;
-}
-
-impl PeopleWriter<'_> {
-    #[inline]
-    fn push(&mut self, person: u32, ts: u32, price: u32) -> Option<u32> {
-        let part = person as usize & (P - 1);
-        let len = self.lengths[part];
-        let row = EvP { person, ts: AtomicU32::new(ts), price };
-        let index = if len < self.stride {
-            // Nonzero stride requires an owned mapping; this partition's
-            // initialized prefix is extended by exactly one exclusive write.
-            unsafe { self.base.add(part * self.stride + len).write(row) };
-            self.lengths[part] = len + 1;
-            len
-        } else {
-            let index = self.stride + self.overflow[part].len();
-            self.overflow[part].push(row);
-            index
-        };
-        u32::try_from(index).ok()
-    }
 }
 
 struct EventFold {
@@ -1976,11 +1940,12 @@ fn fast(seed: u64, nova: bool) -> bool {
         }
     };
 
-    let est_users = evb.iter().find(|b| b.len() >= 1 << 16).map_or(0, |b| {
+    let estimated_rows = evb.iter().find(|b| b.len() >= 1 << 16).map_or(0, |b| {
         let rows = memchr::memchr_iter(b'\n', &b[..1 << 16]).count().max(1);
         let total: usize = evb.iter().map(|b| b.len()).sum();
-        total / ((1 << 16) / rows).max(1) / 12
+        total / ((1 << 16) / rows).max(1)
     });
+    let est_users = estimated_rows / 12;
     for b in &lkb {
         ra.wait(b);
     }
@@ -1996,7 +1961,7 @@ fn fast(seed: u64, nova: bool) -> bool {
     let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs) = if nova {
         let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
+        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll, estimated_rows) else {
             return false;
         };
         result

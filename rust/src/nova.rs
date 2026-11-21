@@ -1,10 +1,10 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{DAY, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
+use crate::{DAY, EvP, LazyChunks, P, PB, People, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
-use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::mem::{MaybeUninit, size_of};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
 const BLOCK_BYTES: usize = 4096;
@@ -218,11 +218,119 @@ struct Claim {
 }
 const _: () = assert!(size_of::<Claim>() == 16);
 
-const LOC_INDEX_BITS: u32 = 18;
+const LOC_INDEX_BITS: u32 = 28 - PB;
 const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
-const LOC_WORKER_SHIFT: u32 = LOC_PART_SHIFT + 10;
+const LOC_WORKER_SHIFT: u32 = LOC_PART_SHIFT + PB;
 const INDEX_MASK: u32 = (1 << LOC_INDEX_BITS) - 1;
 const NO_LOC: u32 = u32::MAX;
+
+// Sixteen 12-byte rows fill three 64-byte lines. All 256 buffers occupy 48 KiB
+// per worker. A location is assigned on enqueue, before its payload is flushed.
+const PAYLOAD_ROWS: usize = 16;
+
+#[repr(align(64))]
+struct PayloadBatch([MaybeUninit<EvP>; PAYLOAD_ROWS]);
+
+struct PeopleWriter<'a> {
+    batches: [PayloadBatch; P],
+    positions: [usize; P],
+    base: *mut EvP,
+    stride: usize,
+    lengths: &'a mut [usize; P],
+    overflow: &'a mut [Vec<EvP>; P],
+}
+
+impl<'a> PeopleWriter<'a> {
+    fn new(people: &'a mut People) -> Self {
+        assert!(people.lengths.iter().all(|&n| n == 0));
+        assert!(people.overflow.iter().all(Vec::is_empty));
+        let base = people.storage.as_mut().map_or(std::ptr::null_mut(), |map| map.as_mut_ptr().cast());
+        Self {
+            batches: std::array::from_fn(|_| PayloadBatch([const { MaybeUninit::uninit() }; PAYLOAD_ROWS])),
+            positions: [0; P],
+            base,
+            stride: people.stride,
+            lengths: &mut people.lengths,
+            overflow: &mut people.overflow,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, part: usize, person: u32, ts: u32, price: u32) -> usize {
+        let index = self.positions[part];
+        let slot = index % PAYLOAD_ROWS;
+        self.batches[part].0[slot].write(EvP { person, ts: AtomicU32::new(ts), price });
+        self.positions[part] = index + 1;
+        if slot + 1 == PAYLOAD_ROWS {
+            self.flush(part, PAYLOAD_ROWS);
+        }
+        index
+    }
+
+    #[inline]
+    fn flush(&mut self, part: usize, count: usize) {
+        let src = self.batches[part].0.as_ptr().cast::<EvP>();
+        let start = self.lengths[part];
+        let mapped = count.min(self.stride - start);
+        if mapped != 0 {
+            // This prefix of the batch is initialized. The destination follows
+            // all previous batches and is exclusively owned by this producer.
+            unsafe {
+                copy_people(src, self.base.add(part * self.stride + start), mapped);
+            }
+            self.lengths[part] = start + mapped;
+        }
+        if mapped != count {
+            let tail = &mut self.overflow[part];
+            let added = count - mapped;
+            let len = tail.len();
+            tail.reserve(added);
+            // The rest of the initialized batch fits in reserved, uninitialized
+            // space after the tail. No row needs to be dropped from the staging buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.add(mapped), tail.as_mut_ptr().add(len), added);
+                tail.set_len(len + added);
+            }
+        }
+    }
+
+    fn finish(mut self) {
+        for part in 0..P {
+            let pending = self.positions[part] % PAYLOAD_ROWS;
+            if pending != 0 {
+                self.flush(part, pending);
+            }
+        }
+    }
+}
+
+impl Drop for PeopleWriter<'_> {
+    fn drop(&mut self) {
+        // All streaming destinations are disjoint. Fence before the borrow
+        // ends so dedup can read or tombstone these rows on any thread.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
+#[inline]
+unsafe fn copy_people(src: *const EvP, dst: *mut EvP, count: usize) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    if count == PAYLOAD_ROWS && dst as usize % 64 == 0 {
+        use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
+        let src = src.cast::<__m256i>();
+        let dst = dst.cast::<__m256i>();
+        // The staging buffer and destination are line-aligned. No destination
+        // is reused, and the producer fences its stores before exposing People.
+        unsafe {
+            for lane in 0..PAYLOAD_ROWS * size_of::<EvP>() / size_of::<__m256i>() {
+                _mm256_stream_si256(dst.add(lane), _mm256_load_si256(src.add(lane)));
+            }
+        }
+        return;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, count) };
+}
 
 #[derive(Clone, Copy)]
 struct Pending {
@@ -576,7 +684,7 @@ struct Parser<'a, 'catalog, 'table> {
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Claim, SHARDS>,
-    people: People,
+    people: PeopleWriter<'a>,
     worker: u32,
 }
 
@@ -587,19 +695,20 @@ impl Parser<'_, '_, '_> {
 
     #[inline]
     fn flush(&mut self) {
-        let mut writer = self.people.writer();
         for pending in &self.batch[..self.count] {
             let loc = if pending.ts != INVALID {
                 let person = self
                     .users
                     .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
-                let Some(index) = writer.push(person, pending.ts, pending.price) else {
+                let part = person as usize & (P - 1);
+                let index = self.people.push(part, person, pending.ts, pending.price);
+                if index >= INDEX_MASK as usize {
                     self.declined.store(true, Relaxed);
                     continue;
-                };
+                }
                 (self.worker << LOC_WORKER_SHIFT)
-                    | ((person as u32 & ((P - 1) as u32)) << LOC_PART_SHIFT)
-                    | (index & INDEX_MASK)
+                    | ((part as u32) << LOC_PART_SHIFT)
+                    | index as u32
             } else {
                 // Invalid copies still compete for the earliest ingest, but
                 // they have no payload to keep or tombstone.
@@ -688,39 +797,49 @@ fn events(
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
+    estimated_rows: usize,
 ) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
+    let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
+    let reservation = (rows_per_partition + rows_per_partition / 4)
+        .clamp(PAYLOAD_ROWS, INDEX_MASK as usize + 1)
+        .next_multiple_of(PAYLOAD_ROWS);
     let mut parsed: Vec<_> = rayon::broadcast(|_| {
         let worker = workers.fetch_add(1, Relaxed) as u32;
         let too_many = worker >= 1 << (32 - LOC_WORKER_SHIFT);
         if too_many {
             declined.store(true, Relaxed);
         }
-        let mut parser = Parser {
-            input,
-            users,
-            declined,
-            window_seconds: input.start.div_euclid(1000),
-            window_ms: (input.end - input.start) as u64,
-            dates: Dates::default(),
-            ids: (0, 0),
-            batch: [Pending::EMPTY; 16],
-            count: 0,
-            streams: Streams::new(),
-            people: People::new(if too_many { 1 } else { 1024 }),
-            worker,
-        };
-        loop {
-            let index = next.fetch_add(1, Relaxed);
-            if index >= work.len() {
-                break;
+        let mut people = People::new(if too_many { 0 } else { reservation });
+        let streams = {
+            let mut parser = Parser {
+                input,
+                users,
+                declined,
+                window_seconds: input.start.div_euclid(1000),
+                window_ms: (input.end - input.start) as u64,
+                dates: Dates::default(),
+                ids: (0, 0),
+                batch: [Pending::EMPTY; 16],
+                count: 0,
+                streams: Streams::new(),
+                people: PeopleWriter::new(&mut people),
+                worker,
+            };
+            loop {
+                let index = next.fetch_add(1, Relaxed);
+                if index >= work.len() {
+                    break;
+                }
+                read_ahead.wait(work.raw(index));
+                parser.parse_chunk(work.get(index));
             }
-            read_ahead.wait(work.raw(index));
-            parser.parse_chunk(work.get(index));
-        }
-        parser.flush();
-        (worker, parser.streams, parser.people)
+            parser.flush();
+            parser.people.finish();
+            parser.streams
+        };
+        (worker, streams, people)
     });
     // `broadcast` returns results in completion order, but locations encode
     // the assigned worker id, so restore that order before indexing.
@@ -840,8 +959,9 @@ pub(super) fn run_events(
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
+    estimated_rows: usize,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let (claims, people) = events(work, read_ahead, users, input, declined);
+    let (claims, people) = events(work, read_ahead, users, input, declined, estimated_rows);
     if declined.load(Relaxed) {
         return None;
     }
@@ -884,7 +1004,7 @@ mod tests {
     #[test]
     fn router_keeps_earliest_invalid_and_changed_person_copies() {
         fn place(
-            people: &mut People,
+            people: &mut PeopleWriter<'_>,
             claims: &mut [ClaimStream],
             worker: u32,
             key: u64,
@@ -893,23 +1013,33 @@ mod tests {
             ts: u32,
             price: u32,
         ) {
-            let index = people.writer().push(person, ts, price).unwrap();
-            let loc = (worker << LOC_WORKER_SHIFT)
-                | ((person & ((P - 1) as u32)) << LOC_PART_SHIFT)
-                | (index & INDEX_MASK);
+            let loc = if ts == INVALID {
+                NO_LOC
+            } else {
+                let part = person as usize & (P - 1);
+                let index = people.push(part, person, ts, price);
+                (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
+            };
             claims[worker as usize].push((key >> 55) as u8 as usize, Claim { key, ingest, loc });
         }
 
-        let mut people = vec![People::new(1), People::new(1)];
+        let mut people = [People::new(32), People::new(1)];
+        let [first, second] = &mut people;
+        let mut first = PeopleWriter::new(first);
+        let mut second = PeopleWriter::new(second);
         let mut claims = vec![ClaimStream::new(), ClaimStream::new()];
-        // Force overflow in the person output and cross a source block boundary.
+        // Exercise full lines, overflow, a partial final batch and a claim block boundary.
         for i in 0..300u64 {
-            place(&mut people[0], &mut claims, 0, i + 1, 20, 3, 10, 1);
+            place(&mut first, &mut claims, 0, i + 1, 20, 3, 10, 1);
         }
-        place(&mut people[1], &mut claims, 1, 1, 10, 7, INVALID, 0);
-        place(&mut people[1], &mut claims, 1, 2, 10, 7, 5, 2);
-        place(&mut people[1], &mut claims, 1, 2, 30, 3, 20, 3);
-        place(&mut people[1], &mut claims, 1, 3, 20, 3, 10, 1);
+        place(&mut second, &mut claims, 1, 1, 10, 7, INVALID, 0);
+        place(&mut second, &mut claims, 1, 2, 10, 7, 5, 2);
+        place(&mut second, &mut claims, 1, 2, 30, 3, 20, 3);
+        place(&mut second, &mut claims, 1, 3, 20, 3, 10, 1);
+        first.finish();
+        second.finish();
+        assert_eq!(people[0].len(3), 300);
+        assert_eq!(people[1].len(7), 1);
         Router::new().route(&people, &claims, 0);
         let live = |part| people.iter().flat_map(|p| p.records(part).into_iter().flatten())
             .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
