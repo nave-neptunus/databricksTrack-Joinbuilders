@@ -1188,6 +1188,8 @@ struct EventFold {
     copies: Vec<Vec<D>>,
     short_copies: ShortArena,
     people: People,
+    // valid rows parsed before the user table existed (links still building)
+    pending: Vec<ParsedEvent>,
 }
 
 impl EventFold {
@@ -1197,6 +1199,54 @@ impl EventFold {
             copies: (0..SH).map(|_| Vec::new()).collect(),
             short_copies: ShortArena::new(shard_capacity),
             people: People::new(person_capacity),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Route parsed rows: valid rows go to their person's partition, every row's ID copy to
+    /// its dedup shard. Without the user table yet, valid rows wait in `pending`; the first
+    /// call with the table routes them (in any order: nothing downstream depends on it).
+    fn route(&mut self, rows: &mut Vec<ParsedEvent>, users: Option<&Users>, block: &mut (u32, u32), coll: &AtomicBool) {
+        let EventFold { copies, short_copies, people, pending } = self;
+        let mut short_writer = short_copies.writer();
+        let mut emit = |r: ParsedEvent| {
+            let shard = (r.copy.hid >> (64 - SHB)) as usize;
+            if r.short_id {
+                if let Some(copy) = ShortD::pack(r.copy) {
+                    short_writer.push(shard, copy);
+                } else {
+                    coll.store(true, Relaxed);
+                }
+            } else {
+                copies[shard].push(r.copy);
+            }
+        };
+        let Some(users) = users else {
+            for r in rows.drain(..) {
+                if r.ts != TOMBSTONE {
+                    pending.push(r);
+                } else {
+                    emit(r);
+                }
+            }
+            return;
+        };
+        for mut r in pending.drain(..).chain(rows.drain(..)) {
+            if r.ts != TOMBSTONE {
+                let person = users.person(r.pkey, r.pchk, r.name_ref, block, coll);
+                let partition = person as usize & (P - 1);
+                let Ok(index) = u32::try_from(people.len(partition)) else {
+                    coll.store(true, Relaxed);
+                    continue;
+                };
+                people.push(partition, EvP {
+                    person,
+                    ts: AtomicU32::new(r.ts),
+                    price: r.price,
+                });
+                r.copy.loc = ((partition as u64) << 32) | u64::from(index);
+            }
+            emit(r);
         }
     }
 }
@@ -1911,16 +1961,34 @@ fn fast(seed: u64) -> bool {
         let total: usize = evb.iter().map(|b| b.len()).sum();
         total / ((1 << 16) / rows).max(1) / 12
     });
-    for b in &lkb {
-        ra.wait(b);
-    }
-    lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed) else {
-        return false;
+    // Links build on their own pool while events parse from t=0. Event rows wait in their
+    // worker's fold until the user table (linked persons first) exists.
+    let links_users: &'static std::sync::OnceLock<Users<'static>> = Box::leak(Box::new(std::sync::OnceLock::new()));
+    let links_dead: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let links_job = {
+        let lkb: Vec<&'static [u8]> = lkb.clone();
+        let lthreads: usize = std::env::var("BLUE2_LINK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(ncpu);
+        std::thread::spawn(move || {
+            let built = (|| {
+                for b in &lkb {
+                    ra.wait(b);
+                }
+                lap("  links read");
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(lthreads).build().ok()?;
+                let (ltab, nedges, nids, pname) = pool.install(|| build_links(&lkb, est_users, seed))?;
+                let ltab: &'static mut Tab = Box::leak(Box::new(ltab));
+                let users = Users::new(ltab, nids, pname.len());
+                let _ = links_users.set(users);
+                lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
+                Some(pname)
+            })();
+            if built.is_none() {
+                links_dead.store(true, Relaxed);
+            }
+            built
+        })
     };
     let coll = AtomicBool::new(false);
-    let users = Users::new(&mut ltab, nids, pname.len());
-    lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Events phase A: route valid copies directly to people, and record
     // every eligible event ID for the global earliest-ingest decision.
@@ -1937,41 +2005,16 @@ fn fast(seed: u64) -> bool {
     let folds: Vec<EventFold> = pt_ordered(ech.len(),
             || EventFold::new(shard_capacity),
             |mut acc, ci| {
+                if links_dead.load(Relaxed) {
+                    return acc;
+                }
+                let users = links_users.get();
                 ra.wait(ech.raw(ci));
                 let c = ech.get(ci);
                 let mut dates = Dates::default();
                 let mut batch = Vec::<ParsedEvent>::with_capacity(16);
-                let mut short_writer = acc.short_copies.writer();
                 let mut block = (0u32, 0u32);
-                let mut flush = |batch: &mut Vec<ParsedEvent>| {
-                    for mut r in batch.drain(..) {
-                        if r.ts != TOMBSTONE {
-                            let person = users.person(r.pkey, r.pchk, r.name_ref, &mut block, &coll);
-                            let partition = person as usize & (P - 1);
-                            let events = &mut acc.people;
-                            let Ok(index) = u32::try_from(events.len(partition)) else {
-                                coll.store(true, Relaxed);
-                                continue;
-                            };
-                            events.push(partition, EvP {
-                                person,
-                                ts: AtomicU32::new(r.ts),
-                                price: r.price,
-                            });
-                            r.copy.loc = ((partition as u64) << 32) | u64::from(index);
-                        }
-                        let shard = (r.copy.hid >> (64 - SHB)) as usize;
-                        if r.short_id {
-                            if let Some(copy) = ShortD::pack(r.copy) {
-                                short_writer.push(shard, copy);
-                            } else {
-                                coll.store(true, Relaxed);
-                            }
-                        } else {
-                            acc.copies[shard].push(r.copy);
-                        }
-                    }
-                };
+                let mut flush = |batch: &mut Vec<ParsedEvent>| acc.route(batch, users, &mut block, &coll);
                 event_rows(c, |_, [id, user, ts, ing, et, pr, pc]| {
                     if id.is_empty() {
                         return;
@@ -2023,7 +2066,9 @@ fn fast(seed: u64) -> bool {
                         };
                         r.name_ref = name;
                         (r.pkey, r.pchk) = hs(user, seed);
-                        users.prefetch(r.pkey);
+                        if let Some(users) = users {
+                            users.prefetch(r.pkey);
+                        }
                         r.ts = (t - w0) as u32;
                     }
                     batch.push(r);
@@ -2035,6 +2080,16 @@ fn fast(seed: u64) -> bool {
                 acc
             },
         );
+    let Some(pname) = links_job.join().ok().flatten() else {
+        return false;
+    };
+    let users = links_users.get().unwrap();
+    let mut folds = folds;
+    folds.par_iter_mut().for_each(|fold| {
+        if !fold.pending.is_empty() {
+            fold.route(&mut Vec::new(), Some(users), &mut (0, 0), &coll);
+        }
+    });
     let (linked_count, pname) = users.names(&pname, &coll);
     lap(&format!("events parsed ({} folds, {} persons)", folds.len(), pname.len()));
     if coll.load(Relaxed) {
@@ -2221,6 +2276,10 @@ fn fast(seed: u64) -> bool {
     };
     camp_job();
     lap("parquet written");
+    // Everything is written and closed: skip freeing the large tables and mappings.
+    if std::env::var_os("BLUE2_NO_EXIT").is_none() {
+        std::process::exit(0);
+    }
     true
 }
 
