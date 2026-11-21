@@ -12,6 +12,30 @@ const SLAB_BYTES: usize = 16 << 20;
 const SHORT_KEY: u64 = 1 << 63;
 const INVALID: u32 = u32::MAX;
 
+/// Canonical generator event IDs are `e` plus the shortest lower-case base-36
+/// spelling of a value below 2^40.  This is a strict grammar: `e0` is the only
+/// zero spelling, so no leading-zero alias can meet a general ID in the compact
+/// table.  Base-36 expansion is injective over canonical spellings.
+#[inline]
+fn canonical_event_key(id: &[u8]) -> Option<u64> {
+    if id.len() < 2 || id[0] != b'e' || (id.len() > 2 && id[1] == b'0') {
+        return None;
+    }
+    let mut key = 0u64;
+    for &byte in &id[1..] {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'z' => byte - b'a' + 10,
+            _ => return None,
+        };
+        if key > ((1 << 40) - 1 - u64::from(digit)) / 36 {
+            return None;
+        }
+        key = key * 36 + u64::from(digit);
+    }
+    Some(key)
+}
+
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
 #[inline]
@@ -205,6 +229,11 @@ impl<T: Copy, const N: usize> Streams<T, N> {
             (blocks - 1) * Self::ROWS + self.used[stream]
         }
     }
+
+    fn bytes(&self) -> (usize, usize, usize) {
+        let rows = (0..N).map(|stream| self.len(stream)).sum::<usize>();
+        (rows * size_of::<T>(), self.next * BLOCK_BYTES, self.slabs.len() * SLAB_BYTES)
+    }
 }
 
 /// A parsed copy's identity and the slot its payload occupies in the final
@@ -217,6 +246,40 @@ struct Claim {
     loc: u32,
 }
 const _: () = assert!(size_of::<Claim>() == 16);
+
+/// Compact claims are used only for `canonical_event_key` IDs. `key_lo` plus
+/// the top eight bits of `key_hi_ingest` retain all 40 identity bits; its low
+/// 24 bits are the exact checked ingest metadata and `loc` is unchanged.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CompactClaim {
+    key_lo: u32,
+    key_hi_ingest: u32,
+    loc: u32,
+}
+const _: () = assert!(size_of::<CompactClaim>() == 12);
+
+impl CompactClaim {
+    #[inline]
+    fn new(key: u64, ingest: i32, loc: u32) -> Option<Self> {
+        let ingest = compact_ingest(ingest)?;
+        Some(Self {
+            key_lo: key as u32,
+            key_hi_ingest: ((key >> 32) as u32) << 24 | ingest,
+            loc,
+        })
+    }
+
+    #[inline]
+    fn key(self) -> u64 {
+        u64::from(self.key_lo) | (u64::from(self.key_hi_ingest >> 24) << 32)
+    }
+
+    #[inline]
+    fn ingest(self) -> i32 {
+        (self.key_hi_ingest & META_INGEST_MASK) as i32 - INGEST_BIAS
+    }
+}
 
 const LOC_INDEX_BITS: u32 = 28 - PB;
 const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
@@ -688,6 +751,8 @@ struct Parser<'a, 'catalog, 'table> {
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Claim, SHARDS>,
+    compact_streams: Streams<CompactClaim, SHARDS>,
+    compact_claims: bool,
     people: PeopleWriter<'a>,
     worker: u32,
 }
@@ -718,10 +783,24 @@ impl Parser<'_, '_, '_> {
                 // they have no payload to keep or tombstone.
                 NO_LOC
             };
-            self.streams.push(
-                (pending.key >> 55) as u8 as usize,
-                Claim { key: pending.key, ingest: pending.ingest, loc },
-            );
+            if self.compact_claims {
+                // `key` is set to the canonical u32 value only in `row`.
+                // General IDs never share this table, so the two identity
+                // domains cannot collide.
+                if pending.key & SHORT_KEY == 0 {
+                    self.compact_streams.push(
+                        (pending.key >> 32) as usize,
+                        // `row` checked the same range before buffering. A
+                        // failed conversion here would mean a programmer bug,
+                        // not a per-copy route change.
+                        CompactClaim::new(pending.key, pending.ingest, loc).unwrap(),
+                    );
+                    continue;
+                }
+            }
+            self.streams.push((pending.key >> 55) as u8 as usize, Claim {
+                key: pending.key, ingest: pending.ingest, loc,
+            });
         }
         self.count = 0;
     }
@@ -736,9 +815,16 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         }
         // The parser can release its input chunk after this call. No
         // captured identities reference the source buffer.
-        let Some(key) = short_key(id, b'e').map(permute_short) else {
-            self.declined.store(true, Relaxed);
-            return;
+        let canonical = self.compact_claims.then(|| canonical_event_key(id)).flatten();
+        let key = match canonical {
+            Some(key) => u64::from(key),
+            None => match short_key(id, b'e').map(permute_short) {
+                Some(key) => key,
+                None => {
+                    self.declined.store(true, Relaxed);
+                    return;
+                }
+            },
         };
         let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
             self.declined.store(true, Relaxed);
@@ -748,6 +834,13 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.declined.store(true, Relaxed);
             return;
         };
+        // The compact and existing routers store only a 24-bit biased ingest
+        // value. Decline the complete fast run instead of wrapping it or
+        // splitting equal IDs by representability.
+        if self.compact_claims && compact_ingest(order).is_none() {
+            self.declined.store(true, Relaxed);
+            return;
+        }
         let mut pending = Pending::EMPTY;
         pending.key = key;
         pending.ingest = order;
@@ -802,7 +895,8 @@ fn events(
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
-) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
+    compact_claims: bool,
+) -> (Vec<Streams<Claim, SHARDS>>, Vec<Streams<CompactClaim, SHARDS>>, Vec<People>) {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
@@ -828,6 +922,8 @@ fn events(
                 batch: [Pending::EMPTY; 16],
                 count: 0,
                 streams: Streams::new(),
+                compact_streams: Streams::new(),
+                compact_claims,
                 people: PeopleWriter::new(&mut people),
                 worker,
             };
@@ -841,23 +937,26 @@ fn events(
             }
             parser.flush();
             parser.people.finish();
-            parser.streams
+            (parser.streams, parser.compact_streams)
         };
-        (worker, streams, people)
+        (worker, streams.0, streams.1, people)
     });
     // `broadcast` returns results in completion order, but locations encode
     // the assigned worker id, so restore that order before indexing.
-    parsed.sort_unstable_by_key(|(worker, _, _)| *worker);
+    parsed.sort_unstable_by_key(|(worker, _, _, _)| *worker);
     let mut streams = Vec::with_capacity(parsed.len());
+    let mut compact_streams = Vec::with_capacity(parsed.len());
     let mut people = Vec::with_capacity(parsed.len());
-    for (_, s, p) in parsed {
+    for (_, s, compact, p) in parsed {
         streams.push(s);
+        compact_streams.push(compact);
         people.push(p);
     }
-    (streams, people)
+    (streams, compact_streams, people)
 }
 
 type ClaimStream = Streams<Claim, SHARDS>;
+type CompactClaimStream = Streams<CompactClaim, SHARDS>;
 
 // One 16-byte cell holds the full event key, the winning ingest time and the
 // location of the payload parse already wrote into its final person partition.
@@ -865,6 +964,12 @@ type ClaimStream = Streams<Claim, SHARDS>;
 const META_GEN_SHIFT: u32 = 24;
 const META_INGEST_MASK: u32 = (1 << META_GEN_SHIFT) - 1;
 const INGEST_BIAS: i32 = 1 << 21;
+
+#[inline]
+fn compact_ingest(ingest: i32) -> Option<u32> {
+    let biased = ingest.checked_add(INGEST_BIAS)?;
+    (u32::try_from(biased).ok()? <= META_INGEST_MASK).then_some(biased as u32)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -879,6 +984,93 @@ struct Router {
     generation: u32,
     route_ns: u64,
     table_percent: usize,
+}
+
+// This table is physically and logically separate from `Router`: a canonical
+// `e????????` key is never compared with a general ID.  That separation is
+// what makes the compact encoding safe even if a general ID has matching bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CompactSlot {
+    key_lo: u32,
+    key_hi_ingest: u32,
+    loc: u32,
+}
+const _: () = assert!(size_of::<CompactSlot>() == 12);
+
+struct CompactRouter {
+    slots: Vec<CompactSlot>,
+    // A 12-byte cell has no spare generation bits after its exact 40-bit key
+    // and 24-bit ingest. This one-bit occupancy map is separate from cells;
+    // each router handles one shard once, so it needs no clearing pass.
+    occupied: Vec<bool>,
+    route_ns: u64,
+    table_percent: usize,
+}
+
+impl CompactRouter {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            occupied: Vec::new(),
+            route_ns: 0,
+            table_percent: std::env::var("BREAKER_TABLE_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(110),
+        }
+    }
+
+    fn route(&mut self, people: &[People], claims: &[CompactClaimStream], shard: usize) {
+        let begin = std::time::Instant::now();
+        let count: usize = claims.iter().map(|fold| fold.len(shard)).sum();
+        if count == 0 {
+            return;
+        }
+        let mask = (count * self.table_percent / 100).next_power_of_two() - 1;
+        if self.slots.len() < mask + 1 {
+            self.slots.resize(mask + 1, CompactSlot::default());
+            self.occupied.resize(mask + 1, false);
+        }
+        // `pt_ordered` reuses one router for several disjoint shards. Cells
+        // retain arbitrary old bytes, so clear only the one-bit validity map
+        // before each shard rather than spending a 12-byte-cell generation.
+        self.occupied.fill(false);
+        for fold in claims {
+            for block in fold.chunks(shard) {
+                for (offset, claim) in block.iter().enumerate() {
+                    if let Some(next) = block.get(offset + 8) {
+                        crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key() as usize & mask).cast());
+                    }
+                    let key = claim.key();
+                    let mut slot = key as usize & mask;
+                    loop {
+                        let winner = self.slots[slot];
+                        if !self.occupied[slot] {
+                            self.occupied[slot] = true;
+                            self.slots[slot] = CompactSlot {
+                                key_lo: claim.key_lo, key_hi_ingest: claim.key_hi_ingest, loc: claim.loc,
+                            };
+                            break;
+                        }
+                        let winner_key = u64::from(winner.key_lo)
+                            | (u64::from(winner.key_hi_ingest >> 24) << 32);
+                        if winner_key == key {
+                            let previous = (winner.key_hi_ingest & META_INGEST_MASK) as i32 - INGEST_BIAS;
+                            if claim.ingest() < previous {
+                                Router::tombstone(people, winner.loc);
+                                self.slots[slot] = CompactSlot {
+                                    key_lo: claim.key_lo, key_hi_ingest: claim.key_hi_ingest, loc: claim.loc,
+                                };
+                            } else {
+                                Router::tombstone(people, claim.loc);
+                            }
+                            break;
+                        }
+                        slot = (slot + 1) & mask;
+                    }
+                }
+            }
+        }
+        self.route_ns += begin.elapsed().as_nanos() as u64;
+    }
 }
 
 impl Router {
@@ -965,7 +1157,25 @@ pub(super) fn run_events(
     declined: &AtomicBool,
     estimated_rows: usize,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let (claims, people) = events(work, read_ahead, users, input, declined, estimated_rows);
+    let compact_enabled = std::env::var_os("NOVA_COMPACT_CLAIMS").is_some();
+    let (claims, compact_claims, people) = events(
+        work, read_ahead, users, input, declined, estimated_rows, compact_enabled,
+    );
+    if std::env::var_os("TIMING").is_some() {
+        let sum = |streams: &[ClaimStream]| streams.iter().fold((0, 0, 0), |a, stream| {
+            let b = stream.bytes();
+            (a.0 + b.0, a.1 + b.1, a.2 + b.2)
+        });
+        let compact_sum = compact_claims.iter().fold((0, 0, 0), |a, stream| {
+            let b = stream.bytes();
+            (a.0 + b.0, a.1 + b.1, a.2 + b.2)
+        });
+        let normal_sum = sum(&claims);
+        eprintln!(
+            "CLAIMS normal stored={} block_reserved={} slab_reserved={}; compact stored={} block_reserved={} slab_reserved={}",
+            normal_sum.0, normal_sum.1, normal_sum.2, compact_sum.0, compact_sum.1, compact_sum.2,
+        );
+    }
     if declined.load(Relaxed) {
         return None;
     }
@@ -992,11 +1202,31 @@ pub(super) fn run_events(
             eprintln!("ROUTER tombstone={:.1}", router.route_ns as f64 / 1e6);
         }
     });
+    // Canonical and general claims are independently partitioned and routed.
+    // An ID chooses exactly one representation at parse time, so equal IDs
+    // always meet here while distinct grammar classes can never compare equal.
+    if compact_enabled {
+        crate::pt_ordered(
+            SHARDS,
+            CompactRouter::new,
+            |mut router, shard| {
+                router.route(&people, &compact_claims, shard);
+                router
+            },
+        )
+        .into_iter()
+        .for_each(|router| {
+            if std::env::var_os("TIMING").is_some() {
+                eprintln!("COMPACT_ROUTER tombstone={:.1}", router.route_ns as f64 / 1e6);
+            }
+        });
+    }
     if declined.load(Relaxed) {
         return None;
     }
     lap("  dedup tombstoned");
     drop(claims);
+    drop(compact_claims);
     lap("events dedup + validate");
     Some((local_count, names, people))
 }
@@ -1004,6 +1234,25 @@ pub(super) fn run_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_event_ids_are_strict_base36_and_injective() {
+        assert_eq!(canonical_event_key(b"e0"), Some(0));
+        assert_eq!(canonical_event_key(b"e1z"), Some(71));
+        assert_eq!(canonical_event_key(b"ezzzzzzzz"), None);
+        assert_eq!(canonical_event_key(b"ezzzzzz"), Some(2_176_782_335));
+        for bad in [b"E1z" as &[u8], b"e01", b"e1Z", b"e-1", b"e", b"x1", b"ezzzzzzzz"] {
+            assert_eq!(canonical_event_key(bad), None, "{bad:?}");
+        }
+        // Base-36 expansion is unique: if two accepted strings differ, their
+        // first differing digit has a non-zero coefficient 36^k, and cannot
+        // be cancelled by the smaller remaining suffix. Check representative
+        // leading/last-digit differences in addition to the construction.
+        assert_ne!(canonical_event_key(b"e10"), canonical_event_key(b"ez"));
+        assert_eq!(compact_ingest(-INGEST_BIAS), Some(0));
+        assert_eq!(compact_ingest(META_INGEST_MASK as i32 - INGEST_BIAS), Some(META_INGEST_MASK));
+        assert_eq!(compact_ingest(META_INGEST_MASK as i32 - INGEST_BIAS + 1), None);
+    }
 
     #[test]
     fn router_keeps_earliest_invalid_and_changed_person_copies() {
@@ -1049,6 +1298,42 @@ mod tests {
             .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
         assert_eq!(live(3), vec![(3, 10, 1); 298]);
         assert_eq!(live(7), vec![(7, 5, 2)]);
+    }
+
+    #[test]
+    fn compact_router_keeps_earliest_across_workers_and_block_boundary() {
+        fn place(
+            people: &mut PeopleWriter<'_>, claims: &mut [CompactClaimStream], worker: u32,
+            key: u64, ingest: i32, person: u32, ts: u32,
+        ) {
+            let part = person as usize & (P - 1);
+            let index = people.push(part, person, ts, 0);
+            let loc = (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32;
+            claims[worker as usize].push(
+                (key >> 32) as usize, CompactClaim::new(key, ingest, loc).unwrap(),
+            );
+        }
+        let mut people = [People::new(400), People::new(4)];
+        let [first, second] = &mut people;
+        let mut first = PeopleWriter::new(first);
+        let mut second = PeopleWriter::new(second);
+        let mut claims = vec![CompactClaimStream::new(), CompactClaimStream::new()];
+        // 12-byte rows give 341 rows per block: cross both the first block
+        // boundary and a partial tail before sending duplicates from worker 1.
+        for key in 0..342u64 {
+            place(&mut first, &mut claims, 0, key, 20, 3, 10);
+        }
+        place(&mut second, &mut claims, 1, 0, 10, 7, INVALID);
+        place(&mut second, &mut claims, 1, 1, 10, 7, 5);
+        place(&mut second, &mut claims, 1, 341, 10, 3, 20);
+        first.finish();
+        second.finish();
+        CompactRouter::new().route(&people, &claims, 0);
+        let live = |part| people.iter().flat_map(|p| p.records(part).into_iter().flatten())
+            .filter_map(|r| r.live().map(|ts| (r.person, ts))).collect::<Vec<_>>();
+        assert_eq!(live(3).len(), 340);
+        assert_eq!(live(3).iter().filter(|&&(_, ts)| ts == 20).count(), 1);
+        assert_eq!(live(7), vec![(7, 5)]);
     }
 
     #[test]
