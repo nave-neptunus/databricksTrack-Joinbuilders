@@ -6,6 +6,8 @@
 // partitions. A separate, compact event-ID stream identifies the copies to tombstone before
 // sessions. Any detected hash collision (same 64-bit key, different check) or unsupported input
 // sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(target_feature = "avx512f")))]
+mod dispatch;
 mod nova;
 mod slow;
 mod user_parquet;
@@ -1519,6 +1521,18 @@ fn unpack_ref(r: u64) -> &'static [u8] {
 }
 
 fn main() {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", not(target_feature = "avx512f")))]
+    if std::env::var_os("NO_V4").is_none()
+        && std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512vl")
+        // LLVM's x86-64-v4 target also enables AVX-512 CD and DQ.
+        && std::is_x86_feature_detected!("avx512cd")
+        && std::is_x86_feature_detected!("avx512dq")
+    {
+        dispatch::exec_v4();
+    }
+
     unsafe { T0 = Some(Instant::now()) };
     let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
     if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, nova) {
