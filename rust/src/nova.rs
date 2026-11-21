@@ -282,6 +282,35 @@ trait EventSink<'a> {
     fn row(&mut self, source: &'a [u8], fields: impl Fields<'a>);
 }
 
+/// Profiling switch. `base` is the shipped path; the other values stop after
+/// the event parse and omit successive layers of backend work.
+fn profile_mode() -> String {
+    std::env::var("EV_ABL").unwrap_or_else(|_| "base".to_string())
+}
+
+#[derive(Default)]
+struct ScanOnly {
+    sum: u64,
+}
+
+impl<'a> EventSink<'a> for ScanOnly {
+    #[inline]
+    fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
+        for i in 0..7 {
+            let len = match i {
+                0 => fields.field::<0>().len(),
+                1 => fields.field::<1>().len(),
+                2 => fields.field::<2>().len(),
+                3 => fields.field::<3>().len(),
+                4 => fields.field::<4>().len(),
+                5 => fields.field::<5>().len(),
+                _ => fields.field::<6>().len(),
+            };
+            self.sum = self.sum.wrapping_add(len as u64);
+        }
+    }
+}
+
 // The common event row spans three AVX2 vectors. Read each vector once for
 // newlines, commas, and quote syntax. Every load stays inside the mapped chunk.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -509,6 +538,8 @@ struct Parser<'a, 'catalog, 'table> {
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Event, SHARDS>,
+    skip_probe: bool,
+    skip_store: bool,
 }
 
 impl Parser<'_, '_, '_> {
@@ -521,11 +552,17 @@ impl Parser<'_, '_, '_> {
         for pending in &self.batch[..self.count] {
             let mut row = pending.row;
             if row.ts != INVALID {
-                row.person =
-                    self.users
-                        .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                if self.skip_probe {
+                    row.person = 0;
+                } else {
+                    row.person =
+                        self.users
+                            .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                }
             }
-            self.streams.push((row.key >> 55) as u8 as usize, row);
+            if !self.skip_store {
+                self.streams.push((row.key >> 55) as u8 as usize, row);
+            }
         }
         self.count = 0;
     }
@@ -605,9 +642,23 @@ fn events(
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
+    mode: &str,
 ) -> Vec<Streams<Event, SHARDS>> {
     let next = AtomicUsize::new(0);
     rayon::broadcast(|_| {
+        if mode == "scan" {
+            let mut sink = ScanOnly::default();
+            loop {
+                let index = next.fetch_add(1, Relaxed);
+                if index >= work.len() {
+                    break;
+                }
+                read_ahead.wait(work.raw(index));
+                scan_event_rows(work.get(index), &mut sink);
+            }
+            std::hint::black_box(sink.sum);
+            return Streams::new();
+        }
         let mut parser = Parser {
             input,
             users,
@@ -619,6 +670,8 @@ fn events(
             batch: [Pending::EMPTY; 16],
             count: 0,
             streams: Streams::new(),
+            skip_probe: mode == "fields",
+            skip_store: mode != "base",
         };
         loop {
             let index = next.fetch_add(1, Relaxed);
@@ -740,7 +793,11 @@ pub(super) fn run_events(
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let folds = events(work, read_ahead, users, input, declined);
+    let mode = profile_mode();
+    let parse_clock = std::time::Instant::now();
+    let (user0, sys0) = crate::cpu_ticks();
+    let folds = events(work, read_ahead, users, input, declined, &mode);
+    let (user1, sys1) = crate::cpu_ticks();
     if declined.load(Relaxed) {
         return None;
     }
@@ -750,6 +807,12 @@ pub(super) fn run_events(
         folds.len(),
         names.len()
     ));
+    eprintln!(
+        "EVENT_PARSE_CPU wall_ms={:.2} user_ticks={} sys_ticks={}",
+        parse_clock.elapsed().as_secs_f64() * 1000.0,
+        user1 - user0,
+        sys1 - sys0
+    );
     if declined.load(Relaxed) {
         return None;
     }
@@ -757,7 +820,13 @@ pub(super) fn run_events(
         .iter()
         .map(|f| (0..SHARDS).map(|shard| f.len(shard)).sum::<usize>())
         .sum();
+    eprintln!("EVENT_ROWS {}", rows);
+    if mode != "base" {
+        return Some((local_count, names, Vec::new()));
+    }
     let reservation = rows.div_ceil(P * rayon::current_num_threads()).min(32_768);
+    let dedup_clock = std::time::Instant::now();
+    let (user2, sys2) = crate::cpu_ticks();
     let people = crate::pt_ordered(
         SHARDS,
         || Router::new(reservation),
@@ -771,11 +840,18 @@ pub(super) fn run_events(
     .into_iter()
     .map(|router| router.people)
     .collect();
+    let (user3, sys3) = crate::cpu_ticks();
     if declined.load(Relaxed) {
         return None;
     }
     drop(folds);
     lap("events dedup + validate");
+    eprintln!(
+        "EVENT_DEDUP_CPU wall_ms={:.2} user_ticks={} sys_ticks={}",
+        dedup_clock.elapsed().as_secs_f64() * 1000.0,
+        user3 - user2,
+        sys3 - sys2
+    );
     Some((local_count, names, people))
 }
 
