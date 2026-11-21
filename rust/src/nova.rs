@@ -1,6 +1,6 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
+use crate::{DAY, EvP, P, People, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
 use std::mem::size_of;
@@ -11,6 +11,7 @@ const BLOCK_BYTES: usize = 4096;
 const SLAB_BYTES: usize = 16 << 20;
 const SHORT_KEY: u64 = 1 << 63;
 const INVALID: u32 = u32::MAX;
+const UNRESOLVED: u32 = crate::PERSON_SET as u32;
 
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
@@ -84,7 +85,7 @@ impl PersonName {
     }
 }
 
-fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec<&'static [u8]>)> {
+fn person_names(users: &Users, linked: &[&'static [u8]]) -> Option<(u32, Vec<&'static [u8]>)> {
     let n = (users.next.load(Relaxed) as usize).min(users.names.len());
     if n < linked.len() || n >= crate::PERSON_SET as usize {
         return None;
@@ -498,9 +499,9 @@ pub(super) struct EventInput<'a> {
     pub(super) end: i64,
 }
 
-struct Parser<'a, 'catalog, 'table> {
+struct Parser<'a, 'catalog> {
     input: &'a EventInput<'catalog>,
-    users: &'a Users<'table>,
+    users: Option<&'a Users>,
     declined: &'a AtomicBool,
     window_seconds: i64,
     window_ms: u64,
@@ -509,29 +510,53 @@ struct Parser<'a, 'catalog, 'table> {
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Event, SHARDS>,
+    unresolved: Vec<u64>,
 }
 
-impl Parser<'_, '_, '_> {
+impl Parser<'_, '_> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
         scan_event_rows(bytes, self);
     }
 
     #[inline]
     fn flush(&mut self) {
+        if let Some(users) = self.users {
+            self.flush_resolved(users);
+        } else {
+            self.flush_unresolved();
+        }
+        self.count = 0;
+    }
+
+    fn flush_resolved(&mut self, users: &Users) {
         for pending in &self.batch[..self.count] {
             let mut row = pending.row;
             if row.ts != INVALID {
                 row.person =
-                    self.users
-                        .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                    users.person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
             }
             self.streams.push((row.key >> 55) as u8 as usize, row);
         }
-        self.count = 0;
+    }
+
+    fn flush_unresolved(&mut self) {
+        for pending in &self.batch[..self.count] {
+            let mut row = pending.row;
+            if row.ts != INVALID {
+                let index = self.unresolved.len();
+                if index >= UNRESOLVED as usize {
+                    self.declined.store(true, Relaxed);
+                    return;
+                }
+                row.person = UNRESOLVED | index as u32;
+                self.unresolved.push(pending.uid);
+            }
+            self.streams.push((row.key >> 55) as u8 as usize, row);
+        }
     }
 }
 
-impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
+impl<'a> EventSink<'a> for Parser<'_, '_> {
     #[inline]
     fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
         let id = fields.field::<0>();
@@ -587,7 +612,9 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
-            self.users.prefetch(uid);
+            if let Some(users) = self.users {
+                users.prefetch(uid);
+            }
             pending.row.ts = relative as u32;
             pending.uid = uid;
         }
@@ -599,18 +626,18 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
     }
 }
 
-fn events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
-    users: &Users<'_>,
+pub(super) fn scan_events<'chunk, 'users>(
+    chunks: usize,
+    load: impl Fn(usize) -> &'chunk [u8] + Sync,
+    users: impl Fn() -> Option<&'users Users> + Sync,
     input: &EventInput<'_>,
     declined: &AtomicBool,
-) -> Vec<Streams<Event, SHARDS>> {
+) -> Events {
     let next = AtomicUsize::new(0);
-    rayon::broadcast(|_| {
+    let folds = rayon::broadcast(|_| {
         let mut parser = Parser {
             input,
-            users,
+            users: None,
             declined,
             window_seconds: input.start.div_euclid(1000),
             window_ms: (input.end - input.start) as u64,
@@ -619,21 +646,35 @@ fn events(
             batch: [Pending::EMPTY; 16],
             count: 0,
             streams: Streams::new(),
+            unresolved: Vec::new(),
         };
         loop {
             let index = next.fetch_add(1, Relaxed);
-            if index >= work.len() {
+            if index >= chunks {
                 break;
             }
-            read_ahead.wait(work.raw(index));
-            parser.parse_chunk(work.get(index));
+            let chunk = load(index);
+            if parser.users.is_none() {
+                parser.users = users();
+            }
+            parser.parse_chunk(chunk);
         }
         parser.flush();
-        parser.streams
-    })
+        EventFold {
+            streams: parser.streams,
+            unresolved: parser.unresolved,
+        }
+    });
+    lap(&format!("events scanned (nova, {} folds)", folds.len()));
+    Events(folds)
 }
 
-type EventStream = Streams<Event, SHARDS>;
+struct EventFold {
+    streams: Streams<Event, SHARDS>,
+    unresolved: Vec<u64>,
+}
+
+pub(super) struct Events(Vec<EventFold>);
 
 // Tag bits avoid an indirect load for almost every occupied cell with a
 // different key. The location refers to a record in an immutable stream.
@@ -642,6 +683,7 @@ const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
 
 struct Router {
     people: People,
+    ids: (u32, u32),
     winners: Vec<u32>,
     losers: Vec<u8>,
     bases: Vec<usize>,
@@ -651,19 +693,26 @@ impl Router {
     fn new(reservation: usize) -> Self {
         Self {
             people: People::new(reservation),
+            ids: (0, 0),
             winners: Vec::new(),
             losers: Vec::new(),
             bases: Vec::new(),
         }
     }
 
-    fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
+    fn route(
+        &mut self,
+        folds: &[EventFold],
+        shard: usize,
+        users: &Users,
+        declined: &AtomicBool,
+    ) -> Option<()> {
         let mut count = 0;
         let mut longest = 1;
         self.bases.clear();
         for fold in folds {
             self.bases.push(count);
-            let rows = fold.len(shard);
+            let rows = fold.streams.len(shard);
             count += rows;
             longest = longest.max(rows);
         }
@@ -682,7 +731,7 @@ impl Router {
         self.losers.resize(count, 0);
 
         for (file, fold) in folds.iter().enumerate() {
-            for (index, row) in fold.records(shard).enumerate() {
+            for (index, row) in fold.streams.records(shard).enumerate() {
                 let hash = row.key;
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
                 let location = ((file << shift) + index + 1) as u32;
@@ -697,7 +746,7 @@ impl Router {
                         let previous = ((winner & LOCATION_MASK) - 1) as usize;
                         let prior_file = previous >> shift;
                         let prior_index = previous & (stride - 1);
-                        let prior = folds[prior_file].get(shard, prior_index);
+                        let prior = folds[prior_file].streams.get(shard, prior_index);
                         if prior.key == row.key {
                             // Invalid copies still compete for earliest ingest.
                             if row.ingest < prior.ingest {
@@ -713,56 +762,68 @@ impl Router {
                 }
             }
         }
+        let mut pending = Vec::with_capacity(16);
         for (file, fold) in folds.iter().enumerate() {
             let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
+            for (index, row) in fold.streams.records(shard).enumerate() {
                 if row.ts != INVALID && self.losers[base + index] == 0 {
-                    self.people.push(
-                        row.person as usize & (P - 1),
-                        EvP {
-                            person: row.person,
-                            ts: AtomicU32::new(row.ts),
-                            price: row.price,
-                        },
-                    );
+                    if row.person & UNRESOLVED == 0 {
+                        self.push(row, row.person);
+                    } else {
+                        let uid = fold.unresolved[(row.person & !UNRESOLVED) as usize];
+                        users.prefetch(uid);
+                        pending.push((uid, row));
+                        if pending.len() == 16 {
+                            self.resolve(&mut pending, users, declined);
+                        }
+                    }
                 }
             }
         }
+        self.resolve(&mut pending, users, declined);
         Some(())
+    }
+
+    #[inline]
+    fn push(&mut self, row: &Event, person: u32) {
+        self.people.push(
+            person as usize & (P - 1),
+            EvP {
+                person,
+                ts: AtomicU32::new(row.ts),
+                price: row.price,
+            },
+        );
+    }
+
+    #[inline]
+    fn resolve(&mut self, pending: &mut Vec<(u64, &Event)>, users: &Users, declined: &AtomicBool) {
+        for (uid, row) in pending.drain(..) {
+            let person = users.person(uid, 0, uid, &mut self.ids, declined);
+            self.push(row, person);
+        }
     }
 }
 
-pub(super) fn run_events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
-    users: &Users<'_>,
-    input: &EventInput<'_>,
+pub(super) fn route_events(
+    Events(folds): Events,
+    users: &Users,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let folds = events(work, read_ahead, users, input, declined);
-    if declined.load(Relaxed) {
-        return None;
-    }
-    let (local_count, names) = person_names(users, linked_names)?;
-    lap(&format!(
-        "events parsed (nova, {} folds, {} persons)",
-        folds.len(),
-        names.len()
-    ));
     if declined.load(Relaxed) {
         return None;
     }
     let rows: usize = folds
         .iter()
-        .map(|f| (0..SHARDS).map(|shard| f.len(shard)).sum::<usize>())
+        .map(|f| (0..SHARDS).map(|shard| f.streams.len(shard)).sum::<usize>())
         .sum();
     let reservation = rows.div_ceil(P * rayon::current_num_threads()).min(32_768);
     let people = crate::pt_ordered(
         SHARDS,
         || Router::new(reservation),
         |mut router, shard| {
-            if router.route(&folds, shard).is_none() {
+            if router.route(&folds, shard, users, declined).is_none() {
                 declined.store(true, Relaxed);
             }
             router
@@ -775,6 +836,7 @@ pub(super) fn run_events(
         return None;
     }
     drop(folds);
+    let (local_count, names) = person_names(users, linked_names)?;
     lap("events dedup + validate");
     Some((local_count, names, people))
 }
