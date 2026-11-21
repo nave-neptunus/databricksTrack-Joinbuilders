@@ -20,14 +20,6 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const LOOK: i64 = 7 * DAY;
 
-static SESS_PROF: AtomicBool = AtomicBool::new(false);
-static PROF_GROUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_AGG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_CLICK_SORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_EVENT_SORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_AGGSESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_ATTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PROF_APPEND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static mut T0: Option<Instant> = None;
 fn lap(name: &str) {
     if std::env::var_os("TIMING").is_some() {
@@ -1528,7 +1520,6 @@ fn unpack_ref(r: u64) -> &'static [u8] {
 
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
-    SESS_PROF.store(std::env::var_os("SESS_PROFILE").is_some(), Relaxed);
     let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
     if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, nova) {
         if std::env::var_os("TIMING").is_some() {
@@ -2195,14 +2186,9 @@ fn fast(seed: u64, nova: bool) -> bool {
         let path = format!("{out}/user_daily/part-{}.parquet", worker.index());
         let user = user_parquet::UserParquet::new(path, user_schema.clone());
         let mut state = PartitionState::new(ncs, ndays, cat_names.len(), user);
-        let prof = SESS_PROF.load(Relaxed);
         while let Some(&(_, partition)) = order.get(next.fetch_add(1, Relaxed)) {
-            let t = Instant::now();
             state.group(partition, linked_count, &paccs, &caccs);
-            if prof { PROF_GROUP.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
-            let t = Instant::now();
             state.aggregate(partition, &pname, &cat_names, w0, day0, ndays, ncamp);
-            if prof { PROF_AGG.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
         }
         state.user.close();
         (state.user_rows, state.cd)
@@ -2210,13 +2196,6 @@ fn fast(seed: u64, nova: bool) -> bool {
     std::mem::forget(paccs);
     std::mem::forget(caccs);
     lap("sessions + credit + aggregate + user parquet");
-    if SESS_PROF.load(Relaxed) {
-        let n = rayon::current_num_threads() as f64;
-        let ms = |v: &std::sync::atomic::AtomicU64| v.load(Relaxed) as f64 / 1e6 / n;
-        eprintln!("SESSPROF group={:.1}ms agg={:.1}ms click_sort={:.1}ms event_sort={:.1}ms aggsess={:.1}ms attr={:.1}ms append={:.1}ms (per-worker avg)",
-            ms(&PROF_GROUP), ms(&PROF_AGG), ms(&PROF_CLICK_SORT), ms(&PROF_EVENT_SORT),
-            ms(&PROF_AGGSESS), ms(&PROF_ATTR), ms(&PROF_APPEND));
-    }
 
     let mut cd = vec![[0i64; 4]; ncs * ndays];
     let mut nrows = 0;
@@ -2394,7 +2373,6 @@ impl PartitionState {
             event_ends, click_ends, events, clicks, gather: _, event_scratch, click_scratch, buckets,
             user, user_rows,
         } = self;
-        let prof = SESS_PROF.load(Relaxed);
         let (mut event_start, mut click_start) = (0, 0);
         for (person, (&event_end, &click_end)) in event_ends.iter().zip(click_ends.iter()).enumerate() {
             let events = &mut events[event_start..event_end];
@@ -2403,20 +2381,15 @@ impl PartitionState {
             if events.is_empty() {
                 continue;
             }
-            let t = Instant::now();
             sort_timeline(clicks, click_scratch, |click| click.ts);
-            if prof { PROF_CLICK_SORT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
             let name = pname[person * P + partition];
             let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
-                let t = Instant::now();
                 let category = top_cat(sums, touched, categories);
                 user.append(name, row, categories.get(category as usize).copied());
-                if prof { PROF_APPEND.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
                 *user_rows += 1;
             };
             let (mut lo, mut hi, mut best_click) = (0, 0, None::<Click>);
             let mut attribute = |start, session_day, revenue| {
-                let t = Instant::now();
                 let time = start + LOOK as u32;
                 let day_index = (session_day - day0) as usize;
                 let lower = start;
@@ -2459,14 +2432,10 @@ impl PartitionState {
                 total[0] += 1;
                 total[1] += i64::from(revenue > 0);
                 total[2] += revenue;
-                if prof { PROF_ATTR.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
             };
 
-            let t = Instant::now();
             if events.len() < BUCKET_MIN_LEN {
                 sort_events(events, event_scratch);
-                if prof { PROF_EVENT_SORT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
-                let t = Instant::now();
                 aggregate_sessions(
                     events, origin, catsum, touched_categories,
                     |event| {
@@ -2476,12 +2445,8 @@ impl PartitionState {
                     |event, sums, touched| (1, add_purchase(event as u32, sums, touched)),
                     write_day, &mut attribute,
                 );
-                if prof { PROF_AGGSESS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
             } else {
-                let t = Instant::now();
                 buckets.build(events);
-                if prof { PROF_EVENT_SORT.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
-                let t = Instant::now();
                 aggregate_sessions(
                     &buckets.used, origin, catsum, touched_categories,
                     |index| {
@@ -2491,7 +2456,6 @@ impl PartitionState {
                     |index, sums, touched| buckets.aggregate(index, sums, touched),
                     write_day, &mut attribute,
                 );
-                if prof { PROF_AGGSESS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); }
             }
             for campaign in active.drain(..) {
                 counts[campaign as usize] = 0;
