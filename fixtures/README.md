@@ -30,6 +30,7 @@ All cases share a window of 2026-10-01 to 2026-10-15, the products `p1` (shoes) 
 | E20 | Lines ending `\r\n`: a view (kept), a purchase whose price becomes `1000\r` (dropped), a click whose `ts` becomes `...Z\r` (dropped); event IDs `e3` and `e3\r` | `\r` is an ordinary character, never a line ending |
 | E21 | Duplicate purchases with first ingest at window start + 2^24 seconds (late) and second at window start | Ingest orders outside Nova's 24-bit router encoding decline to exact fallback; the valid 200-cent copy wins |
 | E22 | Duplicate purchases with first ingest at window start - 2^21 - 1 seconds and second at window start | A too-early ingest still wins under the full ordering; the 100-cent copy is retained |
+| E23 | 100 events by 100 distinct unlinked users in one small file, no links or clicks | An all-user table that fills must decline to the exact fallback instead of probing forever |
 
 ## Attribution
 

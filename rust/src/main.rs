@@ -1051,7 +1051,8 @@ impl<'a> Users<'a> {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
-        loop {
+        // A full table has no empty slot to stop the probe: decline to the exact engine.
+        for _ in 0..=self.mask {
             let mut kk = self.sl[2 * i].load(Acquire);
             if kk == 0 {
                 match self.sl[2 * i].compare_exchange(0, k, AcqRel, Acquire) {
@@ -1082,6 +1083,8 @@ impl<'a> Users<'a> {
             }
             i = (i + 1) & self.mask;
         }
+        coll.store(true, Relaxed);
+        0
     }
 
     /// The person of a user id, if it is linked or on a valid event (lookup only; every
@@ -1090,7 +1093,7 @@ impl<'a> Users<'a> {
     fn find(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
-        loop {
+        for _ in 0..=self.mask {
             let kk = self.sl[2 * i].load(Relaxed);
             if kk == 0 {
                 return None;
@@ -1105,6 +1108,8 @@ impl<'a> Users<'a> {
             }
             i = (i + 1) & self.mask;
         }
+        coll.store(true, Relaxed);
+        None
     }
 
     /// Names of all dense ids (padded to whole blocks; unused ids are empty and have no
