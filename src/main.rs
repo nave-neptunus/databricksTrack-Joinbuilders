@@ -346,6 +346,7 @@ fn main() {
     if std::env::var("XL_PPARTS").is_ok_and(|v| v == "0") {
         sys::SETUP_PARTS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    k_free::set_prefetch_distance(std::env::var("XL_PFD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024));
     if std::env::var("XL_POOL").map_or(true, |v| v == "1") {
         sys::pool_start(nt);
     }

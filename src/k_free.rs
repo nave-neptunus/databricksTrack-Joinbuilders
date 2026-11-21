@@ -1,6 +1,7 @@
 
 use crate::iface::*;
 use core::arch::x86_64::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(not(all(
     target_feature = "avx512bw",
@@ -1680,8 +1681,13 @@ unsafe fn cl_fast<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const
 }
 
 const PIPE: u8 = 0;
-const PFD: usize = 1024;
+static PFD: AtomicUsize = AtomicUsize::new(1024);
+const CLICK_PFD: usize = 1024;
 const CHAIN: u8 = 1;
+
+pub fn set_prefetch_distance(pfd: usize) {
+    PFD.store(pfd, Ordering::Relaxed);
+}
 
 #[inline(always)]
 fn here(mut v: u64) -> u64 {
@@ -1718,7 +1724,7 @@ fn scan_click<S: ClickSink>(buf: &[u8], pos: usize, sink: &mut S) -> usize {
 }
 
 macro_rules! pipe_stages {
-    ($S:ident, $cx:ident, $p:ident, $w:ident, $end:ident, $len:ident, $masks:ident, $adv:expr, $line:ident, $s:ident, $d:ident, $cold:ident, $limrd:ident) => {
+    ($S:ident, $cx:ident, $p:ident, $w:ident, $end:ident, $len:ident, $masks:ident, $adv:expr, $line:ident, $s:ident, $d:ident, $cold:ident, $limrd:ident, $pfd:ident) => {
         const REACH: usize = 3 * ($adv + 64) + 2;
         if $len >= REACH {
             let lim = $end.sub(REACH);
@@ -1735,7 +1741,9 @@ macro_rules! pipe_stages {
                 loop {
                     let p2 = k1.next(p1);
                     let k2 = $masks(p2).here();
-                    _mm_prefetch::<_MM_HINT_T0>($p.wrapping_add(PFD) as *const i8);
+                    if $pfd != 0 {
+                        _mm_prefetch::<_MM_HINT_T0>($p.wrapping_add($pfd) as *const i8);
+                    }
                     let r = $d($cx, $p, st, p1, &mut $w);
                     $p = r;
                     if r != p1 {
@@ -1772,8 +1780,9 @@ macro_rules! runner {
                 let cx = &Cx { base, end, b, cache: (*b).scratch.as_mut_ptr() as *mut DateEnt, sink };
                 let mut w = (*b).ts.as_mut_ptr().add((*b).n);
                 let mut p = base;
+                let pfd = PFD.load(Ordering::Relaxed);
                 if MODE == PIPE {
-                    $pipe!(S, cx, p, w, end, len, $masks, $adv, $line, $s, $d, $cold, $limrd);
+                    $pipe!(S, cx, p, w, end, len, $masks, $adv, $line, $s, $d, $cold, $limrd, pfd);
                 }
                 if MODE == CHAIN {
                     const REACH: usize = 2 * ($adv + 64) + 1;
@@ -1781,7 +1790,9 @@ macro_rules! runner {
                         let lim = end.sub(REACH);
                         while p <= lim {
                             let k = $masks(p);
-                            _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(PFD) as *const i8);
+                            if pfd != 0 {
+                                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(pfd) as *const i8);
+                            }
                             p = $line::<S, false>(cx, p, k, k.next(p), &mut w);
                         }
                     }
@@ -2200,7 +2211,7 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
             out("k1") _,
             T = sym T, CTS = sym CTS, CAMP = sym CAMP5R,
             KID1 = const O_KID1, UID1 = const O_UID1M,
-            CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR, PFD = const PFD,
+            CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR, PFD = const CLICK_PFD,
         );
     }
     (code, np, nw)
@@ -2217,6 +2228,7 @@ unsafe fn run_clicks<S: ClickSink, const MODE: u8>(buf: &[u8], sink: &mut S) {
         let cx = &Cx { base, end, b, cache: (*b).scratch.as_mut_ptr() as *mut DateEnt, sink };
         let mut w = (*b).ts.as_mut_ptr().add((*b).n);
         let mut p = base;
+        let pfd = PFD.load(Ordering::Relaxed);
         if MODE == PIPE && len >= CL_REACH {
             let enter = end.sub(CL_REACH);
             let b512 = (*b).camp.as_mut_ptr() as *mut u8;
@@ -2240,7 +2252,9 @@ unsafe fn run_clicks<S: ClickSink, const MODE: u8>(buf: &[u8], sink: &mut S) {
                 let lim = end.sub(REACH);
                 while p <= lim {
                     let k = ck_masks(p);
-                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(PFD) as *const i8);
+                    if pfd != 0 {
+                        _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(pfd) as *const i8);
+                    }
                     p = cl_fast::<S, false>(cx, p, k, k.next(p), &mut w);
                 }
             }
