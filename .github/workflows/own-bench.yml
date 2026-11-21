@@ -1,0 +1,73 @@
+name: Own engine benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'g7/own-*'
+    paths:
+      - 'Dockerfile'
+      - 'rust/**'
+      - 'generator/**'
+      - 'reference/**'
+      - 'fixtures/**'
+      - 'scripts/**'
+      - '.github/workflows/own-bench.yml'
+
+# This workflow deliberately builds once and reuses that image for every
+# correctness and timing run.  Hosted runner storage is cold and noisy, so the
+# reported measurements are only the post-warm container runs.
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      IMAGE: own-shopping-sessions:${{ github.sha }}
+      BENCH_EVENTS: '20000000'
+      BENCH_CLICKS: '5000000'
+      VERIFY_EVENTS: '300000'
+      VERIFY_CLICKS: '75000'
+      WARM_RUNS: '3'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install exact-check dependencies
+        run: python -m pip install --disable-pip-version-check 'polars>=1,<2'
+
+      - name: Build generator
+        run: cargo build --manifest-path generator/Cargo.toml --release --locked
+
+      - name: Build engine image once
+        run: docker build --tag "$IMAGE" .
+
+      - name: Fixtures, reference gate, and warm 20M timings
+        run: scripts/ci_bench.sh
+
+      - name: Publish stage breakdown
+        if: always()
+        run: |
+          if [ -f .ci-bench/timing-summary.md ]; then
+            cat .ci-bench/timing-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload timing logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: own-bench-${{ github.sha }}
+          path: |
+            .ci-bench/timing-summary.md
+            .ci-bench/logs/
+          if-no-files-found: warn
+          retention-days: 14
