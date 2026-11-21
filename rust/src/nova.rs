@@ -3,7 +3,7 @@
 use crate::{DAY, EvP, LazyChunks, P, PB, People, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
-use std::mem::{MaybeUninit, size_of};
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
@@ -224,17 +224,19 @@ const LOC_WORKER_SHIFT: u32 = LOC_PART_SHIFT + PB;
 const INDEX_MASK: u32 = (1 << LOC_INDEX_BITS) - 1;
 const NO_LOC: u32 = u32::MAX;
 
-// Sixteen 12-byte rows fill three 64-byte lines. All 512 buffers occupy 96 KiB
-// per worker. A location is assigned on enqueue, before its payload is flushed.
-const PAYLOAD_ROWS: usize = 16;
+const ROW_WORDS: usize = 3;
+const LINE_WORDS: usize = 64 / size_of::<u32>();
+const _: () = assert!(size_of::<EvP>() == ROW_WORDS * size_of::<u32>());
 
-#[repr(align(64))]
-struct PayloadBatch([MaybeUninit<EvP>; PAYLOAD_ROWS]);
+// The trailing two words let a 12-byte row straddle a full cache line.
+// After flushing that line, carry those words to the start of the next line.
+#[repr(C, align(64))]
+struct PayloadLine([u32; LINE_WORDS + ROW_WORDS - 1]);
 
 struct PeopleWriter<'a> {
-    batches: [PayloadBatch; P],
+    lines: [PayloadLine; P],
     positions: [usize; P],
-    base: *mut EvP,
+    base: *mut u32,
     stride: usize,
     lengths: &'a mut [usize; P],
     overflow: &'a mut [Vec<EvP>; P],
@@ -244,9 +246,10 @@ impl<'a> PeopleWriter<'a> {
     fn new(people: &'a mut People) -> Self {
         assert!(people.lengths.iter().all(|&n| n == 0));
         assert!(people.overflow.iter().all(Vec::is_empty));
+        assert_eq!(people.stride % LINE_WORDS, 0);
         let base = people.storage.as_mut().map_or(std::ptr::null_mut(), |map| map.as_mut_ptr().cast());
         Self {
-            batches: std::array::from_fn(|_| PayloadBatch([const { MaybeUninit::uninit() }; PAYLOAD_ROWS])),
+            lines: [const { PayloadLine([0; LINE_WORDS + ROW_WORDS - 1]) }; P],
             positions: [0; P],
             base,
             stride: people.stride,
@@ -258,48 +261,42 @@ impl<'a> PeopleWriter<'a> {
     #[inline]
     fn push(&mut self, part: usize, person: u32, ts: u32, price: u32) -> usize {
         let index = self.positions[part];
-        let slot = index % PAYLOAD_ROWS;
-        self.batches[part].0[slot].write(EvP { person, ts: AtomicU32::new(ts), price });
         self.positions[part] = index + 1;
-        if slot + 1 == PAYLOAD_ROWS {
-            self.flush(part, PAYLOAD_ROWS);
+        if index >= self.stride {
+            self.overflow[part].push(EvP { person, ts: AtomicU32::new(ts), price });
+            return index;
+        }
+
+        let words = index * ROW_WORDS;
+        let offset = words % LINE_WORDS;
+        let line = &mut self.lines[part];
+        // EvP is repr(C) and stores these three native words in this order.
+        line.0[offset..offset + ROW_WORDS].copy_from_slice(&[person, ts, price]);
+        if offset + ROW_WORDS >= LINE_WORDS {
+            let start = part * self.stride * ROW_WORDS + words - offset;
+            // The mapping and every partition begin on a line boundary. This
+            // full line follows the preceding writes and fits in the mapping.
+            unsafe {
+                copy_payload_line(line, self.base.add(start));
+            }
+            line.0.copy_within(LINE_WORDS..LINE_WORDS + ROW_WORDS - 1, 0);
         }
         index
     }
 
-    #[inline]
-    fn flush(&mut self, part: usize, count: usize) {
-        let src = self.batches[part].0.as_ptr().cast::<EvP>();
-        let start = self.lengths[part];
-        let mapped = count.min(self.stride - start);
-        if mapped != 0 {
-            // This prefix of the batch is initialized. The destination follows
-            // all previous batches and is exclusively owned by this producer.
-            unsafe {
-                copy_people(src, self.base.add(part * self.stride + start), mapped);
-            }
-            self.lengths[part] = start + mapped;
-        }
-        if mapped != count {
-            let tail = &mut self.overflow[part];
-            let added = count - mapped;
-            let len = tail.len();
-            tail.reserve(added);
-            // The rest of the initialized batch fits in reserved, uninitialized
-            // space after the tail. No row needs to be dropped from the staging buffer.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.add(mapped), tail.as_mut_ptr().add(len), added);
-                tail.set_len(len + added);
-            }
-        }
-    }
-
-    fn finish(mut self) {
+    fn finish(self) {
         for part in 0..P {
-            let pending = self.positions[part] % PAYLOAD_ROWS;
+            let rows = self.positions[part].min(self.stride);
+            let words = rows * ROW_WORDS;
+            let pending = words % LINE_WORDS;
             if pending != 0 {
-                self.flush(part, pending);
+                let start = part * self.stride * ROW_WORDS + words - pending;
+                // Only the initialized remainder lies after the full lines.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.lines[part].0.as_ptr(), self.base.add(start), pending);
+                }
             }
+            self.lengths[part] = rows;
         }
     }
 }
@@ -318,22 +315,23 @@ impl Drop for PeopleWriter<'_> {
 }
 
 #[inline]
-unsafe fn copy_people(src: *const EvP, dst: *mut EvP, count: usize) {
+unsafe fn copy_payload_line(line: &PayloadLine, dst: *mut u32) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
-    if count == PAYLOAD_ROWS && dst as usize % 64 == 0 {
+    {
         use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
-        let src = src.cast::<__m256i>();
+        let src = line.0.as_ptr().cast::<__m256i>();
         let dst = dst.cast::<__m256i>();
         // The staging buffer and destination are line-aligned. No destination
         // is reused, and the producer fences its stores before exposing People.
         unsafe {
-            for lane in 0..PAYLOAD_ROWS * size_of::<EvP>() / size_of::<__m256i>() {
-                _mm256_stream_si256(dst.add(lane), _mm256_load_si256(src.add(lane)));
-            }
+            _mm256_stream_si256(dst, _mm256_load_si256(src));
+            _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
         }
-        return;
     }
-    unsafe { std::ptr::copy_nonoverlapping(src, dst, count) };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+    unsafe {
+        std::ptr::copy_nonoverlapping(line.0.as_ptr(), dst, LINE_WORDS);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -807,8 +805,8 @@ fn events(
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
     let reservation = (rows_per_partition + rows_per_partition / 4)
-        .clamp(PAYLOAD_ROWS, INDEX_MASK as usize + 1)
-        .next_multiple_of(PAYLOAD_ROWS);
+        .clamp(LINE_WORDS, INDEX_MASK as usize + 1)
+        .next_multiple_of(LINE_WORDS);
     let mut parsed: Vec<_> = rayon::broadcast(|_| {
         let worker = workers.fetch_add(1, Relaxed) as u32;
         let too_many = worker >= 1 << (32 - LOC_WORKER_SHIFT);
@@ -1027,14 +1025,14 @@ mod tests {
             claims[worker as usize].push((key >> 55) as u8 as usize, Claim { key, ingest, loc });
         }
 
-        let mut people = [People::new(32), People::new(1)];
+        let mut people = [People::new(32), People::new(16)];
         let [first, second] = &mut people;
         let mut first = PeopleWriter::new(first);
         let mut second = PeopleWriter::new(second);
         let mut claims = vec![ClaimStream::new(), ClaimStream::new()];
         // Exercise full lines, overflow, a partial final batch and a claim block boundary.
         for i in 0..300u64 {
-            place(&mut first, &mut claims, 0, i + 1, 20, 3, 10, 1);
+            place(&mut first, &mut claims, 0, i + 1, 20, 3, 10, i as u32 + 1);
         }
         place(&mut second, &mut claims, 1, 1, 10, 7, INVALID, 0);
         place(&mut second, &mut claims, 1, 2, 10, 7, 5, 2);
@@ -1047,7 +1045,7 @@ mod tests {
         Router::new().route(&people, &claims, 0);
         let live = |part| people.iter().flat_map(|p| p.records(part).into_iter().flatten())
             .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
-        assert_eq!(live(3), vec![(3, 10, 1); 298]);
+        assert_eq!(live(3), (3..=300).map(|price| (3, 10, price)).collect::<Vec<_>>());
         assert_eq!(live(7), vec![(7, 5, 2)]);
     }
 
