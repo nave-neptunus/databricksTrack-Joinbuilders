@@ -6,7 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY src src
 COPY pgo/fast.profdata pgo/fast.profdata
-ENV RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -Cprofile-use=/src/pgo/fast.profdata -Cllvm-args=-pgo-warn-mismatch=false"
+ENV RUSTFLAGS="-C target-cpu=cascadelake -C relocation-model=static -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -Cprofile-use=/src/pgo/fast.profdata -Cllvm-args=-no-pgo-warn-mismatch=false"
 RUN cargo build --release --target x86_64-unknown-linux-musl \
  && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
 
