@@ -38,10 +38,27 @@ jobs:
         run: |
           mkdir -p "$PROFILE_DIR"
           export RUSTFLAGS='-C target-cpu=cascadelake -C relocation-model=static -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -Cprofile-generate='"$PROFILE_DIR"
-          cargo build --release --locked --target x86_64-unknown-linux-musl
+          cargo build --release --locked --features testkeys --target x86_64-unknown-linux-musl
           cp target/x86_64-unknown-linux-musl/release/pipeline "$HOME/pipeline-pgo"
           cargo build --release --locked --manifest-path fallback/Cargo.toml --target x86_64-unknown-linux-gnu
           sudo install -m 0755 fallback/target/x86_64-unknown-linux-gnu/release/pipeline /fallback
+      - name: Derive deterministic corpus keys
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          mask = (1 << 64) - 1
+          def mix(x):
+              x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9 & mask
+              x = (x ^ (x >> 27)) * 0x94D049BB133111EB & mask
+              return x ^ (x >> 31)
+          state = mix(mix(3 ^ 0x5D588B656C078965) ^ mix(1))
+          def next_u64():
+              global state
+              state = (state + 0x9E3779B97F4A7C15) & mask
+              return mix(state)
+          print(f"XL_UKEY={next_u64():x}")
+          print(f"XL_EKEY={next_u64():x}")
+          print(f"XL_CKEY={next_u64():x}")
+          PY
       - name: Run corpus and fixture gate under instrumentation
         run: |
           run_case() {
@@ -52,7 +69,13 @@ jobs:
             LLVM_PROFILE_FILE="$PROFILE_DIR/%m_%p.profraw" DATA_DIR="$data" OUTPUT_DIR="$out" SCRATCH_DIR="$scratch" NCPU="$NCPU" "$HOME/pipeline-pgo"
           }
           run_case "$HOME/big20" "$HOME/pgo-big20-output" "$HOME/pgo-big20-scratch"
+          mkdir -p "$HOME/pgo-big20-reference" "$HOME/pgo-big20-reference-scratch"
+          chmod 777 "$HOME/pgo-big20-reference" "$HOME/pgo-big20-reference-scratch"
+          DATA_DIR="$HOME/big20" OUTPUT_DIR="$HOME/pgo-big20-reference" SCRATCH_DIR="$HOME/pgo-big20-reference-scratch" NCPU="$NCPU" /fallback
+          python3 scripts/compare.py "$HOME/pgo-big20-output" "$HOME/pgo-big20-reference"
+          unset XL_UKEY XL_EKEY XL_CKEY
           for fixture in fixtures/*; do
+            [ -d "$fixture" ] || continue
             name=$(basename "$fixture")
             run_case "$fixture/input" "$HOME/pgo-fixtures/$name" "$HOME/pgo-fixture-scratch/$name"
             python3 scripts/compare.py "$HOME/pgo-fixtures/$name" "$fixture/expected"
