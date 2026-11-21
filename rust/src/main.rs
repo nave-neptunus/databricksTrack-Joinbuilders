@@ -1729,7 +1729,7 @@ fn fast(seed: u64) -> bool {
             || EventFold::new(shard_capacity),
             |mut acc, c| {
                 let mut dates = Dates::default();
-                let mut batch = Vec::<ParsedEvent>::with_capacity(16);
+                let mut batch = Vec::<ParsedEvent>::with_capacity(64);
                 let mut short_writer = acc.short_copies.writer();
                 let mut block = (0u32, 0u32);
                 let mut flush = |batch: &mut Vec<ParsedEvent>| {
@@ -1816,7 +1816,7 @@ fn fast(seed: u64) -> bool {
                         r.ts = (t - w0) as u32;
                     }
                     batch.push(r);
-                    if batch.len() == 16 {
+                    if batch.len() == 64 {
                         flush(&mut batch);
                     }
                 });
