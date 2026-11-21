@@ -163,7 +163,7 @@ struct ReadAhead {
     ready: Vec<std::sync::atomic::AtomicBool>,
 }
 
-const RA_PIECE: usize = 16 << 20;
+const RA_PIECE: usize = 32 << 20;
 
 impl ReadAhead {
     fn start(maps: Vec<&'static memmap2::Mmap>, paths: Vec<&'static str>) -> &'static ReadAhead {
