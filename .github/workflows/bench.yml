@@ -32,6 +32,7 @@ jobs:
           - { label: io-pfd, ref: 603a066 }
           - { label: io-fuse, ref: 74d051a }
           - { label: core-runpath, ref: ec7479b }
+          - { label: core-purchase, ref: d38b295 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -101,14 +102,16 @@ jobs:
           - { label: stack1-lanes8, candidate_ref: 96572eb, candidate_label: 'synthetic merge ed40599 + 6fafb87 + 96572eb', image: stack1-lanes8, setting: '' }
           - { label: core-pgo, candidate_ref: d61d19c, image: core-pgo, setting: '' }
           - { label: stack1-pgo, candidate_ref: 7760829, image: stack1-pgo, setting: '' }
-          - { label: io-pfd-default, candidate_ref: 603a066, image: io-pfd, setting: '' }
-          - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0 }
-          - { label: io-pfd-512, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=512 }
-          - { label: io-pfd-1024, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=1024 }
-          - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048 }
-          - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096 }
-          - { label: io-fuse, candidate_ref: 74d051a, image: io-fuse, setting: '', run_tests: 'true' }
-          - { label: core-runpath, candidate_ref: ec7479b, image: core-runpath, setting: '', run_tests: 'true' }
+          - { label: io-pfd-default, candidate_ref: 603a066, image: io-pfd, setting: '', pairs: '8' }
+          - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0, pairs: '8' }
+          - { label: io-pfd-512, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=512, pairs: '8' }
+          - { label: io-pfd-1024, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=1024, pairs: '8' }
+          - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048, pairs: '8' }
+          - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096, pairs: '8' }
+          # 5f08834 only fixes test data; 74d051a is the identical engine timed below.
+          - { label: io-fuse, candidate_ref: 74d051a, test_ref: 5f08834, image: io-fuse, setting: '', run_tests: 'true', pairs: '8' }
+          - { label: core-runpath, candidate_ref: ec7479b, image: core-runpath, setting: '', run_tests: 'true', pairs: '8' }
+          - { label: core-purchase, candidate_ref: d38b295, image: core-purchase, setting: '', run_tests: 'true', pairs: '8' }
     env:
       BASELINE_REF: ${{ matrix.baseline_ref || 'ed40599' }}
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
@@ -116,7 +119,7 @@ jobs:
       CANDIDATE_ENV: ${{ matrix.setting }}
       BASELINE_IMAGE: g7-bench-${{ matrix.baseline_image || 'baseline' }}
       CANDIDATE_IMAGE: g7-bench-${{ matrix.image }}
-      PAIRS: "10"
+      PAIRS: ${{ matrix.pairs || '10' }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -141,13 +144,32 @@ jobs:
       - name: Run candidate unit tests on this Intel AVX-512 runner
         if: matrix.run_tests == 'true'
         env:
-          TEST_REF: ${{ matrix.candidate_ref }}
+          TEST_REF: ${{ matrix.test_ref || matrix.candidate_ref }}
+          KNOWN_TEST_FAILURE: ${{ matrix.known_test_failure }}
         run: |
-          testdir="$RUNNER_TEMP/io-fuse-test"
-          mkdir -p "$testdir"
-          git archive --format=tar "$TEST_REF" | tar -x -C "$testdir"
-          cd "$testdir"
-          cargo test --locked
+          run_test() {
+            ref="$1"
+            testdir="$RUNNER_TEMP/candidate-test-$ref"
+            mkdir -p "$testdir"
+            git archive --format=tar "$ref" | tar -x -C "$testdir"
+            (cd "$testdir" && cargo test --locked)
+          }
+          if [ "$KNOWN_TEST_FAILURE" = "true" ]; then
+            mkdir -p "$HOME/g7-bench/logs"
+            set +e
+            run_test ed40599 >"$HOME/g7-bench/logs/baseline-cargo-test.txt" 2>&1
+            base_status=$?
+            run_test "$TEST_REF" >"$HOME/g7-bench/logs/candidate-cargo-test.txt" 2>&1
+            candidate_status=$?
+            set -e
+            test "$base_status" -ne 0
+            test "$candidate_status" -ne 0
+            grep -q 'ck_vec_matches_scalar' "$HOME/g7-bench/logs/baseline-cargo-test.txt"
+            grep -q 'ck_vec_matches_scalar' "$HOME/g7-bench/logs/candidate-cargo-test.txt"
+            echo "confirmed inherited ck_vec_matches_scalar test-data failure in baseline and candidate"
+          else
+            run_test "$TEST_REF"
+          fi
       - name: Restore 20M corpus cache
         id: corpus
         uses: actions/cache@v4
