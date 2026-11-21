@@ -1,6 +1,6 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{DAY, EvP, LazyChunks, P, PB, People, ReadAhead, Users, event_rows, lap, parse_price};
+use crate::{DAY, COMPACT_CATEGORY_SHIFT, COMPACT_LOCAL_MASK, COMPACT_PURCHASE, CompactEv, EvP, LazyChunks, P, PB, People, PurchaseSide, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
 use std::mem::{MaybeUninit, size_of};
@@ -218,6 +218,56 @@ struct Claim {
 }
 const _: () = assert!(size_of::<Claim>() == 16);
 
+/// An opt-in, preliminary candidate filter for sparse exact dedup.  A bit is
+/// set in `repeats` only after that bucket appeared at least twice; collisions
+/// are deliberately false positives.  The router still compares every stored
+/// key and ingest order exactly, so this structure may retain too many claims
+/// but can never discard a duplicate candidate.
+struct RepeatFilter {
+    mask: usize,
+    repeats: Vec<u8>,
+}
+
+struct RepeatScan {
+    mask: usize,
+    seen: Vec<u8>,
+    repeats: Vec<u8>,
+}
+
+impl RepeatFilter {
+    #[inline]
+    fn slot(key: u64, mask: usize) -> usize {
+        (key ^ key.rotate_left(23) ^ (key >> 31)) as usize & mask
+    }
+
+    #[inline]
+    fn candidate(&self, key: u64) -> bool {
+        let slot = Self::slot(key, self.mask);
+        self.repeats[slot >> 3] & (1 << (slot & 7)) != 0
+    }
+
+    fn bytes(&self) -> usize { self.repeats.len() }
+}
+
+impl RepeatScan {
+    fn new(mask: usize) -> Self {
+        let bytes = (mask + 1).div_ceil(8);
+        Self { mask, seen: vec![0; bytes], repeats: vec![0; bytes] }
+    }
+
+    #[inline]
+    fn mark(&mut self, key: u64) {
+        let slot = RepeatFilter::slot(key, self.mask);
+        let byte = slot >> 3;
+        let bit = 1 << (slot & 7);
+        if self.seen[byte] & bit != 0 {
+            self.repeats[byte] |= bit;
+        } else {
+            self.seen[byte] |= bit;
+        }
+    }
+}
+
 const LOC_INDEX_BITS: u32 = 28 - PB;
 const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
 const LOC_WORKER_SHIFT: u32 = LOC_PART_SHIFT + PB;
@@ -238,6 +288,8 @@ struct PeopleWriter<'a> {
     stride: usize,
     lengths: &'a mut [usize; P],
     overflow: &'a mut [Vec<EvP>; P],
+    compact: Option<&'a mut [Vec<CompactEv>; P]>,
+    purchases: Option<&'a mut [Vec<PurchaseSide>; P]>,
 }
 
 impl<'a> PeopleWriter<'a> {
@@ -252,11 +304,25 @@ impl<'a> PeopleWriter<'a> {
             stride: people.stride,
             lengths: &mut people.lengths,
             overflow: &mut people.overflow,
+            compact: people.compact.as_deref_mut(),
+            purchases: people.purchases.as_deref_mut(),
         }
     }
 
     #[inline]
-    fn push(&mut self, part: usize, person: u32, ts: u32, price: u32) -> usize {
+    fn push(&mut self, part: usize, person: u32, ts: u32, price: u32, purchase: bool) -> usize {
+        if let Some(rows) = self.compact.as_deref_mut() {
+            let index = rows[part].len();
+            let local = person >> PB;
+            debug_assert!(local <= COMPACT_LOCAL_MASK);
+            let category = price >> 24;
+            let bits = local | (category << COMPACT_CATEGORY_SHIFT) | if purchase { COMPACT_PURCHASE } else { 0 };
+            rows[part].push(CompactEv { local_and_category: bits, ts: AtomicU32::new(ts) });
+            if purchase {
+                self.purchases.as_deref_mut().unwrap()[part].push(PurchaseSide { row: index as u32, amount: price & 0x00ff_ffff });
+            }
+            return index;
+        }
         let index = self.positions[part];
         let slot = index % PAYLOAD_ROWS;
         self.batches[part].0[slot].write(EvP { person, ts: AtomicU32::new(ts), price });
@@ -343,6 +409,7 @@ struct Pending {
     uid: u64,
     ts: u32,
     price: u32,
+    purchase: bool,
 }
 
 impl Pending {
@@ -352,6 +419,7 @@ impl Pending {
         uid: 0,
         ts: INVALID,
         price: 0,
+        purchase: false,
     };
 }
 
@@ -502,6 +570,49 @@ fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
         return unsafe { fused_event_rows(bytes, sink) };
     }
     event_rows(bytes, |line, fields| sink.row(line, fields));
+}
+
+impl<'a> EventSink<'a> for RepeatScan {
+    #[inline]
+    fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
+        if let Some(key) = short_key(fields.field::<0>(), b'e').map(permute_short) {
+            self.mark(key);
+        }
+    }
+}
+
+/// First pass for the sparse-dedup experiment.  Each worker's two-bit state
+/// is private; the merge marks a bucket repeated both within and across
+/// workers.  Equal exact keys necessarily select the same bucket, while hash
+/// collisions only add conservative candidates.
+fn repeat_filter(work: &LazyChunks<'_>, read_ahead: &ReadAhead, estimated_rows: usize) -> RepeatFilter {
+    let bits = estimated_rows.max(1 << 20).saturating_mul(2).next_power_of_two().clamp(1 << 20, 1 << 27);
+    let mask = bits - 1;
+    let next = AtomicUsize::new(0);
+    let scans = rayon::broadcast(|_| {
+        let mut scan = RepeatScan::new(mask);
+        loop {
+            let index = next.fetch_add(1, Relaxed);
+            if index >= work.len() { break; }
+            read_ahead.wait(work.raw(index));
+            scan_event_rows(work.get(index), &mut scan);
+        }
+        scan
+    });
+    merge_repeat_scans(mask, scans)
+}
+
+fn merge_repeat_scans(mask: usize, scans: Vec<RepeatScan>) -> RepeatFilter {
+    let bytes = (mask + 1).div_ceil(8);
+    let mut seen = vec![0u8; bytes];
+    let mut repeats = vec![0u8; bytes];
+    for scan in scans {
+        for ((all_seen, all_repeats), (worker_seen, worker_repeats)) in seen.iter_mut().zip(repeats.iter_mut()).zip(scan.seen.into_iter().zip(scan.repeats)) {
+            *all_repeats |= worker_repeats | (*all_seen & worker_seen);
+            *all_seen |= worker_seen;
+        }
+    }
+    RepeatFilter { mask, repeats }
 }
 
 /// Click rows usually fit in two vectors. Decode their separators and quote
@@ -677,7 +788,7 @@ pub(super) struct EventInput<'a> {
     pub(super) end: i64,
 }
 
-struct Parser<'a, 'catalog, 'table> {
+struct Parser<'a, 'catalog, 'table, 'filter> {
     input: &'a EventInput<'catalog>,
     users: &'a Users<'table>,
     declined: &'a AtomicBool,
@@ -690,9 +801,10 @@ struct Parser<'a, 'catalog, 'table> {
     streams: Streams<Claim, SHARDS>,
     people: PeopleWriter<'a>,
     worker: u32,
+    filter: Option<&'filter RepeatFilter>,
 }
 
-impl Parser<'_, '_, '_> {
+impl Parser<'_, '_, '_, '_> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
         scan_event_rows(bytes, self);
     }
@@ -705,7 +817,7 @@ impl Parser<'_, '_, '_> {
                     .users
                     .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
                 let part = person as usize & (P - 1);
-                let index = self.people.push(part, person, pending.ts, pending.price);
+                let index = self.people.push(part, person, pending.ts, pending.price, pending.purchase);
                 if index >= INDEX_MASK as usize {
                     self.declined.store(true, Relaxed);
                     continue;
@@ -718,16 +830,21 @@ impl Parser<'_, '_, '_> {
                 // they have no payload to keep or tombstone.
                 NO_LOC
             };
-            self.streams.push(
-                (pending.key >> 55) as u8 as usize,
-                Claim { key: pending.key, ingest: pending.ingest, loc },
-            );
+            // Unique buckets need no claim: their payload is already final.
+            // Every potentially repeated bucket keeps all copies for the
+            // existing exact key/order router.
+            if self.filter.is_none_or(|filter| filter.candidate(pending.key)) {
+                self.streams.push(
+                    (pending.key >> 55) as u8 as usize,
+                    Claim { key: pending.key, ingest: pending.ingest, loc },
+                );
+            }
         }
         self.count = 0;
     }
 }
 
-impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
+impl<'a> EventSink<'a> for Parser<'_, '_, '_, '_> {
     #[inline]
     fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
         let id = fields.field::<0>();
@@ -779,6 +896,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.price = value | (category << 24);
             }
+            pending.purchase = purchase;
             let Some(uid) = user_key(user) else {
                 self.declined.store(true, Relaxed);
                 break 'valid;
@@ -803,19 +921,21 @@ fn events(
     declined: &AtomicBool,
     estimated_rows: usize,
 ) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
+    let sparse_filter = std::env::var_os("NOVA_SPARSE_DEDUP").map(|_| repeat_filter(work, read_ahead, estimated_rows));
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
     let reservation = (rows_per_partition + rows_per_partition / 4)
         .clamp(PAYLOAD_ROWS, INDEX_MASK as usize + 1)
         .next_multiple_of(PAYLOAD_ROWS);
+    let compact_events = std::env::var_os("NOVA_COMPACT_EVENTS").is_some();
     let mut parsed: Vec<_> = rayon::broadcast(|_| {
         let worker = workers.fetch_add(1, Relaxed) as u32;
         let too_many = worker >= 1 << (32 - LOC_WORKER_SHIFT);
         if too_many {
             declined.store(true, Relaxed);
         }
-        let mut people = People::new(if too_many { 0 } else { reservation });
+        let mut people = People::new(if too_many { 0 } else { reservation }, compact_events);
         let streams = {
             let mut parser = Parser {
                 input,
@@ -830,6 +950,7 @@ fn events(
                 streams: Streams::new(),
                 people: PeopleWriter::new(&mut people),
                 worker,
+                filter: sparse_filter.as_ref(),
             };
             loop {
                 let index = next.fetch_add(1, Relaxed);
@@ -853,6 +974,12 @@ fn events(
     for (_, s, p) in parsed {
         streams.push(s);
         people.push(p);
+    }
+    if std::env::var_os("NOVA_PROFILE").is_some() {
+        let claims: usize = streams.iter().map(|stream| (0..SHARDS).map(|shard| stream.len(shard)).sum::<usize>()).sum();
+        let filter_bytes = sparse_filter.as_ref().map_or(0, RepeatFilter::bytes);
+        eprintln!("NOVA_SPARSE claims={} claim_bytes={} repeat_bytes={} local_filter_peak_bytes={} prepass=1",
+            claims, claims * size_of::<Claim>(), filter_bytes, filter_bytes * 2 * rayon::current_num_threads());
     }
     (streams, people)
 }
@@ -900,7 +1027,7 @@ impl Router {
         let part = ((loc >> LOC_PART_SHIFT) as usize) & (P - 1);
         let index = (loc & INDEX_MASK) as usize;
         // The payload is already in its final slot; only its timestamp changes.
-        people[worker].get(part, index).ts.store(INVALID, Relaxed);
+        people[worker].tombstone(part, index);
     }
 
     fn route(&mut self, people: &[People], claims: &[ClaimStream], shard: usize) {
@@ -975,6 +1102,18 @@ pub(super) fn run_events(
         claims.len(),
         names.len()
     ));
+    if std::env::var_os("NOVA_PROFILE").is_some() {
+        let (events, purchases, event_capacity, purchase_capacity) = people.iter().filter_map(People::compact_stats)
+            .fold((0usize, 0usize, 0usize, 0usize), |(a, b, e, f), (c, d, g, h)| (a + c, b + d, e + g, f + h));
+        if events != 0 || std::env::var_os("NOVA_COMPACT_EVENTS").is_some() {
+            // Normal EvP is 12 B/event.  Compact rows are 8 B/event plus
+            // exactly 8 B/purchase; claims remain 16 B because their exact
+            // ID, ingest order, and tombstone location do not fit safely in 8.
+            eprintln!("NOVA_COMPACT stored_pre_dedup_events={} stored_pre_dedup_purchases={} logical_payload_bytes={} reserved_payload_bytes={} normal_logical_payload_bytes={} claim_bytes={}",
+                events, purchases, events * 8 + purchases * 8, event_capacity * 8 + purchase_capacity * 8, events * size_of::<EvP>(),
+                claims.iter().map(|s| (0..SHARDS).map(|i| s.len(i)).sum::<usize>()).sum::<usize>() * size_of::<Claim>());
+        }
+    }
     if declined.load(Relaxed) {
         return None;
     }
@@ -1021,13 +1160,13 @@ mod tests {
                 NO_LOC
             } else {
                 let part = person as usize & (P - 1);
-                let index = people.push(part, person, ts, price);
+                let index = people.push(part, person, ts, price, price != 0);
                 (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
             };
             claims[worker as usize].push((key >> 55) as u8 as usize, Claim { key, ingest, loc });
         }
 
-        let mut people = [People::new(32), People::new(1)];
+        let mut people = [People::new(32, false), People::new(1, false)];
         let [first, second] = &mut people;
         let mut first = PeopleWriter::new(first);
         let mut second = PeopleWriter::new(second);
@@ -1049,6 +1188,119 @@ mod tests {
             .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
         assert_eq!(live(3), vec![(3, 10, 1); 298]);
         assert_eq!(live(7), vec![(7, 5, 2)]);
+    }
+
+    #[test]
+    fn compact_people_preserves_zero_purchase_and_category_without_expansion() {
+        let mut people = People::new(4, true);
+        let mut writer = PeopleWriter::new(&mut people);
+        // A zero-value purchase is distinct from a view and must retain its
+        // category through the sparse side table.
+        writer.push(3, 3, 17, 9 << 24, true);
+        writer.push(3, 3, 18, 0, false);
+        writer.finish();
+        let mut got = Vec::new();
+        let mut ends = vec![0; 1];
+        people.collect_session_inputs(3, &mut got, &mut ends);
+        assert_eq!(got, vec![(0, (17u64 << 32) | (9u64 << 24)), (0, 18u64 << 32)]);
+        assert_eq!(people.compact_stats().map(|(events, purchases, _, _)| (events, purchases)), Some((2, 1)));
+        assert!(people.storage.is_none());
+        assert_eq!(people.stride, 0);
+        assert_eq!(people.normal_reservation_capacity(), 0);
+    }
+
+    #[test]
+    fn sparse_filter_keeps_cross_worker_duplicates_and_collision_candidates() {
+        let mask = 7;
+        let key = 0x1234_5678_9abc_def0;
+        let mut first = RepeatScan::new(mask);
+        let mut second = RepeatScan::new(mask);
+        first.mark(key);
+        second.mark(key);
+        // Find an unequal key in the same small filter bucket.  The collision
+        // must be retained as a candidate, not mistaken for equality.
+        let colliding = (0..u64::MAX).find(|&other| other != key && RepeatFilter::slot(other, mask) == RepeatFilter::slot(key, mask)).unwrap();
+        let distinct = (0..u64::MAX).find(|&other| RepeatFilter::slot(other, mask) != RepeatFilter::slot(key, mask)).unwrap();
+        let mut third = RepeatScan::new(mask);
+        third.mark(colliding);
+        let filter = merge_repeat_scans(mask, vec![first, second, third]);
+        assert!(filter.candidate(key));
+        assert!(filter.candidate(colliding));
+        assert!(!filter.candidate(distinct));
+    }
+
+    #[test]
+    fn compact_router_keeps_earliest_invalid_and_side_cursor_alignment() {
+        fn place(
+            people: &mut PeopleWriter<'_>, claims: &mut [ClaimStream], worker: u32,
+            key: u64, ingest: i32, person: u32, ts: u32, price: u32, purchase: bool,
+        ) {
+            let loc = if ts == INVALID { NO_LOC } else {
+                let part = person as usize & (P - 1);
+                let index = people.push(part, person, ts, price, purchase);
+                (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
+            };
+            claims[worker as usize].push(0, Claim { key, ingest, loc });
+        }
+        let mut people = [People::new(4, true), People::new(4, true)];
+        let [first, second] = &mut people;
+        let mut first = PeopleWriter::new(first);
+        let mut second = PeopleWriter::new(second);
+        let mut claims = vec![ClaimStream::new(), ClaimStream::new()];
+        // Earlier invalid wins and tombstones a purchase at part 3/index 0.
+        place(&mut first, &mut claims, 0, 10, 20, 3, 10, 7 << 24, true);
+        place(&mut second, &mut claims, 1, 10, 10, 7, INVALID, 0, false);
+        // A later live purchase in the same partition proves the cursor
+        // consumes that tombstoned purchase side entry first.
+        place(&mut first, &mut claims, 0, 12, 20, 3, 30, 4 << 24 | 9, true);
+        // Cross-worker and cross-partition valid duplicate: worker 0 wins.
+        place(&mut first, &mut claims, 0, 11, 20, 4, 40, 2 << 24 | 5, true);
+        place(&mut second, &mut claims, 1, 11, 30, 5, 50, 3 << 24 | 6, true);
+        first.finish();
+        second.finish();
+        Router::new().route(&people, &claims, 0);
+        let mut gathered = Vec::new();
+        let mut ends = vec![0; 1];
+        people[0].collect_session_inputs(3, &mut gathered, &mut ends);
+        assert_eq!(gathered, vec![(0, (30u64 << 32) | ((4u64 << 24) | 9))]);
+        let mut other = Vec::new();
+        people[0].collect_session_inputs(4, &mut other, &mut ends);
+        assert_eq!(other, vec![(0, (40u64 << 32) | ((2u64 << 24) | 5))]);
+        let mut loser = Vec::new();
+        people[1].collect_session_inputs(5, &mut loser, &mut ends);
+        assert!(loser.is_empty());
+    }
+
+    #[test]
+    fn compact_and_normal_people_have_equal_session_inputs_at_bit_limits() {
+        let part = P - 1;
+        let person = (COMPACT_LOCAL_MASK << PB) | part as u32;
+        let price = (255 << 24) | 0x00ff_ff;
+        let mut normal = People::new(4, false);
+        let mut compact = People::new(4, true);
+        let write = |writer: &mut PeopleWriter<'_>| {
+            writer.push(part, person, 1, price, true);
+            writer.push(part, person, 2, 0, false);
+            writer.push(part, person, 3, 255 << 24, true);
+        };
+        {
+            let mut writer = PeopleWriter::new(&mut normal);
+            write(&mut writer);
+            writer.finish();
+        }
+        {
+            let mut writer = PeopleWriter::new(&mut compact);
+            write(&mut writer);
+            writer.finish();
+        }
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut left_ends = vec![0; COMPACT_LOCAL_MASK as usize + 1];
+        let mut right_ends = vec![0; COMPACT_LOCAL_MASK as usize + 1];
+        normal.collect_session_inputs(part, &mut left, &mut left_ends);
+        compact.collect_session_inputs(part, &mut right, &mut right_ends);
+        assert_eq!(left, right);
+        assert_eq!(left_ends, right_ends);
     }
 
     #[test]

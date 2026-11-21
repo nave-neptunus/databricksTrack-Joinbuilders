@@ -1135,15 +1135,35 @@ struct People {
     stride: usize,
     lengths: Box<[usize; P]>,
     overflow: Box<[Vec<EvP>; P]>,
+    // Opt-in Nova representation.  It never allocates the normal payload
+    // mapping: ordinary views/carts are 8 bytes and purchases have an exact,
+    // sparse (row,value) side table.  See PeopleWriter::push for the layout.
+    compact: Option<Box<[Vec<CompactEv>; P]>>,
+    purchases: Option<Box<[Vec<PurchaseSide>; P]>>,
 }
+
+const COMPACT_LOCAL_BITS: u32 = 31 - PB;
+const COMPACT_LOCAL_MASK: u32 = (1 << COMPACT_LOCAL_BITS) - 1;
+const COMPACT_CATEGORY_SHIFT: u32 = COMPACT_LOCAL_BITS;
+const COMPACT_PURCHASE: u32 = 1 << 31;
+
+#[repr(C)]
+struct CompactEv { local_and_category: u32, ts: AtomicU32 }
+const _: () = assert!(std::mem::size_of::<CompactEv>() == 8);
+
+#[repr(C)]
+struct PurchaseSide { row: u32, amount: u32 }
+const _: () = assert!(std::mem::size_of::<PurchaseSide>() == 8);
 
 // The mapping is only written through &mut self; shared access reads initialized prefixes.
 unsafe impl Send for People {}
 unsafe impl Sync for People {}
 
 impl People {
-    fn new(reservation: usize) -> Self {
-        let storage = if reservation == 0 || std::env::var_os("BLUE2_NO_PEOPLE_MAP").is_some() {
+    fn new(reservation: usize, compact_events: bool) -> Self {
+        let compact = compact_events.then(|| Box::new(std::array::from_fn(|_| Vec::with_capacity(reservation))));
+        let purchases = compact_events.then(|| Box::new(std::array::from_fn(|_| Vec::new())));
+        let storage = if compact_events || reservation == 0 || std::env::var_os("BLUE2_NO_PEOPLE_MAP").is_some() {
             None
         } else {
             memmap2::MmapMut::map_anon(reservation * P * std::mem::size_of::<EvP>()).ok()
@@ -1153,12 +1173,18 @@ impl People {
             let _ = mapping.advise(memmap2::Advice::HugePage);
         }
         let stride = if storage.is_some() { reservation } else { 0 };
-        let overflow = Box::new(std::array::from_fn(|_| if stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }));
-        Self { storage, stride, lengths: Box::new([0; P]), overflow }
+        // Compact rows own their own reservations.  In particular, do not
+        // retain 512 unused `Vec<EvP>` allocations merely because compact
+        // storage has no normal mmap stride.
+        let overflow = Box::new(std::array::from_fn(|_| {
+            if !compact_events && stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }
+        }));
+        Self { storage, stride, lengths: Box::new([0; P]), overflow, compact, purchases }
     }
 
     #[inline]
     fn len(&self, part: usize) -> usize {
+        if let Some(rows) = &self.compact { return rows[part].len(); }
         self.lengths[part] + self.overflow[part].len()
     }
 
@@ -1185,9 +1211,69 @@ impl People {
     }
 
     #[inline]
+    fn tombstone(&self, part: usize, index: usize) {
+        if let Some(rows) = &self.compact {
+            rows[part][index].ts.store(TOMBSTONE, Relaxed);
+        } else {
+            let [prefix, overflow] = self.records(part);
+            prefix.get(index).unwrap_or_else(|| &overflow[index - prefix.len()]).ts.store(TOMBSTONE, Relaxed);
+        }
+    }
+
+    #[inline]
     fn get(&self, part: usize, index: usize) -> &EvP {
         let [prefix, overflow] = self.records(part);
         prefix.get(index).unwrap_or_else(|| &overflow[index - prefix.len()])
+    }
+
+    #[inline]
+    fn collect_session_inputs(&self, part: usize, gather: &mut Vec<(u32, u64)>, ends: &mut [usize]) {
+        if let Some(rows) = &self.compact {
+            let purchases = self.purchases.as_ref().unwrap();
+            let mut side = 0;
+            for (index, row) in rows[part].iter().enumerate() {
+                let bits = row.local_and_category;
+                let local = bits & COMPACT_LOCAL_MASK;
+                let price = if bits & COMPACT_PURCHASE == 0 { 0 } else {
+                    // Side rows and compact rows are both append ordered.
+                    // Consume tombstoned purchases too, so a later live
+                    // purchase stays aligned; a missing/misordered entry is
+                    // an invariant failure, never a silently lost price.
+                    let entry = purchases[part].get(side).expect("compact purchase side missing");
+                    assert_eq!(entry.row, index as u32, "compact purchase side order");
+                    side += 1;
+                    entry.amount | (((bits >> COMPACT_CATEGORY_SHIFT) & 0xff) << 24)
+                };
+                let ts = row.ts.load(Relaxed);
+                if ts == TOMBSTONE { continue; }
+                gather.push((local, (u64::from(ts) << 32) | u64::from(price)));
+                ends[local as usize] += 1;
+            }
+            assert_eq!(side, purchases[part].len(), "orphan compact purchase side");
+        } else {
+            for row in self.records(part).into_iter().flatten() {
+                if let Some((person, payload)) = row.session_input() {
+                    let local = (person >> PB) as u32;
+                    gather.push((local, payload));
+                    ends[local as usize] += 1;
+                }
+            }
+        }
+    }
+
+    fn compact_stats(&self) -> Option<(usize, usize, usize, usize)> {
+        self.compact.as_ref().map(|rows| {
+            let events = rows.iter().map(Vec::len).sum();
+            let purchases = self.purchases.as_ref().unwrap().iter().map(Vec::len).sum();
+            let event_capacity = rows.iter().map(Vec::capacity).sum();
+            let purchase_capacity = self.purchases.as_ref().unwrap().iter().map(Vec::capacity).sum();
+            (events, purchases, event_capacity, purchase_capacity)
+        })
+    }
+
+    #[cfg(test)]
+    fn normal_reservation_capacity(&self) -> usize {
+        self.overflow.iter().map(Vec::capacity).sum()
     }
 }
 
@@ -1213,7 +1299,7 @@ impl EventFold {
         Self {
             copies: (0..SH).map(|_| Vec::new()).collect(),
             short_copies: ShortArena::new(shard_capacity),
-            people: People::new(person_capacity),
+            people: People::new(person_capacity, false),
         }
     }
 }
@@ -2329,19 +2415,15 @@ impl PartitionState {
         event_ends.resize(people as usize, 0);
         click_ends.clear();
         click_ends.resize(people as usize, 0);
-        let event_rows = || event_folds.iter()
-            .flat_map(|fold| fold.records(partition))
-            .flatten()
-            .filter_map(EvP::session_input);
         let click_rows = || click_folds.iter().flat_map(|fold| fold.chunks(partition)).flatten();
         // Count and capture the payload in one traversal of the EvP records.
         // The old code walked those records twice (once to count, once to
         // scatter), reloading each atomic timestamp on both passes.
         gather.clear();
-        for (person, payload) in event_rows() {
-            let person = (person >> PB) as u32;
-            gather.push((person, payload));
-            event_ends[person as usize] += 1;
+        for fold in event_folds {
+            // The compact Nova prototype adapts directly into this existing
+            // local-person/payload contract; no full event-price expansion.
+            fold.collect_session_inputs(partition, gather, event_ends);
         }
         for click in click_rows() {
             let person = (click.person >> PB) as usize;
