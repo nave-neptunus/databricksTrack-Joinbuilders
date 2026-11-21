@@ -12,11 +12,6 @@ const SLAB_BYTES: usize = 16 << 20;
 const SHORT_KEY: u64 = 1 << 63;
 const INVALID: u32 = u32::MAX;
 static EVENT_DIGEST: AtomicU64 = AtomicU64::new(0);
-static FIELD_KEY: AtomicU64 = AtomicU64::new(0);
-static FIELD_INGEST: AtomicU64 = AtomicU64::new(0);
-static FIELD_TS: AtomicU64 = AtomicU64::new(0);
-static FIELD_PRICE: AtomicU64 = AtomicU64::new(0);
-static FIELD_VALID: AtomicU64 = AtomicU64::new(0);
 
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
@@ -305,28 +300,14 @@ fn digest_enabled() -> bool {
 }
 
 #[inline]
-fn field_hash(digest: &AtomicU64, value: u64) {
-    digest.fetch_add(
-        value
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            .rotate_left(17),
-        Relaxed,
-    );
-}
-
-#[inline]
-fn mix_digest(digest: &mut u64, key: u64, ingest: i32, ts: u32, price: u32) {
-    let word = key ^ ((ingest as u64) << 32) ^ (u64::from(ts) << 16) ^ u64::from(price);
+fn mix_digest(digest: &mut u64, pending: &Pending) {
+    let row = pending.row;
+    let time = (u64::from(row.ingest as u32) << 32) | u64::from(row.ts);
+    let word = crate::mum(row.key ^ crate::K0, time ^ crate::K1)
+        ^ crate::mum(pending.uid ^ crate::K2, u64::from(row.price) ^ crate::K3);
     *digest = digest
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         .wrapping_add(word.rotate_left(17));
-    field_hash(&FIELD_KEY, key);
-    field_hash(&FIELD_INGEST, ingest as u64);
-    field_hash(&FIELD_TS, u64::from(ts));
-    field_hash(&FIELD_PRICE, u64::from(price));
-    if ts != INVALID {
-        FIELD_VALID.fetch_add(1, Relaxed);
-    }
 }
 
 #[derive(Default)]
@@ -609,12 +590,12 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 /// A fixed-window ISO fast path. The manifest window is only a few days, so
-/// one month-prefix compare plus a 16-entry day table resolves the date; the
+/// one month-prefix compare plus a 32-entry day table resolves the date; the
 /// clock is decoded by the existing SWAR helper. Any other shape, month, or
 /// date goes straight back to `Dates`, which remains the exact authority.
 struct FastDates {
     exact: Dates,
-    midnight: [Option<u32>; 32],
+    midnight: [Option<i64>; 32],
     prefix: [[u8; 10]; 32],
     months: [u64; 8],
     nmonths: usize,
@@ -646,7 +627,7 @@ impl FastDates {
                 return out;
             };
             let index = day as usize;
-            out.midnight[index] = Some((ms.div_euclid(1000)) as u32);
+            out.midnight[index] = Some(ms.div_euclid(1000));
             out.prefix[index].copy_from_slice(&bytes[..10]);
             let month_prefix = crate::rd8(bytes, 0);
             if !out.months[..out.nmonths].contains(&month_prefix) {
@@ -676,11 +657,11 @@ impl FastDates {
             return None;
         }
         let index = tens as usize * 10 + ones as usize;
-        let midnight = self.midnight[index]?;
+        let midnight = self.midnight.get(index).copied().flatten()?;
         if &s[..10] != &self.prefix[index] {
             return None;
         }
-        Some(i64::from(midnight) + clock_seconds(s)?)
+        Some(midnight + clock_seconds(s)?)
     }
 
     #[inline]
@@ -843,13 +824,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             pending.uid = uid;
         }
         if self.digest_on {
-            mix_digest(
-                &mut self.digest,
-                pending.row.key,
-                pending.row.ingest,
-                pending.row.ts,
-                pending.row.price,
-            );
+            mix_digest(&mut self.digest, &pending);
         }
         self.batch[self.count] = pending;
         self.count += 1;
@@ -906,17 +881,26 @@ fn events(
             digest: 0,
             digest_on: dig,
         };
+        let mut digest = 0u64;
         loop {
             let index = next.fetch_add(1, Relaxed);
             if index >= work.len() {
                 break;
             }
             read_ahead.wait(work.raw(index));
+            // Workers claim different chunks on every run. Seed each chunk by
+            // its input position and combine chunk digests commutatively.
+            if dig {
+                parser.digest = (index as u64).wrapping_mul(crate::K4);
+            }
             parser.parse_chunk(work.get(index));
+            if dig {
+                digest = digest.wrapping_add(parser.digest);
+            }
         }
         parser.flush();
         if dig {
-            EVENT_DIGEST.fetch_add(parser.digest, Relaxed);
+            EVENT_DIGEST.fetch_add(digest, Relaxed);
         }
         parser.streams
     })
@@ -1034,11 +1018,6 @@ pub(super) fn run_events(
     let (user0, sys0) = crate::cpu_ticks();
     if digest_enabled() {
         EVENT_DIGEST.store(0, Relaxed);
-        FIELD_KEY.store(0, Relaxed);
-        FIELD_INGEST.store(0, Relaxed);
-        FIELD_TS.store(0, Relaxed);
-        FIELD_PRICE.store(0, Relaxed);
-        FIELD_VALID.store(0, Relaxed);
     }
     let folds = events(work, read_ahead, users, input, declined, &mode);
     let (user1, sys1) = crate::cpu_ticks();
@@ -1067,14 +1046,6 @@ pub(super) fn run_events(
     eprintln!("EVENT_ROWS {}", rows);
     if digest_enabled() {
         eprintln!("EVENT_DIGEST {:016x}", EVENT_DIGEST.load(Relaxed));
-        eprintln!(
-            "EVENT_FIELDS key={:016x} ingest={:016x} ts={:016x} price={:016x} valid={}",
-            FIELD_KEY.load(Relaxed),
-            FIELD_INGEST.load(Relaxed),
-            FIELD_TS.load(Relaxed),
-            FIELD_PRICE.load(Relaxed),
-            FIELD_VALID.load(Relaxed),
-        );
     }
     if mode != "base" {
         return Some((local_count, names, Vec::new()));
@@ -1253,12 +1224,26 @@ mod tests {
             b"2027-12-11T24:00:00Z",
             b"2027-12-11T00:60:00Z",
             b"2027-12-11T00:00:60Z",
+            b"2027-12-99T00:00:00Z",
             b"1791071890000",
             b"0000000000000",
             b"123",
             b"bad",
         ] {
             assert_eq!(fast.parse(value), exact.parse(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn fast_window_dates_keep_signed_epoch_seconds() {
+        for timestamp in [
+            &b"1969-12-31T12:34:56Z"[..],
+            b"2106-02-08T12:34:56Z",
+        ] {
+            let ms = crate::parse_ts(timestamp).unwrap();
+            let mut fast = FastDates::new(ms - 1000, ms + 1000);
+            assert_eq!(fast.fast_iso(timestamp), Some(ms / 1000));
+            assert_eq!(fast.parse(timestamp), Some(ms));
         }
     }
 
