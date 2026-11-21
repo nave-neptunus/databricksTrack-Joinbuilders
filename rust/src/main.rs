@@ -102,15 +102,14 @@ fn chunks<'a>(bufs: &[&'a [u8]], target: usize) -> Vec<&'a [u8]> {
 /// per-block ready flags and hand the slot back when done. Nothing but O_DIRECT DMA touches the
 /// event bytes before the parser, and no fresh memory is faulted per block. Warm data,
 /// non-Linux hosts and file systems without O_DIRECT keep the mmap path.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod dio {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::*};
-    pub const BLK: usize = 4 << 20;
+    const BLK: usize = 4 << 20;
     const PAD: usize = 64 << 10;
     const SLOT: usize = BLK + PAD + 4096;
     const RING: usize = 48;
-
-    pub static RING_MODE: AtomicBool = AtomicBool::new(false);
 
     struct Job {
         file: u32,
@@ -132,21 +131,16 @@ mod dio {
     }
 
     pub struct Input {
-        _maps: Vec<Option<memmap2::Mmap>>,
         _region: Option<memmap2::MmapMut>,
-        _ring: Option<memmap2::MmapMut>,
-        shared: Option<Arc<Shared>>,
+        _ring: memmap2::MmapMut,
+        shared: Arc<Shared>,
         threads: Vec<std::thread::JoinHandle<()>>,
-        slices: Vec<(usize, usize)>, // persistent files (links, clicks); events in mmap mode
-        nev: usize,
-        ev_files: std::ops::Range<usize>,
+        slices: Vec<(usize, usize)>, // persistent files (links, clicks)
     }
 
     impl Drop for Input {
         fn drop(&mut self) {
-            if let Some(s) = &self.shared {
-                s.cancel.store(true, Relaxed);
-            }
+            self.shared.cancel.store(true, Relaxed);
             for t in self.threads.drain(..) {
                 let _ = t.join();
             }
@@ -212,66 +206,57 @@ mod dio {
     }
 
     impl Input {
-        /// A links or clicks file (whole), or an event file in mmap mode.
-        pub fn bytes(&self, f: usize) -> &[u8] {
-            let (a, l) = self.slices[f];
-            if l == 0 { &[] } else { unsafe { std::slice::from_raw_parts(a as *const u8, l) } }
-        }
-        pub fn direct(&self) -> bool {
-            self.shared.is_some()
+        /// Wait for the whole persistent file before lending its bytes.
+        pub fn bytes(&self, f: usize) -> Option<&[u8]> {
+            let s = &self.shared;
+            for (i, j) in s.jobs[..s.ev0].iter().enumerate() {
+                if j.file as usize == f && !self.wait_job(i) {
+                    return None;
+                }
+            }
+            let (a, len) = self.slices[f];
+            Some(if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(a as *const u8, len) } })
         }
         pub fn failed(&self) -> bool {
-            self.shared.as_ref().is_some_and(|s| s.failed.load(Relaxed))
+            self.shared.failed.load(Relaxed)
         }
-        fn wait_job(&self, i: usize) {
-            let Some(s) = &self.shared else { return };
+        fn wait_job(&self, i: usize) -> bool {
             let mut spins = 0;
-            while s.ready[i].load(Acquire) == 0 {
+            while self.shared.ready[i].load(Acquire) == 0 {
                 pause(&mut spins);
-            }
-        }
-        /// Waits for a persistent file. False if a read failed.
-        pub fn wait_file(&self, f: usize) -> bool {
-            if let Some(s) = &self.shared {
-                for (i, j) in s.jobs[..s.ev0].iter().enumerate() {
-                    if j.file as usize == f {
-                        self.wait_job(i);
-                    }
-                }
             }
             !self.failed()
         }
-        /// Number of event chunks.
         pub fn event_chunks(&self) -> usize {
-            self.nev
+            self.shared.jobs.len() - self.shared.ev0
         }
-        /// Up to 64 KiB from the start of the first event file of at least that size.
-        pub fn event_sample(&self) -> &[u8] {
-            match &self.shared {
-                None => self.ev_files.clone().map(|f| self.bytes(f)).find(|b| b.len() >= 1 << 16).map_or(&[], |b| &b[..1 << 16]),
-                Some(s) => {
-                    for (k, j) in s.jobs[s.ev0..].iter().enumerate() {
-                        if j.off == 0 && s.files[j.file as usize].2 >= 1 << 16 {
-                            self.wait_job(s.ev0 + k);
-                            // Only read before any slot is released (before the event parse).
-                            return unsafe { std::slice::from_raw_parts((s.ring + (k % RING) * SLOT) as *const u8, 1 << 16) };
-                        }
+        /// Take the same file sample as the mmap reader, before any slot is released.
+        pub fn event_sample(&self, range: std::ops::Range<usize>) -> Option<&[u8]> {
+            let s = &self.shared;
+            for (k, j) in s.jobs[s.ev0..].iter().enumerate() {
+                if j.off == 0 && s.files[j.file as usize].2 >= range.end {
+                    debug_assert!(k < RING);
+                    if !self.wait_job(s.ev0 + k) {
+                        return None;
                     }
-                    &[]
+                    let ptr = (s.ring + k * SLOT + range.start) as *const u8;
+                    return Some(unsafe { std::slice::from_raw_parts(ptr, range.len()) });
                 }
             }
+            Some(&[])
         }
-        /// Event chunk k: whole data lines, header skipped; the chunks partition each file's lines
-        /// exactly like `chunks`. None means a line too long for the overlap: decline.
-        /// In ring mode, call `release(k)` once nothing refers to the bytes.
-        pub fn event_chunk(&self, k: usize) -> Option<&[u8]> {
-            let Some(s) = &self.shared else {
-                // mmap mode: k indexes 1 MiB ranges over the event files.
-                let (f, a) = self.mmap_range(k);
-                return Some(line_range(self.bytes(f), a, a + (1 << 20)));
-            };
+        /// Lend one chunk until the parser returns, then allow the slot to be reused.
+        pub fn with_event_chunk<T>(&self, k: usize, parse: impl FnOnce(&[u8]) -> T) -> Option<T> {
+            let chunk = self.event_chunk(k).map(parse);
+            self.shared.freed[k % RING].fetch_add(1, Release);
+            chunk
+        }
+        fn event_chunk(&self, k: usize) -> Option<&[u8]> {
+            let s = &self.shared;
             let i = s.ev0 + k;
-            self.wait_job(i);
+            if !self.wait_job(i) {
+                return None;
+            }
             let j = &s.jobs[i];
             let flen = s.files[j.file as usize].2;
             let data = unsafe { std::slice::from_raw_parts((s.ring + (k % RING) * SLOT) as *const u8, j.len) };
@@ -294,30 +279,6 @@ mod dio {
             };
             Some(if st >= en { &[] } else { &data[st..en] })
         }
-        pub fn release(&self, k: usize) {
-            if let Some(s) = &self.shared {
-                s.freed[k % RING].fetch_add(1, Release);
-            }
-        }
-        fn mmap_range(&self, mut k: usize) -> (usize, usize) {
-            for f in self.ev_files.clone() {
-                let n = self.slices[f].1.div_ceil(1 << 20);
-                if k < n {
-                    return (f, k << 20);
-                }
-                k -= n;
-            }
-            unreachable!()
-        }
-    }
-
-    /// Lines starting in raw range [a, b), as in `chunks` (header skipped).
-    fn line_range(data: &[u8], a: usize, b: usize) -> &[u8] {
-        let n = data.len();
-        let nl = |from: usize| memchr::memchr(b'\n', &data[from.min(n)..]).map(|i| from + i);
-        let st = nl(a.saturating_sub(1)).map_or(n, |i| i + 1);
-        let en = if b >= n { n } else { nl(b - 1).map_or(n, |i| i + 1) };
-        if st >= en { &[] } else { &data[st..en] }
     }
 
     #[cfg(target_os = "linux")]
@@ -338,62 +299,71 @@ mod dio {
         if all == 0 { 1.0 } else { yes as f64 / all as f64 }
     }
 
-    /// Files are indexed links, events, clicks (the order given). Reads go links, clicks, events.
-    pub fn open(links: &[String], events: &[String], clicks: &[String], nthreads: usize) -> Option<Input> {
-        let order: Vec<String> = links.iter().chain(events).chain(clicks).cloned().collect();
-        let maps = super::map_all(&order);
-        let ev_files = links.len()..links.len() + events.len();
-        let slices: Vec<(usize, usize)> =
-            maps.iter().map(|m| m.as_ref().map_or((0, 0), |m| (m.as_ptr() as usize, m.len()))).collect();
-        let nev_mmap: usize = ev_files.clone().map(|f| slices[f].1.div_ceil(1 << 20)).sum();
-        let _ = nev_mmap;
-        let mmap_input = |_maps: Vec<Option<memmap2::Mmap>>| -> Option<Input> { None };
+    /// Files are indexed links, events, clicks. Reads go links, clicks, events.
+    pub fn open(
+        paths: &[String],
+        lens: &[usize],
+        ev_files: std::ops::Range<usize>,
+        ev_maps: &[Option<memmap2::Mmap>],
+    ) -> Option<Input> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = nthreads;
-            return mmap_input(maps);
+            let _ = (paths, lens, ev_files, ev_maps);
+            None
         }
         #[cfg(target_os = "linux")]
         {
             let mode = std::env::var("BREAKER_IO").unwrap_or_default();
-            if mode == "mmap" || (mode != "direct" && resident(&maps[ev_files.clone()]) > 0.5) {
-                return mmap_input(maps);
+            let force_direct = mode == "direct";
+            if mode == "mmap" || (!force_direct && resident(ev_maps) > 0.5) {
+                return None;
             }
+            let nthreads = std::env::var("BREAKER_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(8).max(1);
+            use std::os::fd::AsRawFd;
             use std::os::unix::fs::OpenOptionsExt;
-            let lens: Vec<usize> = slices.iter().map(|x| x.1).collect();
-            let mut files = Vec::with_capacity(order.len());
-            for path in &order {
-                let Ok(plain) = std::fs::File::open(path) else { return mmap_input(maps) };
-                let Ok(direct) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path) else {
-                    return mmap_input(maps);
-                };
-                files.push((direct, plain, 0usize));
+
+            // Sampling happens before parsing starts, so it cannot wait for a recycled slot.
+            for end in [1 << 16, 1 << 17] {
+                let before_sample = lens[ev_files.clone()].iter().take_while(|&&len| len < end);
+                if before_sample.filter(|&&len| len != 0).count() >= RING {
+                    return None;
+                }
             }
-            for (f, l) in files.iter_mut().zip(&lens) {
-                f.2 = *l;
+            let mut files = Vec::with_capacity(paths.len());
+            for (path, &len) in paths.iter().zip(lens) {
+                let plain = std::fs::File::open(path).ok()?;
+                let direct = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path).ok()?;
+                // Some tmpfs kernels accept the flag but perform buffered reads anyway.
+                let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                if unsafe { libc::fstatfs(direct.as_raw_fd(), fs.as_mut_ptr()) == 0
+                    && fs.assume_init().f_type == libc::TMPFS_MAGIC }
+                {
+                    return None;
+                }
+                files.push((direct, plain, len));
             }
             // Persistent region for links and clicks.
-            let keep: Vec<usize> = (0..order.len()).filter(|f| !ev_files.contains(f)).collect();
+            let keep: Vec<usize> = (0..paths.len()).filter(|f| !ev_files.contains(f)).collect();
             let total: usize = keep.iter().map(|&f| (lens[f] + 4095) & !4095).sum();
             let mut region = if total > 0 {
                 match memmap2::MmapMut::map_anon(total) {
                     Ok(m) => Some(m),
-                    Err(_) => return mmap_input(maps),
+                    Err(_) => return None,
                 }
             } else {
                 None
             };
-            let Ok(mut ring) = memmap2::MmapMut::map_anon(RING * SLOT) else { return mmap_input(maps) };
+            let mut ring = memmap2::MmapMut::map_anon(RING * SLOT).ok()?;
             let _ = ring.advise(memmap2::Advice::HugePage);
             if let Some(r) = &region {
                 let _ = r.advise(memmap2::Advice::HugePage);
             }
             let base = region.as_mut().map_or(0, |r| r.as_mut_ptr() as usize);
-            let mut slices = vec![(0usize, 0usize); order.len()];
+            let mut slices = vec![(0usize, 0usize); paths.len()];
             let mut jobs = vec![];
             let mut at = base;
-            let link_files = 0..links.len();
-            let click_files = ev_files.end..order.len();
+            let link_files = 0..ev_files.start;
+            let click_files = ev_files.end..paths.len();
             for f in link_files.chain(click_files) {
                 slices[f] = (at, lens[f]);
                 let mut o = 0;
@@ -411,7 +381,6 @@ mod dio {
                     o += BLK;
                 }
             }
-            let nev = jobs.len() - ev0;
             let shared = Arc::new(Shared {
                 files,
                 ready: (0..jobs.len()).map(|_| AtomicU8::new(0)).collect(),
@@ -420,12 +389,12 @@ mod dio {
                 freed: (0..RING).map(|_| AtomicUsize::new(0)).collect(),
                 next: AtomicUsize::new(0), cancel: AtomicBool::new(false), failed: AtomicBool::new(false),
             });
-            let threads = (0..nthreads.max(1))
+            let threads = (0..nthreads)
                 .map(|t| {
                     let s = shared.clone();
                     std::thread::spawn(move || {
                         // Fault this thread's share of the ring before the first read.
-                        let per = RING.div_ceil(nthreads.max(1));
+                        let per = RING.div_ceil(nthreads);
                         let lo = (t * per).min(RING) * SLOT;
                         let hi = ((t + 1) * per).min(RING) * SLOT;
                         if hi > lo {
@@ -437,11 +406,8 @@ mod dio {
                     })
                 })
                 .collect();
-            RING_MODE.store(true, Relaxed);
-            drop(maps);
             Some(Input {
-                _maps: vec![], _region: region, _ring: Some(ring), shared: Some(shared), threads,
-                slices, nev, ev_files,
+                _region: region, _ring: ring, shared, threads, slices,
             })
         }
     }
@@ -454,10 +420,7 @@ thread_local! {
 /// In ring mode event bytes are reused, so a name stored past the parse is copied into a
 /// leaked per-thread arena first.
 #[inline]
-fn persist_name(r: u64) -> u64 {
-    if !dio::RING_MODE.load(Relaxed) || r == 0 {
-        return r;
-    }
+fn persist_name(r: u64) -> Option<u64> {
     let src = unpack_ref(r);
     NAME_ARENA.with(|a| {
         let mut a = a.borrow_mut();
@@ -470,7 +433,7 @@ fn persist_name(r: u64) -> u64 {
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
         a.0 += src.len();
         let copy = unsafe { std::slice::from_raw_parts(dst, src.len()) };
-        pack_ref(copy).unwrap_or(r)
+        pack_ref(copy)
     })
 }
 
@@ -522,8 +485,26 @@ impl<'a> LazyChunks<'a> {
         let end = Self::line_start(b, e).max(start);
         &b[start..end]
     }
-    fn total(&self) -> usize {
-        self.bufs.iter().map(|b| b.len()).sum()
+}
+
+struct EventChunks<'a> {
+    mmap: &'a LazyChunks<'a>,
+    ra: &'a ReadAhead,
+    ring: Option<&'a dio::Input>,
+}
+
+impl EventChunks<'_> {
+    fn len(&self) -> usize {
+        self.ring.map_or(self.mmap.len(), dio::Input::event_chunks)
+    }
+
+    fn with_chunk<T>(&self, index: usize, parse: impl FnOnce(&[u8]) -> T) -> Option<T> {
+        if let Some(ring) = self.ring {
+            ring.with_event_chunk(index, parse)
+        } else {
+            self.ra.wait(self.mmap.raw(index));
+            Some(parse(self.mmap.get(index)))
+        }
     }
 }
 
@@ -574,7 +555,7 @@ impl ReadAhead {
             maps: table,
             ready: (0..ranges.len()).map(|_| std::sync::atomic::AtomicBool::new(!on)).collect(),
         }));
-        if on {
+        if on && !ranges.is_empty() {
             let ranges: &'static [(&'static memmap2::Mmap, &'static str, usize, usize)] = Box::leak(ranges.into_boxed_slice());
             let populate = std::env::var_os("BLUE2_WARM_POPULATE").is_some();
             let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
@@ -1379,10 +1360,11 @@ struct Users<'a> {
     used: std::sync::atomic::AtomicUsize,
     next: std::sync::atomic::AtomicU32,
     names: &'a [std::sync::atomic::AtomicU64],
+    ring_names: bool,
 }
 
 impl<'a> Users<'a> {
-    fn new(tab: &'a mut Tab, nids: usize, npersons: usize) -> Self {
+    fn new(tab: &'a mut Tab, nids: usize, npersons: usize, ring_names: bool) -> Self {
         use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
         let cap = tab.mask + 1;
         // The slots are not otherwise accessed until the table is dropped; AtomicU64 has u64's layout.
@@ -1394,7 +1376,7 @@ impl<'a> Users<'a> {
         let v: Vec<u64> = vec![0; ids];
         let names = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU64, ids) };
         std::mem::forget(v);
-        Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names }
+        Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names, ring_names }
     }
 
     #[inline]
@@ -1440,7 +1422,12 @@ impl<'a> Users<'a> {
                     Ok(_) => {
                         let id = self.fresh(block, coll);
                         if let Some(slot) = self.names.get(id as usize) {
-                            slot.store(persist_name(name), Relaxed);
+                            let name = if self.ring_names { persist_name(name) } else { Some(name) };
+                            if let Some(name) = name {
+                                slot.store(name, Relaxed);
+                            } else {
+                                coll.store(true, Relaxed);
+                            }
                         } else {
                             coll.store(true, Relaxed);
                         }
@@ -2239,36 +2226,34 @@ fn fast(seed: u64) -> bool {
     }
     let ckf = csv_files(&format!("{data}/clicks"));
     let lkf = csv_files(&format!("{data}/links"));
-    // Mappings live for the whole run (the process exits right after), so the read-ahead
-    // threads can hold them.
-    // Cold events: O_DIRECT ring reader (dio); otherwise mmap + read-ahead.
-    let io_threads = std::env::var("BREAKER_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-    let ring = dio::open(&lkf, &evf, &ckf, io_threads);
-    let ev_sizes: Vec<u64> = evf.iter().map(|f| std::fs::metadata(f).map_or(0, |m| m.len())).collect();
-    let (evm, ckm, lkm): (&'static [Option<memmap2::Mmap>], &'static [Option<memmap2::Mmap>], &'static [Option<memmap2::Mmap>]) =
-        if ring.is_some() {
-            (&[], &[], &[])
-        } else {
-            (Box::leak(map_all(&evf).into_boxed_slice()), Box::leak(map_all(&ckf).into_boxed_slice()), Box::leak(map_all(&lkf).into_boxed_slice()))
-        };
-    // Start the cold-cache read-ahead before anything else touches the inputs.
+    let evm = map_all(&evf);
+    if evm.iter().flatten().any(|m| m.len() > u32::MAX as usize) {
+        return false;
+    }
+    let lkm = map_all(&lkf);
+    let ckm = map_all(&ckf);
+    let ev_total: usize = evm.iter().flatten().map(|m| m.len()).sum();
+    let ne = lkf.len() + evf.len();
+    let paths: Vec<_> = lkf.iter().chain(&evf).chain(&ckf).cloned().collect();
+    let lens: Vec<_> = lkm.iter().chain(&evm).chain(&ckm).map(|m| m.as_ref().map_or(0, |m| m.len())).collect();
+    let ring = dio::open(&paths, &lens, lkf.len()..ne, &evm);
+    let (evm, ckm, lkm): (&'static [_], &'static [_], &'static [_]) = if ring.is_some() {
+        (&[], &[], &[])
+    } else {
+        // Read-ahead threads may outlive fast() when it declines to the exact engine.
+        (Box::leak(evm.into_boxed_slice()), Box::leak(ckm.into_boxed_slice()), Box::leak(lkm.into_boxed_slice()))
+    };
     let ra = {
-        let files: Vec<&'static str> = lkf.iter().chain(evf.iter()).chain(ckf.iter()).map(|f| &*Box::leak(f.clone().into_boxed_str())).collect();
-        let maps: Vec<(&'static memmap2::Mmap, &'static str)> = lkm.iter().chain(evm.iter()).chain(ckm.iter()).zip(files)
-            .filter_map(|(m, f)| m.as_ref().map(|m| (m, f))).collect();
+        let maps: Vec<_> = lkm.iter().chain(evm).chain(ckm).zip(paths)
+            .filter_map(|(m, f)| m.as_ref().map(|m| (m, &*Box::leak(f.into_boxed_str())))).collect();
         let (maps, paths) = maps.into_iter().unzip();
         ReadAhead::start(maps, paths)
     };
     let smm = map_all(&[format!("{data}/products.csv"), format!("{data}/campaigns.csv")]);
     let evb = as_slices(evm);
-    if ev_sizes.iter().any(|&l| l > u64::from(u32::MAX)) {
-        return false;
+    if std::env::var_os("TIMING").is_some() {
+        lap(if ring.is_some() { "input O_DIRECT ring" } else { "input mmap" });
     }
-    let (nl, ne) = (lkf.len(), evf.len());
-    let (ckb, lkb) = match &ring {
-        Some(input) => ((nl + ne..nl + ne + ckf.len()).map(|f| input.bytes(f)).collect(), (0..nl).map(|f| input.bytes(f)).collect()),
-        None => (as_slices(ckm), as_slices(lkm)),
-    };
     let smb = as_slices(&smm);
     lap("mapped files");
 
@@ -2306,64 +2291,49 @@ fn fast(seed: u64) -> bool {
     });
     let ncamp = camp_names.len();
 
-    let ev_total: usize = ev_sizes.iter().map(|&l| l as usize).sum();
-    let sample: &[u8] = match &ring {
-        Some(input) => input.event_sample(),
-        None => evb.iter().find(|b| b.len() >= 1 << 16).map_or(&[], |b| &b[..1 << 16]),
+    let event_sample = |range: std::ops::Range<usize>| match &ring {
+        Some(input) => input.event_sample(range),
+        None => Some(evb.iter().find(|b| b.len() >= range.end).map_or(&[][..], |b| &b[range])),
     };
-    let est_users = if sample.len() < 1 << 16 { 0 } else {
+    let Some(sample) = event_sample(0..1 << 16) else { return false };
+    let est_users = if sample.is_empty() { 0 } else {
         let rows = memchr::memchr_iter(b'\n', sample).count().max(1);
-        ev_total / ((1 << 16) / rows).max(1) / 12
+        ev_total / (sample.len() / rows).max(1) / 12
+    };
+    let lkb = match &ring {
+        Some(input) => {
+            let Some(files) = (0..lkf.len()).map(|f| input.bytes(f)).collect::<Option<Vec<_>>>() else { return false };
+            files
+        }
+        None => as_slices(lkm),
     };
     for b in &lkb {
         ra.wait(b);
-    }
-    if let Some(input) = &ring {
-        if !(0..nl).all(|f| input.wait_file(f)) {
-            return false;
-        }
     }
     lap("  links read");
     let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed) else {
         return false;
     };
     let coll = AtomicBool::new(false);
-    let users = Users::new(&mut ltab, nids, pname.len());
+    let users = Users::new(&mut ltab, nids, pname.len(), ring.is_some());
     lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Events phase A: route valid copies directly to people, and record
     // every eligible event ID for the global earliest-ingest decision.
     let ech = LazyChunks::new(&evb, 1 << 20);
-    let cap_sample: &[u8] = match &ring {
-        Some(_) => sample,
-        None => evb.iter().find(|b| b.len() >= 1 << 17).map_or(&[], |b| &b[1 << 16..1 << 17]),
-    };
-    let shard_capacity = Some(cap_sample).filter(|b| !b.is_empty()).map_or(0, |sample| {
-        let rows = memchr::memchr_iter(b'\n', sample).count();
-        let avg_bytes = (sample.len() / rows.max(1)).max(64);
-        let input_bytes: usize = ev_total;
-        let per_shard = (input_bytes / avg_bytes).div_ceil(SH * rayon::current_num_threads());
+    let Some(cap_sample) = event_sample(1 << 16..1 << 17) else { return false };
+    let shard_capacity = if cap_sample.is_empty() { 0 } else {
+        let rows = memchr::memchr_iter(b'\n', cap_sample).count();
+        let avg_bytes = (cap_sample.len() / rows.max(1)).max(64);
+        let per_shard = (ev_total / avg_bytes).div_ceil(SH * rayon::current_num_threads());
         (per_shard + per_shard / 8).min(32_768)
-    });
+    };
     let window_seconds = w0.div_euclid(1000);
-    let nchunks = ring.as_ref().map_or(ech.len(), |input| input.event_chunks());
-    let folds: Vec<EventFold> = pt_ordered(nchunks,
-            || EventFold::new(shard_capacity),
-            |mut acc, ci| {
-                let c = match &ring {
-                    Some(input) => match input.event_chunk(ci) {
-                        Some(c) => c,
-                        None => {
-                            coll.store(true, Relaxed);
-                            input.release(ci);
-                            return acc;
-                        }
-                    },
-                    None => {
-                        ra.wait(ech.raw(ci));
-                        ech.get(ci)
-                    }
-                };
+    let chunks = EventChunks { mmap: &ech, ra, ring: ring.as_ref() };
+    let folds: Vec<EventFold> = pt_ordered(chunks.len(),
+        || EventFold::new(shard_capacity),
+        |mut acc, ci| {
+            if chunks.with_chunk(ci, |c| {
                 let mut dates = Dates::default();
                 let mut batch = Vec::<ParsedEvent>::with_capacity(16);
                 let mut short_writer = acc.short_copies.writer();
@@ -2457,16 +2427,12 @@ fn fast(seed: u64) -> bool {
                     }
                 });
                 flush(&mut batch);
-                drop(flush);
-                if let Some(input) = &ring {
-                    input.release(ci);
-                }
-                acc
-            },
-        );
-    if ring.as_ref().is_some_and(|input| input.failed()) {
-        return false;
-    }
+            }).is_none() {
+                coll.store(true, Relaxed);
+            }
+            acc
+        },
+    );
     let (linked_count, pname) = users.names(&pname, &coll);
     lap(&format!("events parsed ({} folds, {} persons)", folds.len(), pname.len()));
     if coll.load(Relaxed) {
@@ -2488,11 +2454,13 @@ fn fast(seed: u64) -> bool {
 
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
-    if let Some(input) = &ring {
-        if !(nl + ne..nl + ne + ckf.len()).all(|f| input.wait_file(f)) {
-            return false;
+    let ckb = match &ring {
+        Some(input) => {
+            let Some(files) = (ne..ne + ckf.len()).map(|f| input.bytes(f)).collect::<Option<Vec<_>>>() else { return false };
+            files
         }
-    }
+        None => as_slices(ckm),
+    };
     let cch = LazyChunks::new(&ckb, 1 << 20);
     let caccs: Vec<Vec<Vec<Click>>> = pt_ordered(
         cch.len(),
