@@ -29,6 +29,7 @@ jobs:
           - { label: stack1-lanes8, ref: ed40599, combined: "true" }
           - { label: core-pgo, ref: d61d19c }
           - { label: stack1-pgo, ref: 7760829 }
+          - { label: io-pfd, ref: 603a066 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -98,12 +99,18 @@ jobs:
           - { label: stack1-lanes8, candidate_ref: 96572eb, candidate_label: 'synthetic merge ed40599 + 6fafb87 + 96572eb', image: stack1-lanes8, setting: '' }
           - { label: core-pgo, candidate_ref: d61d19c, image: core-pgo, setting: '' }
           - { label: stack1-pgo, candidate_ref: 7760829, image: stack1-pgo, setting: '' }
+          - { label: io-pfd-default, candidate_ref: 603a066, image: io-pfd, setting: '' }
+          - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0 }
+          - { label: io-pfd-512, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=512 }
+          - { label: io-pfd-1024, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=1024 }
+          - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048 }
+          - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096 }
     env:
-      BASELINE_REF: ed40599
+      BASELINE_REF: ${{ matrix.baseline_ref || 'ed40599' }}
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
       CANDIDATE_LABEL: ${{ matrix.candidate_label }}
       CANDIDATE_ENV: ${{ matrix.setting }}
-      BASELINE_IMAGE: g7-bench-baseline
+      BASELINE_IMAGE: g7-bench-${{ matrix.baseline_image || 'baseline' }}
       CANDIDATE_IMAGE: g7-bench-${{ matrix.image }}
       PAIRS: "10"
     steps:
