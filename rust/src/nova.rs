@@ -1,6 +1,6 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
+use crate::{DAY, EvP, EventChunks, P, People, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
 use std::mem::size_of;
@@ -629,8 +629,7 @@ fn route_pending(
 }
 
 pub(super) fn parse_events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+    work: &EventChunks<'_>,
     users: &std::sync::OnceLock<Users<'_>>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
@@ -655,13 +654,17 @@ pub(super) fn parse_events(
             if index >= work.len() || declined.load(Relaxed) {
                 break;
             }
-            read_ahead.wait(work.raw(index));
-            if parser.users.is_none() {
-                if let Some(users) = users.get() {
-                    parser.publish_links(users);
+            if work.with_chunk(index, |bytes| {
+                if parser.users.is_none() {
+                    if let Some(users) = users.get() {
+                        parser.publish_links(users);
+                    }
                 }
+                parser.parse_chunk(bytes);
+            }).is_none() {
+                declined.store(true, Relaxed);
+                break;
             }
-            parser.parse_chunk(work.get(index));
         }
         parser.flush();
         ParsedFold { streams: parser.streams, pending_links: parser.pending_links, ids: parser.ids }
