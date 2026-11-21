@@ -12,6 +12,11 @@ const SLAB_BYTES: usize = 16 << 20;
 const SHORT_KEY: u64 = 1 << 63;
 const INVALID: u32 = u32::MAX;
 static EVENT_DIGEST: AtomicU64 = AtomicU64::new(0);
+static FIELD_KEY: AtomicU64 = AtomicU64::new(0);
+static FIELD_INGEST: AtomicU64 = AtomicU64::new(0);
+static FIELD_TS: AtomicU64 = AtomicU64::new(0);
+static FIELD_PRICE: AtomicU64 = AtomicU64::new(0);
+static FIELD_VALID: AtomicU64 = AtomicU64::new(0);
 
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
@@ -300,11 +305,28 @@ fn digest_enabled() -> bool {
 }
 
 #[inline]
+fn field_hash(digest: &AtomicU64, value: u64) {
+    digest.fetch_add(
+        value
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .rotate_left(17),
+        Relaxed,
+    );
+}
+
+#[inline]
 fn mix_digest(digest: &mut u64, key: u64, ingest: i32, ts: u32, price: u32) {
     let word = key ^ ((ingest as u64) << 32) ^ (u64::from(ts) << 16) ^ u64::from(price);
     *digest = digest
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         .wrapping_add(word.rotate_left(17));
+    field_hash(&FIELD_KEY, key);
+    field_hash(&FIELD_INGEST, ingest as u64);
+    field_hash(&FIELD_TS, u64::from(ts));
+    field_hash(&FIELD_PRICE, u64::from(price));
+    if ts != INVALID {
+        FIELD_VALID.fetch_add(1, Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -1012,6 +1034,11 @@ pub(super) fn run_events(
     let (user0, sys0) = crate::cpu_ticks();
     if digest_enabled() {
         EVENT_DIGEST.store(0, Relaxed);
+        FIELD_KEY.store(0, Relaxed);
+        FIELD_INGEST.store(0, Relaxed);
+        FIELD_TS.store(0, Relaxed);
+        FIELD_PRICE.store(0, Relaxed);
+        FIELD_VALID.store(0, Relaxed);
     }
     let folds = events(work, read_ahead, users, input, declined, &mode);
     let (user1, sys1) = crate::cpu_ticks();
@@ -1040,6 +1067,14 @@ pub(super) fn run_events(
     eprintln!("EVENT_ROWS {}", rows);
     if digest_enabled() {
         eprintln!("EVENT_DIGEST {:016x}", EVENT_DIGEST.load(Relaxed));
+        eprintln!(
+            "EVENT_FIELDS key={:016x} ingest={:016x} ts={:016x} price={:016x} valid={}",
+            FIELD_KEY.load(Relaxed),
+            FIELD_INGEST.load(Relaxed),
+            FIELD_TS.load(Relaxed),
+            FIELD_PRICE.load(Relaxed),
+            FIELD_VALID.load(Relaxed),
+        );
     }
     if mode != "base" {
         return Some((local_count, names, Vec::new()));
