@@ -24,6 +24,7 @@ jobs:
           - { label: core-prerelease, ref: 92b062f }
           - { label: core-prefault, ref: 49449d5 }
           - { label: io-prefault2, ref: abe261c }
+          - { label: stack1, ref: 96572eb }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -69,6 +70,7 @@ jobs:
           - { label: core-prerelease, candidate_ref: 92b062f, image: core-prerelease, setting: '' }
           - { label: core-prefault, candidate_ref: 49449d5, image: core-prefault, setting: '' }
           - { label: io-prefault2, candidate_ref: abe261c, image: io-prefault2, setting: '' }
+          - { label: stack1, candidate_ref: 96572eb, image: stack1, setting: '' }
     env:
       BASELINE_REF: ed40599
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
