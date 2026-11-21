@@ -87,7 +87,7 @@ def timing(stderr):
     return float(exit_match.group(1)), int(rss_match.group(1)) if rss_match else None
 
 
-def run(tag, name, *, cold=False, extra_env=None, preserve=False):
+def run(tag, name, *, cold=False, extra_env=None, preserve=False, capture_minflt=False):
     out = WORK / "outputs" / name
     scratch = WORK / "scratch" / name
     clean(out)
@@ -109,14 +109,19 @@ def run(tag, name, *, cold=False, extra_env=None, preserve=False):
     started = time.perf_counter()
     process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     max_minflt = None
-    while process.poll() is None:
-        inspected = subprocess.run(["docker", "inspect", "--format", "{{.State.Pid}}", container_name], text=True, capture_output=True)
-        if inspected.returncode == 0 and inspected.stdout.strip().isdigit():
-            value = proc_minflt(int(inspected.stdout))
-            if value is not None:
-                max_minflt = value if max_minflt is None else max(max_minflt, value)
-        time.sleep(0.002)
-    stdout, stderr = process.communicate()
+    if capture_minflt:
+        # This is profile-only: repeatedly invoking docker inspect during each
+        # trial steals a CPU from a small hosted runner and corrupts timing.
+        while process.poll() is None:
+            inspected = subprocess.run(["docker", "inspect", "--format", "{{.State.Pid}}", container_name], text=True, capture_output=True)
+            if inspected.returncode == 0 and inspected.stdout.strip().isdigit():
+                value = proc_minflt(int(inspected.stdout))
+                if value is not None:
+                    max_minflt = value if max_minflt is None else max(max_minflt, value)
+            time.sleep(0.05)
+        stdout, stderr = process.communicate()
+    else:
+        stdout, stderr = process.communicate()
     container_seconds = time.perf_counter() - started
     logs = WORK / "logs"
     logs.mkdir(exist_ok=True)
@@ -176,7 +181,7 @@ cand_out, _ = run("g7-bench-candidate", "big20-candidate-gate", extra_env=env, p
 compare(cand_out, base_out, "big20 candidate vs baseline")
 remove(base_out)
 remove(cand_out)
-_, baseline_profile = run("g7-bench-baseline", "baseline-profile", cold=True)
+_, baseline_profile = run("g7-bench-baseline", "baseline-profile", cold=True, capture_minflt=True)
 print("BASELINE_METRICS " + json.dumps(baseline_profile, sort_keys=True), flush=True)
 
 observations = []
