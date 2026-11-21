@@ -453,15 +453,12 @@ fn swar_value(word: u64) -> u64 {
     low.wrapping_add(high) >> 32
 }
 
-/// Classify an already-unquoted event type from one or two u32 loads. Any
-/// spelling that is not exactly `view`, `cart`, or `purchase` is invalid, so
-/// the caller's fallback is the shipped exact comparison.
+/// Classify the already-unquoted event type with one word load.
 #[inline]
 fn event_kind(s: &[u8]) -> u8 {
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
-    const PURC: u32 = u32::from_le_bytes(*b"purc");
-    const HASE: u32 = u32::from_le_bytes(*b"hase");
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     match s.len() {
         4 => {
             let word = u32::from_le_bytes(s[..4].try_into().unwrap());
@@ -473,15 +470,24 @@ fn event_kind(s: &[u8]) -> u8 {
                 0
             }
         }
-        8 => {
-            if crate::rd4(s, 0) as u32 == PURC && crate::rd4(s, 4) as u32 == HASE {
-                3
-            } else {
-                0
-            }
-        }
+        8 if crate::rd8(s, 0) == PURCHASE => 3,
         _ => 0,
     }
+}
+
+/// Decode the five-digit prefix separately from the eight-digit suffix.
+/// The two overlapping loads cover all thirteen bytes for validation.
+#[inline]
+fn epoch_ms_13(s: &[u8]) -> Option<i64> {
+    let first = crate::rd8(s, 0);
+    let last = crate::rd8(s, 5);
+    if !(swar_digits(first) & swar_digits(last)) {
+        return None;
+    }
+    let digits = first & 0x0000_000f_0f0f_0f0f;
+    let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8);
+    let prefix = (pairs & 0xff) * 1000 + ((pairs >> 16) & 0xff) * 10 + (digits >> 32);
+    Some((prefix * 100_000_000 + swar_value(last)) as i64)
 }
 
 /// Decode six ASCII digits and two colons with a single eight-byte load.
@@ -589,95 +595,62 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + if month <= 2 { 1 } else { 0 }, month, day)
 }
 
-/// A fixed-window ISO fast path. The manifest window is only a few days, so
-/// one month-prefix compare plus a 32-entry day table resolves the date; the
-/// clock is decoded by the existing SWAR helper. Any other shape, month, or
-/// date goes straight back to `Dates`, which remains the exact authority.
-struct FastDates {
-    exact: Dates,
-    midnight: [Option<i64>; 32],
-    prefix: [[u8; 10]; 32],
-    months: [u64; 8],
-    nmonths: usize,
-    enabled: bool,
+#[derive(Clone, Copy)]
+struct WindowDate {
+    prefix: u64,
+    day_and_t: u32,
+    midnight: i64,
 }
 
+/// Seed exact ISO date keys from the manifest once per parser.
+struct FastDates([WindowDate; 32]);
+
 impl FastDates {
+    const EMPTY: Self = Self(
+        [WindowDate { prefix: 0, day_and_t: u32::MAX, midnight: 0 }; 32],
+    );
+
+    #[inline]
+    fn index(day_and_t: u32) -> usize {
+        // Modulo 32 keeps only the low five bits of each day digit.
+        (day_and_t.wrapping_mul(10).wrapping_add(day_and_t >> 8) & 31) as usize
+    }
+
     fn new(start: i64, end: i64) -> Self {
-        let mut out = Self {
-            exact: Dates::default(),
-            midnight: [None; 32],
-            prefix: [[0; 10]; 32],
-            months: [0; 8],
-            nmonths: 0,
-            enabled: true,
-        };
-        let first = start.div_euclid(86_400_000);
-        let last = (end - 1).div_euclid(86_400_000);
+        let mut out = Self::EMPTY;
+        let first = start.div_euclid(DAY);
+        let last = (end - 1).div_euclid(DAY);
         if last < first || last - first >= 32 {
-            out.enabled = false;
             return out;
         }
         for days in first..=last {
             let (year, month, day) = civil_from_days(days);
-            let text = format!("{year:04}-{month:02}-{day:02}T00:00:00Z");
-            let bytes = text.as_bytes();
-            let Some(ms) = crate::parse_ts(bytes) else {
-                out.enabled = false;
-                return out;
-            };
-            let index = day as usize;
-            out.midnight[index] = Some(ms.div_euclid(1000));
-            out.prefix[index].copy_from_slice(&bytes[..10]);
-            let month_prefix = crate::rd8(bytes, 0);
-            if !out.months[..out.nmonths].contains(&month_prefix) {
-                if out.nmonths == out.months.len() {
-                    out.enabled = false;
-                    return out;
-                }
-                out.months[out.nmonths] = month_prefix;
-                out.nmonths += 1;
+            if !(0..=9999).contains(&year) {
+                continue;
             }
+            let text = format!("{year:04}-{month:02}-{day:02}T0");
+            let bytes = text.as_bytes();
+            let day_and_t = crate::rd4(bytes, 8) as u32 & 0x00ff_ffff;
+            out.0[Self::index(day_and_t)] = WindowDate {
+                prefix: crate::rd8(bytes, 0),
+                day_and_t,
+                midnight: days * (DAY / 1000),
+            };
         }
         out
     }
 
     #[inline]
     fn fast_iso(&self, s: &[u8]) -> Option<i64> {
-        if !self.enabled || s.len() != 20 || s[19] != b'Z' || s[10] != b'T' {
+        if s.len() != 20 || s[19] != b'Z' {
             return None;
         }
-        let month = crate::rd8(s, 0);
-        if !self.months[..self.nmonths].contains(&month) {
+        let day_and_t = crate::rd4(s, 8) as u32 & 0x00ff_ffff;
+        let entry = &self.0[Self::index(day_and_t)];
+        if (crate::rd8(s, 0) ^ entry.prefix) | u64::from(day_and_t ^ entry.day_and_t) != 0 {
             return None;
         }
-        let tens = s[8].wrapping_sub(b'0');
-        let ones = s[9].wrapping_sub(b'0');
-        if tens > 9 || ones > 9 {
-            return None;
-        }
-        let index = tens as usize * 10 + ones as usize;
-        let midnight = self.midnight.get(index).copied().flatten()?;
-        if &s[..10] != &self.prefix[index] {
-            return None;
-        }
-        Some(midnight + clock_seconds(s)?)
-    }
-
-    #[inline]
-    fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
-        if let Some(seconds) = self.fast_iso(s) {
-            return Some(seconds);
-        }
-        self.exact.utc_seconds(s)
-    }
-
-    #[inline]
-    fn parse(&mut self, s: &[u8]) -> Option<i64> {
-        if let Some(seconds) = self.fast_iso(s) {
-            return Some(seconds * 1000);
-        }
-        self.exact.parse(s)
+        Some(entry.midnight + clock_seconds(s)?)
     }
 }
 
@@ -688,15 +661,14 @@ pub(super) struct EventInput<'a> {
     pub(super) end: i64,
 }
 
-struct Parser<'a, 'catalog, 'table> {
+struct Parser<'a, 'catalog, 'table, const FAST: bool> {
     input: &'a EventInput<'catalog>,
     users: &'a Users<'table>,
     declined: &'a AtomicBool,
     window_seconds: i64,
     window_ms: u64,
     dates: Dates,
-    fast_dates: Option<FastDates>,
-    fast_fields: bool,
+    fast_dates: FastDates,
     ids: (u32, u32),
     batch: [Pending; 16],
     count: usize,
@@ -707,27 +679,28 @@ struct Parser<'a, 'catalog, 'table> {
     digest_on: bool,
 }
 
-impl Parser<'_, '_, '_> {
+impl<const FAST: bool> Parser<'_, '_, '_, FAST> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
         scan_event_rows(bytes, self);
     }
 
     #[inline]
     fn ingest_seconds(&mut self, s: &[u8]) -> Option<i64> {
-        if self.fast_fields {
-            self.fast_dates.as_mut().unwrap().utc_seconds(s)
-        } else {
-            self.dates.utc_seconds(s)
+        if FAST && let Some(seconds) = self.fast_dates.fast_iso(s) {
+            return Some(seconds);
         }
+        self.dates.utc_seconds(s)
     }
 
     #[inline]
     fn event_time(&mut self, s: &[u8]) -> Option<i64> {
-        if self.fast_fields {
-            self.fast_dates.as_mut().unwrap().parse(s)
-        } else {
-            self.dates.parse(s)
+        if FAST && s.len() == 13 {
+            return epoch_ms_13(s);
         }
+        if FAST && let Some(seconds) = self.fast_dates.fast_iso(s) {
+            return Some(seconds * 1000);
+        }
+        self.dates.parse(s)
     }
 
     #[inline]
@@ -755,7 +728,7 @@ impl Parser<'_, '_, '_> {
     }
 }
 
-impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
+impl<'a, const FAST: bool> EventSink<'a> for Parser<'_, '_, '_, FAST> {
     #[inline]
     fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
         let id = fields.field::<0>();
@@ -784,7 +757,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             if user.is_empty() || fields.empty::<5>() {
                 break 'valid;
             }
-            let purchase = if self.fast_fields {
+            let purchase = if FAST {
                 match event_kind(fields.field::<4>()) {
                     1 | 2 => false,
                     3 => true,
@@ -834,7 +807,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
     }
 }
 
-fn events(
+fn events<const FAST: bool>(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
     users: &Users<'_>,
@@ -843,7 +816,6 @@ fn events(
     mode: &str,
 ) -> Vec<Streams<Event, SHARDS>> {
     let next = AtomicUsize::new(0);
-    let ff = fast_fields();
     let dig = digest_enabled();
     rayon::broadcast(|_| {
         if mode == "scan" {
@@ -859,19 +831,18 @@ fn events(
             std::hint::black_box(sink.sum);
             return Streams::new();
         }
-        let mut parser = Parser {
+        let mut parser = Parser::<FAST> {
             input,
             users,
             declined,
             window_seconds: input.start.div_euclid(1000),
             window_ms: (input.end - input.start) as u64,
             dates: Dates::default(),
-            fast_dates: if ff {
-                Some(FastDates::new(input.start, input.end))
+            fast_dates: if FAST {
+                FastDates::new(input.start, input.end)
             } else {
-                None
+                FastDates::EMPTY
             },
-            fast_fields: ff,
             ids: (0, 0),
             batch: [Pending::EMPTY; 16],
             count: 0,
@@ -1019,7 +990,11 @@ pub(super) fn run_events(
     if digest_enabled() {
         EVENT_DIGEST.store(0, Relaxed);
     }
-    let folds = events(work, read_ahead, users, input, declined, &mode);
+    let folds = if fast_fields() {
+        events::<true>(work, read_ahead, users, input, declined, &mode)
+    } else {
+        events::<false>(work, read_ahead, users, input, declined, &mode)
+    };
     let (user1, sys1) = crate::cpu_ticks();
     if declined.load(Relaxed) {
         return None;
@@ -1205,32 +1180,28 @@ mod tests {
 
     #[test]
     fn fast_window_dates_match_exact_parser() {
-        let start = crate::parse_ts(b"2027-12-11T00:00:00Z").unwrap();
-        let end = crate::parse_ts(b"2027-12-26T00:00:00Z").unwrap();
-        let mut fast = FastDates::new(start, end);
-        let mut exact = Dates::default();
-        for day in 11..=25 {
+        let start = crate::parse_ts(b"2027-12-20T00:00:00Z").unwrap();
+        let end = crate::parse_ts(b"2028-01-07T00:00:00Z").unwrap();
+        let fast = FastDates::new(start, end);
+        for (year, month, day) in (20..=31).map(|d| (2027, 12, d))
+            .chain((1..=6).map(|d| (2028, 1, d)))
+        {
             for (hour, minute, second) in [(0, 0, 0), (11, 22, 33), (23, 59, 59)] {
-                let text = format!("2027-12-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
+                let text = format!("{year}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
                 let bytes = text.as_bytes();
-                assert_eq!(fast.utc_seconds(bytes), exact.utc_seconds(bytes), "{text}");
-                assert_eq!(fast.parse(bytes), exact.parse(bytes), "{text}");
+                assert_eq!(fast.fast_iso(bytes), crate::parse_ts(bytes).map(|ms| ms / 1000), "{text}");
             }
         }
         for value in [
             &b"2027-11-11T00:00:00Z"[..],
-            b"2027-12-26T00:00:00Z",
-            b"2027-12-11T00:00:00+01:00",
-            b"2027-12-11T24:00:00Z",
-            b"2027-12-11T00:60:00Z",
-            b"2027-12-11T00:00:60Z",
+            b"2028-01-07T00:00:00Z",
+            b"2027-12-20T00:00:00+01:00",
+            b"2027-12-20T24:00:00Z",
+            b"2027-12-20T00:60:00Z",
+            b"2027-12-20T00:00:60Z",
             b"2027-12-99T00:00:00Z",
-            b"1791071890000",
-            b"0000000000000",
-            b"123",
-            b"bad",
         ] {
-            assert_eq!(fast.parse(value), exact.parse(value), "{value:?}");
+            assert_eq!(fast.fast_iso(value), None, "{value:?}");
         }
     }
 
@@ -1241,9 +1212,25 @@ mod tests {
             b"2106-02-08T12:34:56Z",
         ] {
             let ms = crate::parse_ts(timestamp).unwrap();
-            let mut fast = FastDates::new(ms - 1000, ms + 1000);
+            let fast = FastDates::new(ms - 1000, ms + 1000);
             assert_eq!(fast.fast_iso(timestamp), Some(ms / 1000));
-            assert_eq!(fast.parse(timestamp), Some(ms));
+        }
+    }
+
+    #[test]
+    fn fixed_width_epoch_decoder_matches_general_parser() {
+        for n in [0, 1, 1_791_071_890_000, 9_999_999_999_999] {
+            let s = format!("{n:013}");
+            assert_eq!(epoch_ms_13(s.as_bytes()), Some(n));
+        }
+        let mut input = *b"1791071890000";
+        for i in 0..input.len() {
+            let saved = input[i];
+            for byte in 0..=u8::MAX {
+                input[i] = byte;
+                assert_eq!(epoch_ms_13(&input), crate::parse_ts(&input));
+            }
+            input[i] = saved;
         }
     }
 
