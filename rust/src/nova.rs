@@ -5,7 +5,7 @@ use crate::{
     unpack_ref,
 };
 use ahash::AHashMap;
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
@@ -492,7 +492,7 @@ const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
 struct Router {
     people: People,
     winners: Vec<u32>,
-    losers: Vec<u8>,
+    outputs: Vec<MaybeUninit<u32>>,
     bases: Vec<usize>,
 }
 
@@ -501,9 +501,30 @@ impl Router {
         Self {
             people: People::new(reservation),
             winners: Vec::new(),
-            losers: Vec::new(),
+            outputs: Vec::new(),
             bases: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn emit(&mut self, row: &Event) -> Option<u32> {
+        if row.ts == INVALID {
+            return Some(INVALID);
+        }
+        let partition = row.person as usize & (P - 1);
+        let index = u32::try_from(self.people.len(partition)).ok()?;
+        if index == INVALID {
+            return None;
+        }
+        self.people.push(
+            partition,
+            EvP {
+                person: row.person,
+                ts: AtomicU32::new(row.ts),
+                price: row.price,
+            },
+        );
+        Some(index)
     }
 
     fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
@@ -527,10 +548,10 @@ impl Router {
         let mask = (count * 2).next_power_of_two() - 1;
         self.winners.clear();
         self.winners.resize(mask + 1, 0);
-        self.losers.clear();
-        self.losers.resize(count, 0);
+        self.outputs.resize_with(count, MaybeUninit::uninit);
 
         for (file, fold) in folds.iter().enumerate() {
+            let base = self.bases[file];
             for (index, row) in fold.records(shard).enumerate() {
                 let hash = event_hash(row.key);
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
@@ -539,6 +560,8 @@ impl Router {
                 loop {
                     let winner = self.winners[slot];
                     if winner == 0 {
+                        let output = self.emit(row)?;
+                        self.outputs[base + index].write(output);
                         self.winners[slot] = tag | location;
                         break;
                     }
@@ -550,30 +573,25 @@ impl Router {
                         if same_event(prior.key, row.key) {
                             // Invalid copies still compete for earliest ingest.
                             if row.ingest < prior.ingest {
-                                self.losers[self.bases[prior_file] + prior_index] = 1;
+                                // Every published winner has initialized its output index.
+                                let previous = unsafe {
+                                    self.outputs[self.bases[prior_file] + prior_index].assume_init()
+                                };
+                                if previous != INVALID {
+                                    let partition = prior.person as usize & (P - 1);
+                                    self.people
+                                        .get(partition, previous as usize)
+                                        .ts
+                                        .store(INVALID, Relaxed);
+                                }
+                                let output = self.emit(row)?;
+                                self.outputs[base + index].write(output);
                                 self.winners[slot] = tag | location;
-                            } else {
-                                self.losers[self.bases[file] + index] = 1;
                             }
                             break;
                         }
                     }
                     slot = (slot + 1) & mask;
-                }
-            }
-        }
-        for (file, fold) in folds.iter().enumerate() {
-            let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
-                if row.ts != INVALID && self.losers[base + index] == 0 {
-                    self.people.push(
-                        row.person as usize & (P - 1),
-                        EvP {
-                            person: row.person,
-                            ts: AtomicU32::new(row.ts),
-                            price: row.price,
-                        },
-                    );
                 }
             }
         }
