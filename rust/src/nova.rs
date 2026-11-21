@@ -748,6 +748,10 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.declined.store(true, Relaxed);
             return;
         };
+        if encode_ingest(order).is_none() {
+            self.declined.store(true, Relaxed);
+            return;
+        }
         let mut pending = Pending::EMPTY;
         pending.key = key;
         pending.ingest = order;
@@ -865,6 +869,20 @@ type ClaimStream = Streams<Claim, SHARDS>;
 const META_GEN_SHIFT: u32 = 24;
 const META_INGEST_MASK: u32 = (1 << META_GEN_SHIFT) - 1;
 const INGEST_BIAS: i32 = 1 << 21;
+const INGEST_MIN: i32 = -INGEST_BIAS;
+const INGEST_MAX: i32 = META_INGEST_MASK as i32 - INGEST_BIAS;
+
+// The router stores ingest order in the low 24 bits of `meta`. Keep this
+// conversion checked at the parser boundary so the exact fallback retains the
+// full i32 ordering rather than allowing two orders to alias here.
+#[inline]
+fn encode_ingest(ingest: i32) -> Option<u32> {
+    if !(INGEST_MIN..=INGEST_MAX).contains(&ingest) {
+        return None;
+    }
+    let encoded = i64::from(ingest) + i64::from(INGEST_BIAS);
+    Some(encoded as u32)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -929,7 +947,9 @@ impl Router {
                     if let Some(next) = block.get(offset + 8) {
                         crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
                     }
-                    let meta = generation | ((claim.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
+                    let meta = generation
+                        | encode_ingest(claim.ingest)
+                            .expect("router received ingest outside its 24-bit encoding");
                     let mut slot = claim.key as usize & mask;
                     loop {
                         let winner = self.slots[slot];
@@ -1004,6 +1024,16 @@ pub(super) fn run_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingest_encoding_accepts_exact_bounds_and_rejects_aliases() {
+        assert_eq!(encode_ingest(INGEST_MIN), Some(0));
+        assert_eq!(encode_ingest(INGEST_MAX), Some(META_INGEST_MASK));
+        assert_eq!(encode_ingest(INGEST_MIN - 1), None);
+        assert_eq!(encode_ingest(INGEST_MAX + 1), None);
+        assert_eq!(encode_ingest(i32::MIN), None);
+        assert_eq!(encode_ingest(i32::MAX), None);
+    }
 
     #[test]
     fn router_keeps_earliest_invalid_and_changed_person_copies() {
