@@ -161,64 +161,141 @@ struct ReadAhead {
     // per mapping (by address): start address, length, index of its first range
     maps: Vec<(usize, usize, usize)>,
     ready: Vec<std::sync::atomic::AtomicBool>,
+    // a buffer range could not be read: the fast engine must decline
+    failed: std::sync::atomic::AtomicBool,
 }
 
 const RA_PIECE: usize = 16 << 20;
 
+/// Where an input's bytes come from: a file mapping warmed through the page cache, or an
+/// anonymous buffer the read-ahead threads fill with pread (optionally O_DIRECT).
+#[derive(Clone, Copy)]
+enum Src {
+    Map(&'static memmap2::Mmap),
+    Buf { ptr: usize, cap: usize, direct: bool },
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    fn gettid() -> i32;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_DIRECT: i32 = 0o40000;
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+const O_DIRECT: i32 = 0o200000;
+
+/// Read mode for the inputs: BLUE2_READ=mmap (default), pread, direct.
+fn read_mode() -> (bool, bool) {
+    match std::env::var("BLUE2_READ").as_deref() {
+        Ok("pread") => (true, false),
+        Ok("direct") => (true, cfg!(target_os = "linux")),
+        _ => (false, false),
+    }
+}
+
+/// Inputs as `'static` slices plus their sources. Buffer mode allocates anonymous memory (THP)
+/// that the read-ahead threads fill; readers must `ReadAhead::wait` before touching bytes.
+fn load_all(files: &[String], buffered: bool, direct: bool) -> Vec<(&'static [u8], Option<Src>)> {
+    files
+        .par_iter()
+        .map(|f| {
+            let file = std::fs::File::open(f).unwrap();
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+            if len == 0 {
+                return (&[][..], None);
+            }
+            if !buffered {
+                let m: &'static memmap2::Mmap = Box::leak(Box::new(unsafe { memmap2::Mmap::map(&file).unwrap() }));
+                return (&m[..], Some(Src::Map(m)));
+            }
+            let cap = len.div_ceil(2 << 20) * (2 << 20);
+            let mut m = memmap2::MmapMut::map_anon(cap).unwrap();
+            #[cfg(target_os = "linux")]
+            let _ = m.advise(memmap2::Advice::HugePage);
+            let ptr = m.as_mut_ptr() as usize;
+            std::mem::forget(m);
+            let b: &'static [u8] = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            (b, Some(Src::Buf { ptr, cap, direct }))
+        })
+        .collect()
+}
+
 impl ReadAhead {
-    fn start(maps: Vec<&'static memmap2::Mmap>, paths: Vec<&'static str>) -> &'static ReadAhead {
+    fn start(srcs: Vec<(Src, &'static [u8], &'static str)>) -> &'static ReadAhead {
         let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let nice: Option<i32> = std::env::var("BLUE2_IO_NICE").ok().and_then(|s| s.parse().ok());
         let mut table = vec![];
         let mut ranges = vec![];
-        for (m, path) in maps.iter().zip(&paths) {
-            table.push((m.as_ptr() as usize, m.len(), ranges.len()));
+        let buffered = srcs.iter().any(|s| matches!(s.0, Src::Buf { .. }));
+        for &(src, b, path) in &srcs {
+            table.push((b.as_ptr() as usize, b.len(), ranges.len()));
             let mut off = 0;
-            while off < m.len() {
-                ranges.push((*m, *path, off, RA_PIECE.min(m.len() - off)));
+            while off < b.len() {
+                ranges.push((src, path, off, RA_PIECE.min(b.len() - off)));
                 off += RA_PIECE;
             }
         }
         table.sort_unstable();
-        let on = threads > 0;
+        // Buffers hold no data until read, so they always need the threads.
+        let on = threads > 0 || buffered;
+        let threads = threads.max(usize::from(buffered));
         let ra: &'static ReadAhead = Box::leak(Box::new(ReadAhead {
             maps: table,
             ready: (0..ranges.len()).map(|_| std::sync::atomic::AtomicBool::new(!on)).collect(),
+            failed: std::sync::atomic::AtomicBool::new(false),
         }));
         if on {
-            let ranges: &'static [(&'static memmap2::Mmap, &'static str, usize, usize)] = Box::leak(ranges.into_boxed_slice());
+            let ranges: &'static [(Src, &'static str, usize, usize)] = Box::leak(ranges.into_boxed_slice());
             let populate = std::env::var_os("BLUE2_WARM_POPULATE").is_some();
             let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
             for _ in 0..threads {
                 std::thread::spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    if let Some(n) = nice {
+                        unsafe { setpriority(0, gettid() as u32, n) };
+                    }
+                    let _ = nice;
                     // sendfile to /dev/null fills the page cache without copying to user space
                     // (std::io::copy picks sendfile/splice for a file reader on Linux).
                     let mut null = std::fs::OpenOptions::new().write(true).open("/dev/null").ok();
                     let mut open: Option<(&str, std::fs::File)> = None;
+                    let mut odirect: Option<(&str, Option<std::fs::File>)> = None;
                     loop {
                         let i = next.fetch_add(1, Relaxed);
-                        let Some(&(m, path, off, len)) = ranges.get(i) else { break };
-                        let mut done = false;
-                        if !populate && cfg!(target_os = "linux") {
-                            if let Some(sink) = null.as_mut() {
-                                if open.as_ref().map(|o| o.0) != Some(path) {
-                                    open = std::fs::File::open(path).ok().map(|f| (path, f));
+                        let Some(&(src, path, off, len)) = ranges.get(i) else { break };
+                        match src {
+                            Src::Buf { ptr, cap, direct } => {
+                                if !ra.read_buf(path, ptr, cap, off, len, direct, &mut open, &mut odirect) {
+                                    ra.failed.store(true, Relaxed);
                                 }
-                                if let Some((_, f)) = open.as_mut() {
-                                    use std::io::{Read, Seek, SeekFrom};
-                                    if f.seek(SeekFrom::Start(off as u64)).is_ok() {
-                                        let reader: &std::fs::File = f;
-                                        done = std::io::copy(&mut reader.take(len as u64), sink).is_ok();
+                            }
+                            Src::Map(m) => {
+                                let mut done = false;
+                                if !populate && cfg!(target_os = "linux") {
+                                    if let Some(sink) = null.as_mut() {
+                                        if open.as_ref().map(|o| o.0) != Some(path) {
+                                            open = std::fs::File::open(path).ok().map(|f| (path, f));
+                                        }
+                                        if let Some((_, f)) = open.as_mut() {
+                                            use std::io::{Read, Seek, SeekFrom};
+                                            if f.seek(SeekFrom::Start(off as u64)).is_ok() {
+                                                let reader: &std::fs::File = f;
+                                                done = std::io::copy(&mut reader.take(len as u64), sink).is_ok();
+                                            }
+                                        }
                                     }
                                 }
+                                if !done {
+                                    #[cfg(target_os = "linux")]
+                                    if m.advise_range(memmap2::Advice::PopulateRead, off, len).is_err() {
+                                        let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+                                    }
+                                    #[cfg(not(target_os = "linux"))]
+                                    let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+                                }
                             }
-                        }
-                        if !done {
-                            #[cfg(target_os = "linux")]
-                            if m.advise_range(memmap2::Advice::PopulateRead, off, len).is_err() {
-                                let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
                         }
                         ra.ready[i].store(true, std::sync::atomic::Ordering::Release);
                     }
@@ -226,6 +303,63 @@ impl ReadAhead {
             }
         }
         ra
+    }
+
+    /// Fill `len` bytes at `off` of a buffer from the file. O_DIRECT falls back to buffered
+    /// pread when the file system refuses it (EINVAL on open or read). Returns false if the
+    /// range could not be read completely; the caller then declines the fast engine.
+    #[allow(clippy::too_many_arguments)]
+    fn read_buf<'p>(
+        &self, path: &'p str, ptr: usize, cap: usize, off: usize, len: usize, direct: bool,
+        open: &mut Option<(&'p str, std::fs::File)>, odirect: &mut Option<(&'p str, Option<std::fs::File>)>,
+    ) -> bool {
+        use std::os::unix::fs::FileExt;
+        let end = off + len;
+        let mut at = off;
+        #[cfg(target_os = "linux")]
+        if direct {
+            use std::os::unix::fs::OpenOptionsExt;
+            if odirect.as_ref().map(|o| o.0) != Some(path) {
+                let f = std::fs::OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path).ok();
+                *odirect = Some((path, f));
+            }
+            if let Some((_, Some(f))) = odirect.as_ref() {
+                // Offsets are 16 MiB aligned and the buffer is page aligned; round the length
+                // up to a page (the buffer has room) and accept a short read at end of file.
+                let want = (len.div_ceil(4096) * 4096).min(cap - off);
+                while at < end {
+                    let dst = unsafe { std::slice::from_raw_parts_mut((ptr + at) as *mut u8, off + want - at) };
+                    match f.read_at(dst, at as u64) {
+                        Ok(0) => break,
+                        Ok(n) if n % 4096 == 0 || at + n >= end => at += n,
+                        Ok(n) => { at += n; break; }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                // A read past `end` only wrote into slack beyond this range or the file.
+                if at >= end {
+                    return true;
+                }
+                // Restart this range buffered from the last aligned point.
+                at = off + (at - off) / 4096 * 4096;
+            }
+        }
+        let _ = (direct, cap, &odirect);
+        if open.as_ref().map(|o| o.0) != Some(path) {
+            *open = std::fs::File::open(path).ok().map(|f| (path, f));
+        }
+        let Some((_, f)) = open.as_ref() else { return false };
+        while at < end {
+            let dst = unsafe { std::slice::from_raw_parts_mut((ptr + at) as *mut u8, end - at) };
+            match f.read_at(dst, at as u64) {
+                Ok(0) => return false,
+                Ok(n) => at += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        true
     }
 
     /// Wait (briefly yielding) until the ranges under `b` have been read.
@@ -1851,24 +1985,25 @@ fn fast(seed: u64) -> bool {
     let lkf = csv_files(&format!("{data}/links"));
     // Mappings live for the whole run (the process exits right after), so the read-ahead
     // threads can hold them.
-    let evm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&evf).into_boxed_slice());
-    let ckm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&ckf).into_boxed_slice());
-    let lkm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&lkf).into_boxed_slice());
+    let (buffered, direct) = read_mode();
+    let evm = load_all(&evf, buffered, direct);
+    let ckm = load_all(&ckf, buffered, direct);
+    let lkm = load_all(&lkf, buffered, direct);
     // Start the cold-cache read-ahead before anything else touches the inputs.
     let ra = {
-        let files: Vec<&'static str> = lkf.iter().chain(evf.iter()).chain(ckf.iter()).map(|f| &*Box::leak(f.clone().into_boxed_str())).collect();
-        let maps: Vec<(&'static memmap2::Mmap, &'static str)> = lkm.iter().chain(evm.iter()).chain(ckm.iter()).zip(files)
-            .filter_map(|(m, f)| m.as_ref().map(|m| (m, f))).collect();
-        let (maps, paths) = maps.into_iter().unzip();
-        ReadAhead::start(maps, paths)
+        let srcs: Vec<(Src, &'static [u8], &'static str)> = lkm.iter().zip(&lkf)
+            .chain(evm.iter().zip(&evf)).chain(ckm.iter().zip(&ckf))
+            .filter_map(|(&(b, src), f)| src.map(|src| (src, b, &*Box::leak(f.clone().into_boxed_str()))))
+            .collect();
+        ReadAhead::start(srcs)
     };
     let smm = map_all(&[format!("{data}/products.csv"), format!("{data}/campaigns.csv")]);
-    let evb = as_slices(evm);
+    let evb: Vec<&'static [u8]> = evm.iter().map(|m| m.0).collect();
     if evb.iter().any(|file| file.len() > u32::MAX as usize) {
         return false;
     }
-    let ckb = as_slices(ckm);
-    let lkb = as_slices(lkm);
+    let ckb: Vec<&'static [u8]> = ckm.iter().map(|m| m.0).collect();
+    let lkb: Vec<&'static [u8]> = lkm.iter().map(|m| m.0).collect();
     let smb = as_slices(&smm);
     lap("mapped files");
 
@@ -2098,7 +2233,8 @@ fn fast(seed: u64) -> bool {
         },
     );
     lap("clicks parsed");
-    if coll.load(Relaxed) {
+    // Every input byte has been waited for by now; a failed buffer read means missing data.
+    if coll.load(Relaxed) || ra.failed.load(Relaxed) {
         return false;
     }
 
@@ -2221,6 +2357,10 @@ fn fast(seed: u64) -> bool {
     };
     camp_job();
     lap("parquet written");
+    // Everything is written and closed: skip freeing the large tables and buffers.
+    if std::env::var_os("BLUE2_NO_EXIT").is_none() {
+        std::process::exit(0);
+    }
     true
 }
 
