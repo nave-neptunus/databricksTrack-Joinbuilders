@@ -1730,7 +1730,7 @@ mod tests {
                     1 => CAMP_ODD,
                     2 => (CBOUND as u64 + r.below(1 << 27)) as u32,
                     3 => (ranges[t].0 as u64 + r.below(3)).saturating_sub(1) as u32,
-                    4 => (ranges[t].1 as u64 + r.below(3) - 1) as u32,
+                    4 => (ranges[t].1 as u64 + r.below(3)).saturating_sub(1) as u32,
                     5 => (ranges[t].0 as u64 + r.below((ranges[t].1 - ranges[t].0 + 1) as u64)) as u32,
                     _ => r.below(CBOUND as u64) as u32,
                 };
