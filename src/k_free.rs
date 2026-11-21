@@ -1682,7 +1682,6 @@ unsafe fn cl_fast<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const
 
 const PIPE: u8 = 0;
 static PFD: AtomicUsize = AtomicUsize::new(1024);
-const CLICK_PFD: usize = 1024;
 const CHAIN: u8 = 1;
 
 pub fn set_prefetch_distance(pfd: usize) {
@@ -2029,7 +2028,11 @@ macro_rules! cl_ms {
             "vpcmpeqb ymm1, ymm12, ymmword ptr [", $a, " + 32]\n",
             "vpmovmskb ", $nlout, ", ymm1\n",
             "tzcnt ", $nlout, ", ", $nlout, "\n",
-            "prefetcht0 byte ptr [", $a, " + {PFD}]\n",
+            "mov rdi, qword ptr [rsp + 16]\n",
+            "test rdi, rdi\n",
+            "jz 9f\n",
+            "prefetcht0 byte ptr [", $a, " + rdi]\n",
+            "9:\n",
             "mov qword ptr [rsp + ", $slot, "], ", $b, "\n",
             "tzcnt r8d, ", $cin, "\n",
             "blsr ", $cin, ", ", $cin, "\n",
@@ -2126,17 +2129,18 @@ macro_rules! cl_d {
 const CL_REACH: usize = (NB + 3) * 65 + 64;
 
 #[inline(never)]
-unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, *mut i64) {
+unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8, pfd: usize) -> (u64, *const u8, *mut i64) {
     let (code, np, nw): (u64, *const u8, *mut i64);
     unsafe {
         core::arch::asm!(
             "push rbx",
             "push rbp",
-            "sub rsp, 16",
+            "sub rsp, 24",
             "mov r15, rdx",
             "mov rbx, rsi",
             "sub rbx, r15",
             "mov rbp, rdi",
+            "mov qword ptr [rsp + 16], r8",
             "mov eax, 0x2c2c2c2c",
             "vmovd xmm13, eax",
             "vpbroadcastd ymm13, xmm13",
@@ -2196,14 +2200,14 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
             "mov eax, 2",
             "6:",
             "lea rsi, [r15 + rbx]",
-            "add rsp, 16",
+            "add rsp, 24",
             "pop rbp",
             "pop rbx",
             inout("rdi") p => np,
             inout("rsi") w => nw,
             inout("rdx") b512 => _,
             out("rax") code,
-            out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+            out("rcx") _, inout("r8") pfd => _, out("r9") _, out("r10") _, out("r11") _, out("r12") _, out("r13") _, out("r14") _, out("r15") _,
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _, out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _,
             out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
@@ -2211,7 +2215,7 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
             out("k1") _,
             T = sym T, CTS = sym CTS, CAMP = sym CAMP5R,
             KID1 = const O_KID1, UID1 = const O_UID1M,
-            CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR, PFD = const CLICK_PFD,
+            CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR,
         );
     }
     (code, np, nw)
@@ -2233,7 +2237,7 @@ unsafe fn run_clicks<S: ClickSink, const MODE: u8>(buf: &[u8], sink: &mut S) {
             let enter = end.sub(CL_REACH);
             let b512 = (*b).camp.as_mut_ptr() as *mut u8;
             while p <= enter {
-                let (code, np, nw) = cl_loop(p, w, b512);
+                let (code, np, nw) = cl_loop(p, w, b512, pfd);
                 p = np;
                 w = nw;
                 if code == 2 {
