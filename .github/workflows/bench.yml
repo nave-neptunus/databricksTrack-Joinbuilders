@@ -1,0 +1,47 @@
+name: bench
+on:
+  push:
+    branches: ['bench/**']
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SEED: 7
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Machine info
+        run: |
+          lscpu; nproc; free -g; df -h /
+          grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^avx512(f|bw|vl|dq|cd)$|^avx2$|^bmi2$' | sort | tr '\n' ' '; echo
+          docker version --format '{{.Server.Version}}'
+          cat bench/request.json
+      - name: Cache dataset
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/data20m
+          key: data20m-${{ hashFiles('generator/**') }}-seed${{ env.SEED }}
+      - name: Generate dataset (20M events, 5M clicks)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed $SEED --events 20000000 --clicks 5000000 --output ~/data20m
+      - run: du -sh ~/data20m; ls ~/data20m
+      - run: pip install -q polars
+      - name: Bench
+        run: python3 bench/ci_bench.py ~/data20m ~/work 2>&1 | tee ~/bench.log
+      - name: Summary
+        if: always()
+        run: |
+          cat ~/work/summary.md >> $GITHUB_STEP_SUMMARY || true
+          { echo '```'; lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | sed 's/Flags.*avx512/avx512/' | cut -c1-200; echo '```'; } >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-logs
+          path: |
+            ~/bench.log
+            ~/work/summary.md
+            ~/work/results.json
