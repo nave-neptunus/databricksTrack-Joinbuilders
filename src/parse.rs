@@ -745,9 +745,13 @@ unsafe fn ev_vec<const TSB: bool, const STAGE: bool>(eb: &EvBatch, out: &mut Out
             st4::<OB>(outp, j, bv);
             st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
         } else {
+            // The final vector can include stale, valid rows beyond n.  push_many
+            // previously applied this same lane mask after collecting okb.
+            let live: u8 = if n - j >= 4 { 0x0f } else { (1u8 << (n - j)) - 1 };
+            let okp = ok & live;
             macro_rules! push {
                 ($i:literal) => {
-                    if ok & (1 << $i) != 0 {
+                    if okp & (1 << $i) != 0 {
                         let mut w0 = _mm256_extract_epi64::<$i>(w0v) as u64;
                         if pm & (1 << $i) != 0 {
                             let prod = (*eb.pp.get_unchecked(j + $i) as u32 as usize).min(PBOUND);
@@ -870,9 +874,12 @@ unsafe fn ck_vec<const RANGED: bool, const MODE_A: bool, const STAGE: bool>(cb: 
             st4::<OB>(outp, j, bv);
             st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
         } else {
+            // The final vector can include stale, valid rows beyond n.
+            let live: u8 = if n - j >= 4 { 0x0f } else { (1u8 << (n - j)) - 1 };
+            let okp = ok & live;
             macro_rules! push {
                 ($i:literal) => {
-                    if ok & (1 << $i) != 0 {
+                    if okp & (1 << $i) != 0 {
                         part.push_cached(_mm256_extract_epi64::<$i>(bv) as usize, _mm256_extract_epi64::<$i>(o0) as u64, _mm256_extract_epi64::<$i>(o1) as u64, &mut last_b, &mut last_f);
                     }
                 };
@@ -1837,6 +1844,97 @@ mod tests {
                 assert_eq!(v1, v2, "nb {nb} b {b}");
                 assert_eq!(v1.len(), p1.count(b));
             }
+        }
+    }
+
+    fn same_part_records(a: &Part, b: &Part, nb: usize) {
+        for p in 0..nb {
+            assert_eq!(a.count(p), b.count(p), "partition {p} count");
+            let mut av = Vec::new();
+            let mut bv = Vec::new();
+            a.for_each(p, |r| av.extend(r.iter().map(|r| (r.w0, r.w1))));
+            b.for_each(p, |r| bv.extend(r.iter().map(|r| (r.w0, r.w1))));
+            assert_eq!(av, bv, "partition {p} records");
+        }
+    }
+
+    #[test]
+    fn fused_vec_masks_stale_tail_lanes() {
+        use crate::keyrec::scramble;
+
+        let prod = vec![0u8; PBOUND + 1 + 64];
+        let camp = vec![0u8; CBOUND + 64];
+        // Fill every lane first, mimicking a previous full batch.  Thus the
+        // lanes past n in each case below are deliberately valid stale rows.
+        for n in 1..=4 {
+            let ea = Arena::new(1 << 20);
+            let eb_arena = Arena::new(1 << 20);
+            let ca = Arena::new(1 << 20);
+            let cb_arena = Arena::new(1 << 20);
+            let mut epush = Part::new(&ea, 1);
+            let mut efused = Part::new(&eb_arena, 1);
+            let mut cpush = Part::new(&ca, 1);
+            let mut cfused = Part::new(&cb_arena, 1);
+            let mut ev = EvBatch::new();
+            let mut ck = CkBatch::new();
+            let mut out = Out::new();
+            let ep = EvP {
+                ing_base: 0,
+                ws: 0,
+                wlen: DAY_MS as u64,
+                ukey: 0x1234,
+                ekey: 0x5678,
+                ucap: 1,
+                ecap: BSIZE as u64,
+                ptab: prod.as_ptr(),
+                lines: epush.lines_ptr(),
+            };
+            let cp = CkP {
+                cbase: 0,
+                clen: DAY_MS as u64,
+                ukey: 0x9abc,
+                ucap: 1,
+                ckey: 0,
+                ccap: 0,
+                ctab: camp.as_ptr(),
+                crange: Some((0, CBOUND as u64 - 1)),
+                lines: cpush.lines_ptr(),
+            };
+            for i in 0..NB {
+                ev.eid[i] = scramble((32 + i) as u64, ep.ekey);
+                ev.uid[i] = scramble(0, ep.ukey);
+                ev.ts[i] = 100;
+                ev.ing[i] = 100;
+                ev.pp[i] = ev_pp(0, 0, 0);
+                ck.cid[i] = i as u64;
+                ck.uid[i] = scramble(0, cp.ukey);
+                ck.ts[i] = 100;
+                ck.camp[i] = 0;
+            }
+            for i in 0..n {
+                ev.eid[i] = scramble(i as u64, ep.ekey);
+                ck.cid[i] = i as u64;
+            }
+
+            let (eok, esp, ebad) = unsafe { ev_vec::<true, true>(&ev, &mut out, &mut epush, n, &ep) };
+            assert!(!ebad);
+            assert_eq!(esp, 0);
+            unsafe { epush.push_many(eok, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
+            assert_eq!(unsafe { ev_vec::<true, false>(&ev, &mut out, &mut efused, n, &ep) }, (eok, esp, ebad));
+
+            let (cok, csp) = unsafe { ck_vec::<true, false, true>(&ck, &mut out, &mut cpush, n, &cp) };
+            assert_eq!(csp, 0);
+            unsafe { cpush.push_many(cok, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
+            assert_eq!(unsafe { ck_vec::<true, false, false>(&ck, &mut out, &mut cfused, n, &cp) }, (cok, csp));
+
+            epush.finish();
+            efused.finish();
+            cpush.finish();
+            cfused.finish();
+            assert_eq!(epush.count(0), n, "event n {n}");
+            assert_eq!(cpush.count(0), n, "click n {n}");
+            same_part_records(&epush, &efused, 1);
+            same_part_records(&cpush, &cfused, 1);
         }
     }
 }
