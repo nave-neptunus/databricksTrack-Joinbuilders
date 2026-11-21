@@ -44,12 +44,20 @@ fn csv_files(dir: &str) -> Vec<String> {
 
 /// Memory-map every file (empty files map to nothing).
 fn map_all(files: &[String]) -> Vec<Option<memmap2::Mmap>> {
+    #[cfg(target_os = "linux")]
+    let populate = std::env::var_os("BLUE2_MAP_POPULATE").is_some();
     files
         .par_iter()
         .map(|f| {
             let file = std::fs::File::open(f).unwrap();
             if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
                 return None;
+            }
+            #[cfg(target_os = "linux")]
+            if populate {
+                if let Ok(mapping) = unsafe { memmap2::MmapOptions::new().populate().map(&file) } {
+                    return Some(mapping);
+                }
             }
             Some(unsafe { memmap2::Mmap::map(&file).unwrap() })
         })
@@ -216,63 +224,10 @@ fn csv_rows<'a, const N: usize>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [
     });
 }
 
-/// Fixed-arity event rows already separated by the newline iterator.
-/// Collect two masks for the whole row, then decode exactly six cuts.
+/// Decode six cuts from the structural masks for one row.
 #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
-fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
-    #[cfg(target_arch = "aarch64")]
-    const WIDTH: usize = 16;
-    #[cfg(target_arch = "x86_64")]
-    const WIDTH: usize = 32;
-
-    if !(WIDTH..=128).contains(&line.len()) {
-        return fields::<7>(line);
-    }
-    let masks = |offset: usize| {
-        // The caller loads full vectors inside the row, overlapping the last
-        // one when needed and discarding the overlapping lanes.
-        unsafe {
-            #[cfg(target_arch = "aarch64")]
-            {
-                use std::arch::aarch64::*;
-                const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-                let w = vld1q_u8(WEIGHTS.as_ptr());
-                let v = vld1q_u8(line.as_ptr().add(offset));
-                let comma = vandq_u8(w, vceqq_u8(v, vdupq_n_u8(b',')));
-                let quote = vandq_u8(w, vceqq_u8(v, vdupq_n_u8(b'"')));
-                let pairs = vpaddq_u8(comma, quote);
-                let groups = vpaddq_u8(pairs, pairs);
-                let bytes = vpaddq_u8(groups, groups);
-                let both = vgetq_lane_u32::<0>(vreinterpretq_u32_u8(bytes));
-                (both as u16 as u32, both >> 16)
-            }
-            #[cfg(target_arch = "x86_64")]
-            {
-                use std::arch::x86_64::*;
-                let v = _mm256_loadu_si256(line.as_ptr().add(offset).cast());
-                let comma = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8)));
-                let quote = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8)));
-                (comma as u32, quote as u32)
-            }
-        }
-    };
-    let mut commas = 0u128;
-    let mut quotes = 0u128;
-    let mut offset = 0;
-    while offset + WIDTH <= line.len() {
-        let (c, q) = masks(offset);
-        commas |= u128::from(c) << offset;
-        quotes |= u128::from(q) << offset;
-        offset += WIDTH;
-    }
-    if offset < line.len() {
-        let start = line.len() - WIDTH;
-        let (c, q) = masks(start);
-        let overlap = offset - start;
-        commas |= u128::from(c >> overlap) << offset;
-        quotes |= u128::from(q >> overlap) << offset;
-    }
+fn event_fields(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; 7]> {
     if commas.count_ones() != 6 {
         return None;
     }
@@ -303,14 +258,92 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
     (quotes.count_ones() == expected).then_some(values)
 }
 
+// One load per input vector supplies the comma, quote and newline masks.
+#[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn event_structure(block: &[u8; 64]) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let lo = _mm256_loadu_si256(block.as_ptr().cast());
+        let hi = _mm256_loadu_si256(block.as_ptr().add(32).cast());
+        let mask = |byte: u8| {
+            let ch = _mm256_set1_epi8(byte as i8);
+            let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, ch)) as u32;
+            let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, ch)) as u32;
+            u64::from(a) | (u64::from(b) << 32)
+        };
+        (mask(b','), mask(b'"'), mask(b'\n'))
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let weights = vld1q_u8(WEIGHTS.as_ptr());
+        let mask_pair = |a, b| {
+            let pairs = vpaddq_u8(vandq_u8(a, weights), vandq_u8(b, weights));
+            let groups = vpaddq_u8(pairs, pairs);
+            let bytes = vpaddq_u8(groups, groups);
+            u64::from(vgetq_lane_u32::<0>(vreinterpretq_u32_u8(bytes)))
+        };
+        let [a, b, c, d] = [0, 16, 32, 48].map(|i| vld1q_u8(block.as_ptr().add(i)));
+        let mask = |byte| {
+            let ch = vdupq_n_u8(byte);
+            mask_pair(vceqq_u8(a, ch), vceqq_u8(b, ch))
+                | (mask_pair(vceqq_u8(c, ch), vceqq_u8(d, ch)) << 32)
+        };
+        (mask(b','), mask(b'"'), mask(b'\n'))
+    }
+}
+
 #[inline]
 fn event_rows<'a>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
     #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
-    for_lines(bytes, |line| {
-        if let Some(values) = event_fields(line) {
-            row(line, values);
+    {
+        let mut start = 0;
+        let mut carry = (0u128, 0u128);
+        let (blocks, tail) = bytes.as_chunks::<64>();
+        for (i, block) in blocks.iter().enumerate() {
+            let base = i * 64;
+            let (commas, quotes, mut newlines) = event_structure(block);
+            let mut pos = 0;
+            while newlines != 0 {
+                let end = newlines.trailing_zeros() as usize;
+                let len = base + end - start;
+                let line = &bytes[start..base + end];
+                let through_end = (1u64 << end).wrapping_sub(1);
+                let fields = if len <= 128 {
+                    let offset = len - (end - pos);
+                    // Offset 128 is possible only when the newline is the
+                    // first byte of the block, so there are no new bits.
+                    let c = u128::from((commas & through_end) >> pos).checked_shl(offset as u32).unwrap_or(0);
+                    let q = u128::from((quotes & through_end) >> pos).checked_shl(offset as u32).unwrap_or(0);
+                    event_fields(line, carry.0 | c, carry.1 | q)
+                } else {
+                    fields::<7>(line)
+                };
+                if let Some(values) = fields {
+                    row(line, values);
+                }
+                start = base + end + 1;
+                newlines &= newlines - 1;
+                carry = (0, 0);
+                pos = end + 1;
+            }
+            let offset = base + pos - start;
+            if offset < 128 && pos < 64 {
+                carry.0 |= u128::from(commas >> pos) << offset;
+                carry.1 |= u128::from(quotes >> pos) << offset;
+            }
         }
-    });
+        if !tail.is_empty() || start < bytes.len() {
+            for_lines(&bytes[start..], |line| {
+                if let Some(values) = fields::<7>(line) {
+                    row(line, values);
+                }
+            });
+        }
+    }
     #[cfg(not(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2"))))]
     csv_rows(bytes, row);
 }
@@ -395,6 +428,40 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
     if a < 10 && b < 10 { Some((a * 10 + b) as i64) } else { None }
 }
 
+#[inline]
+fn ascii_digits(word: u64) -> bool {
+    const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const LOW: u64 = !HIGH;
+    (word & HIGH) == 0x3030_3030_3030_3030
+        && ((word & LOW) + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 == 0
+}
+
+#[inline]
+fn decimal_groups(digits: u64) -> u64 {
+    let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8) & 0x00ff_00ff_00ff_00ff;
+    pairs.wrapping_mul(100).wrapping_add(pairs >> 16) & 0x0000_ffff_0000_ffff
+}
+
+#[inline]
+fn date_time_of_day(s: &[u8]) -> Option<i64> {
+    const COLONS: u64 = (0xff << 16) | (0xff << 40);
+    let clock = rd8(s, 11);
+    if clock & COLONS != (u64::from(b':') << 16) | (u64::from(b':') << 40)
+        || !ascii_digits((clock & !COLONS) | (0x30 << 16) | (0x30 << 40))
+    {
+        return None;
+    }
+    let digits = clock & 0x0f0f_0f0f_0f0f_0f0f;
+    let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8);
+    let hours = pairs & 0xff;
+    let minutes = (pairs >> 24) & 0xff;
+    let seconds = pairs >> 48 & 0xff;
+    if hours > 23 || minutes > 59 || seconds > 59 {
+        return None;
+    }
+    Some((hours * 3600 + minutes * 60 + seconds) as i64 * 1000)
+}
+
 // One small cache per parsing task. Store all ten date bytes, so a hit also
 // verifies the calendar date and punctuation validated by the cold path.
 #[derive(Default)]
@@ -403,23 +470,41 @@ struct Dates([([u8; 10], i64); 32]);
 impl Dates {
     #[inline]
     fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        if s.len() == 13 {
+            let a = rd8(s, 0);
+            let b = rd4(s, 8) | 0x3030_3030_0000_0000;
+            let c = s[12].wrapping_sub(b'0');
+            if !ascii_digits(a) || !ascii_digits(b) || c > 9 {
+                return None;
+            }
+            let a = decimal_groups(a & 0x0f0f_0f0f_0f0f_0f0f);
+            let b = decimal_groups(b & 0x0f0f_0f0f_0f0f_0f0f);
+            return Some(((a & 0xffff) * 1_000_000_000 + (a >> 32) * 100_000 + b * 10 + u64::from(c)) as i64);
+        }
         // The date separator excludes the all-zero key used by empty slots.
-        if s.len() == 20 && s[19] == b'Z' && s[4] == b'-' && s[10] == b'T' && s[13] == b':' && s[16] == b':' {
+        if matches!(s.len(), 20 | 25) && s[4] == b'-' && s[10] == b'T' {
+            let offset = match s[19] {
+                b'Z' if s.len() == 20 => 0,
+                zone @ (b'+' | b'-') if s.len() == 25 && s[22] == b':' => {
+                    let hours = d2(s, 20)?;
+                    let minutes = d2(s, 23)?;
+                    if hours > 23 || minutes > 59 {
+                        return None;
+                    }
+                    let offset = (hours * 60 + minutes) * 60_000;
+                    if zone == b'+' { offset } else { -offset }
+                }
+                _ => return None,
+            };
+            let time = date_time_of_day(s)?;
             let date: [u8; 10] = s[..10].try_into().unwrap();
             let index = (date[8] as usize * 10 + date[9] as usize) & 31;
             let entry = &mut self.0[index];
-            let h = d2(s, 11)?;
-            let m = d2(s, 14)?;
-            let sec = d2(s, 17)?;
-            if h > 23 || m > 59 || sec > 59 {
-                return None;
-            }
-            let time = (h * 3600 + m * 60 + sec) * 1000;
             if entry.0 == date {
-                return Some(entry.1 + time);
+                return Some(entry.1 + time - offset);
             }
             let t = parse_ts(s)?;
-            *entry = (date, t - time);
+            *entry = (date, t + offset - time);
             return Some(t);
         }
         if !s.is_empty() && s.len() <= 18 {
@@ -442,6 +527,26 @@ impl Dates {
 fn empty_date_cache_rejects_invalid_date() {
     let mut cache = Dates::default();
     assert_eq!(cache.parse(b"\0\0\0\0\0\0\0\0\0\0T00:00:00Z"), None);
+}
+
+#[cfg(test)]
+#[test]
+fn word_timestamps_match_scalar_in_cold_and_warm_cache() {
+    let mut dates = Dates::default();
+    for template in [b"2028-02-29T23:58:59Z".as_slice(), b"2028-02-29T01:02:03-04:30", b"1791071890000"] {
+        let expected = parse_ts(template);
+        assert!(expected.is_some());
+        for _ in 0..2 {
+            assert_eq!(dates.parse(template), expected);
+            for i in 0..template.len() {
+                let mut changed = template.to_vec();
+                for byte in 0..=255u8 {
+                    changed[i] = byte;
+                    assert_eq!(dates.parse(&changed), parse_ts(&changed), "{changed:?}");
+                }
+            }
+        }
+    }
 }
 
 /// ms since epoch, or None if bad. Overlong F3 saturates to i64::MAX (out of any window).
@@ -729,7 +834,7 @@ impl D {
         if self.loc < NO_EVENT {
             let partition = (self.loc >> 32) as usize;
             let index = self.loc as u32 as usize;
-            fold.people[partition][index].ts.store(TOMBSTONE, Relaxed);
+            fold.people.get(partition, index).ts.store(TOMBSTONE, Relaxed);
         }
     }
 }
@@ -809,82 +914,109 @@ const _: () = assert!(std::mem::size_of::<LiveEvent>() == 24);
 const _: () = assert!(std::mem::size_of::<D>() == 24);
 const _: () = assert!(std::mem::size_of::<ShortD>() == 16);
 
-/// The hot dedup stream has one anonymous mapping per worker. Each shard
-/// owns an initialized prefix of its reservation and a growable overflow.
-struct ShortArena {
-    storage: Option<memmap2::MmapMut>,
+/// One page-aligned reservation per worker. Each partition owns a typed,
+/// initialized prefix plus an independently growable overflow.
+struct Arena<T, const PARTS: usize> {
+    _storage: Option<memmap2::MmapMut>,
+    base: *mut T,
     stride: usize,
-    lengths: [usize; SH],
-    overflow: Vec<Vec<ShortD>>,
+    lengths: [usize; PARTS],
+    overflow: Vec<Vec<T>>,
 }
 
-impl ShortArena {
-    fn new(reservation: usize) -> Self {
-        let storage = if reservation == 0 {
-            None
-        } else {
-            memmap2::MmapMut::map_anon(reservation * SH * std::mem::size_of::<ShortD>()).ok()
-        };
+// The pointer belongs to _storage, never changes, and is only written through
+// an exclusive writer. Shared access is restricted to initialized T.
+unsafe impl<T: Send, const PARTS: usize> Send for Arena<T, PARTS> {}
+unsafe impl<T: Sync, const PARTS: usize> Sync for Arena<T, PARTS> {}
+
+impl<T, const PARTS: usize> Arena<T, PARTS> {
+    fn new(reservation: usize, prefault: bool) -> Self {
+        // Mapping destruction does not run destructors for the prefixes.
+        const { assert!(!std::mem::needs_drop::<T>() && std::mem::size_of::<T>() != 0) };
+        let mut storage = reservation.checked_mul(PARTS)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<T>()))
+            .filter(|&bytes| bytes != 0 && bytes <= isize::MAX as usize)
+            .and_then(|bytes| memmap2::MmapMut::map_anon(bytes).ok());
         #[cfg(target_os = "linux")]
         if let Some(mapping) = &storage {
             let _ = mapping.advise(memmap2::Advice::HugePage);
+            if prefault {
+                let _ = mapping.advise(memmap2::Advice::PopulateWrite);
+            }
         }
-        let stride = if storage.is_some() { reservation } else { 0 };
-        Self { storage, stride, lengths: [0; SH], overflow: (0..SH).map(|_| Vec::new()).collect() }
-    }
-
-    fn writer(&mut self) -> ShortWriter<'_> {
-        let base = self.storage.as_mut().map_or(std::ptr::null_mut(), |m| m.as_mut_ptr().cast());
-        ShortWriter { base, stride: self.stride, lengths: &mut self.lengths, overflow: &mut self.overflow }
-    }
-
-    #[inline]
-    fn records(&self, shard: usize) -> [&[ShortD]; 2] {
-        let prefix = self.storage.as_ref().map_or(&[][..], |mapping| {
-            let ptr = mapping.as_ptr().cast::<ShortD>();
-            // Only the recorded prefix has been initialized. No writes can
-            // occur through this shared borrow.
-            unsafe { std::slice::from_raw_parts(ptr.add(shard * self.stride), self.lengths[shard]) }
+        #[cfg(not(target_os = "linux"))]
+        let _ = prefault;
+        let base = storage.as_mut().map_or(std::ptr::null_mut(), |mapping| {
+            // Obtain a writable pointer before publishing any shared views.
+            mapping.as_mut_ptr().cast::<T>()
         });
-        [prefix, &self.overflow[shard]]
+        assert!(base.is_aligned());
+        let stride = if storage.is_some() { reservation } else { 0 };
+        Self { _storage: storage, base, stride, lengths: [0; PARTS], overflow: (0..PARTS).map(|_| Vec::new()).collect() }
+    }
+
+    fn writer(&mut self) -> ArenaWriter<'_, T> {
+        ArenaWriter { base: self.base, stride: self.stride, lengths: &mut self.lengths, overflow: &mut self.overflow }
+    }
+
+    #[inline]
+    fn records(&self, part: usize) -> [&[T]; 2] {
+        let len = self.lengths[part];
+        let prefix = if len == 0 {
+            &[]
+        } else {
+            // A nonempty prefix lies in the mapping and contains initialized T.
+            unsafe { std::slice::from_raw_parts(self.base.add(part * self.stride), len) }
+        };
+        [prefix, &self.overflow[part]]
+    }
+
+    #[inline]
+    fn get(&self, part: usize, index: usize) -> &T {
+        let [prefix, overflow] = self.records(part);
+        prefix.get(index).unwrap_or_else(|| &overflow[index - prefix.len()])
     }
 }
 
-struct ShortWriter<'a> {
-    base: *mut ShortD,
+struct ArenaWriter<'a, T> {
+    base: *mut T,
     stride: usize,
-    lengths: &'a mut [usize; SH],
-    overflow: &'a mut [Vec<ShortD>],
+    lengths: &'a mut [usize],
+    overflow: &'a mut [Vec<T>],
 }
 
-impl ShortWriter<'_> {
+impl<T> ArenaWriter<'_, T> {
     #[inline]
-    fn push(&mut self, shard: usize, row: ShortD) {
-        let len = self.lengths[shard];
+    fn len(&self, part: usize) -> usize {
+        self.lengths[part] + self.overflow[part].len()
+    }
+
+    #[inline]
+    fn push(&mut self, part: usize, row: T) {
+        let len = self.lengths[part];
         if len < self.stride {
-            // A nonzero stride requires a page-aligned mapping owned by the
-            // borrowed arena. This worker exclusively owns the next slot.
-            unsafe { self.base.add(shard * self.stride + len).write(row) };
-            self.lengths[shard] += 1;
+            // The worker exclusively owns this previously uninitialized slot.
+            unsafe { self.base.add(part * self.stride + len).write(row) };
+            self.lengths[part] += 1;
         } else {
-            self.overflow[shard].push(row);
+            self.overflow[part].push(row);
         }
     }
 }
 
 struct EventFold {
     copies: Vec<Vec<D>>,
-    short_copies: ShortArena,
-    people: Vec<Vec<EvP>>,
+    short_copies: Arena<ShortD, SH>,
+    people: Arena<EvP, P>,
 }
 
 impl EventFold {
-    fn new(shard_capacity: usize) -> Self {
+    fn new(shard_capacity: usize, prefault: bool) -> Self {
         let person_capacity = shard_capacity * SH / P;
         Self {
             copies: (0..SH).map(|_| Vec::new()).collect(),
-            short_copies: ShortArena::new(shard_capacity),
-            people: (0..P).map(|_| Vec::with_capacity(person_capacity)).collect(),
+            short_copies: Arena::new(shard_capacity, prefault),
+            people: Arena::new(person_capacity, prefault),
         }
     }
 }
@@ -921,22 +1053,52 @@ const DEDUP_EPOCH_SHIFT: u32 = 25;
 #[derive(Default)]
 struct Dedup {
     cells: Vec<u32>,
+    mapped: Option<memmap2::MmapMut>,
+    use_mapping: bool,
     epoch: u8,
-    mask: usize,
 }
 
 impl Dedup {
-    fn start(&mut self, n: usize) {
+    fn cells(&mut self, n: usize) -> (&mut [u32], u32) {
         let cap = (n * 2).next_power_of_two().max(16);
-        if self.cells.len() < cap {
-            self.cells.resize(cap, 0);
+        let bytes = cap * std::mem::size_of::<u32>();
+        if self.use_mapping && self.mapped.as_ref().is_none_or(|m| m.len() < bytes) {
+            match memmap2::MmapMut::map_anon(bytes) {
+                Ok(mapping) => {
+                    // Later shards reuse the lazily zeroed pages.
+                    #[cfg(target_os = "linux")]
+                    let _ = mapping.advise(memmap2::Advice::HugePage);
+                    self.mapped = Some(mapping);
+                }
+                Err(_) => {
+                    // Never return to an old table with stale epoch tags.
+                    self.mapped = None;
+                    self.use_mapping = false;
+                }
+            }
+            self.epoch = 0;
         }
+        let cells = match &mut self.mapped {
+            Some(mapping) => {
+                // The mapping is page-aligned and its length is a multiple of
+                // four. All u32 bit patterns are valid, and this is the sole view.
+                let (head, cells, tail) = unsafe { mapping.align_to_mut::<u32>() };
+                debug_assert!(head.is_empty() && tail.is_empty());
+                cells
+            }
+            _ => {
+                if self.cells.len() < cap {
+                    self.cells.resize(cap, 0);
+                }
+                &mut self.cells[..]
+            }
+        };
         self.epoch += 1;
         if self.epoch == 128 {
-            self.cells.fill(0);
+            cells.fill(0);
             self.epoch = 1;
         }
-        self.mask = cap - 1;
+        (&mut cells[..cap], u32::from(self.epoch))
     }
 
     fn shard<R: Copy + Into<D>>(
@@ -965,9 +1127,8 @@ impl Dedup {
         }
         let fold_shift = stride.trailing_zeros();
         let row_mask = stride - 1;
-        self.start(count);
-
-        let epoch = u32::from(self.epoch);
+        let (cells, epoch) = self.cells(count);
+        let mask = cells.len() - 1;
         for (fold_index, fold) in folds.iter().enumerate() {
             let fold_base = fold_index << fold_shift;
             for (row_index, &event) in records(fold, shard).into_iter().flatten().enumerate() {
@@ -975,11 +1136,11 @@ impl Dedup {
                 let tag = (epoch << DEDUP_EPOCH_SHIFT)
                     | (((event.hid >> 32) as u32 & 31) << DEDUP_INDEX_BITS);
                 let new_entry = tag | (fold_base | row_index) as u32;
-                let mut i = event.hid as usize & self.mask;
+                let mut i = event.hid as usize & mask;
                 loop {
-                    let entry = self.cells[i];
+                    let entry = cells[i];
                     if entry >> DEDUP_EPOCH_SHIFT != epoch {
-                        self.cells[i] = new_entry;
+                        cells[i] = new_entry;
                         break;
                     }
                     if entry & !((DEDUP_INDEX_LIMIT as u32) - 1) == tag {
@@ -993,14 +1154,14 @@ impl Dedup {
                                 coll.store(true, Relaxed);
                             } else if event.order() < winner.order() {
                                 winner.tombstone(winner_fold);
-                                self.cells[i] = new_entry;
+                                cells[i] = new_entry;
                             } else {
                                 event.tombstone(fold);
                             }
                             break;
                         }
                     }
-                    i = (i + 1) & self.mask;
+                    i = (i + 1) & mask;
                 }
             }
         }
@@ -1013,8 +1174,9 @@ mod single_scatter_tests {
 
     fn copy(fold: &mut EventFold, ingest: i32, partition: Option<usize>) {
         let loc = if let Some(p) = partition {
-            let index = fold.people[p].len();
-            fold.people[p].push(EvP {
+            let mut writer = fold.people.writer();
+            let index = writer.len(p);
+            writer.push(p, EvP {
                 person: PersonData::new((p as u64) << (64 - PB), 0, 0),
                 ts: AtomicU32::new(1),
                 price: 0,
@@ -1034,42 +1196,42 @@ mod single_scatter_tests {
 
     #[test]
     fn earliest_invalid_copy_tombstones_all_valid_copies() {
-        let mut folds = [EventFold::new(0), EventFold::new(0)];
+        let mut folds = [EventFold::new(0, false), EventFold::new(0, false)];
         copy(&mut folds[0], 2, Some(3));
         copy(&mut folds[0], 3, Some(5));
         copy(&mut folds[1], 1, None);
         dedup(&folds);
-        assert!(folds[0].people[3][0].live().is_none());
-        assert!(folds[0].people[5][0].live().is_none());
+        assert!(folds[0].people.get(3, 0).live().is_none());
+        assert!(folds[0].people.get(5, 0).live().is_none());
     }
 
     #[test]
     fn later_duplicate_with_different_person_is_tombstoned() {
-        let mut folds = [EventFold::new(0), EventFold::new(0)];
+        let mut folds = [EventFold::new(0, false), EventFold::new(0, false)];
         copy(&mut folds[0], 2, Some(1000));
         copy(&mut folds[1], 1, Some(1));
         dedup(&folds);
-        assert!(folds[0].people[1000][0].live().is_none());
-        assert!(folds[1].people[1][0].live().is_some());
+        assert!(folds[0].people.get(1000, 0).live().is_none());
+        assert!(folds[1].people.get(1, 0).live().is_some());
     }
 
     #[test]
     fn equal_ingest_valid_duplicates_leave_exactly_one_live_copy() {
-        let mut folds = [EventFold::new(0), EventFold::new(0)];
+        let mut folds = [EventFold::new(0, false), EventFold::new(0, false)];
         copy(&mut folds[0], 1, Some(3));
         copy(&mut folds[1], 1, Some(3));
         copy(&mut folds[1], 1, Some(3));
         dedup(&folds);
-        assert_eq!(folds.iter().flat_map(|f| &f.people[3]).filter_map(EvP::live).count(), 1);
+        assert_eq!(folds.iter().flat_map(|f| f.people.records(3)).flatten().filter_map(EvP::live).count(), 1);
     }
 
     #[test]
     fn unparseable_ingest_loses_to_largest_parsed_ingest() {
-        let mut folds = [EventFold::new(0)];
+        let mut folds = [EventFold::new(0, false)];
         folds[0].copies[0].push(D { hid: 7, hchk: 9, ingest: i32::MAX, loc: NO_EVENT | UNPARSED_INGEST });
         copy(&mut folds[0], i32::MAX, Some(3));
         dedup(&folds);
-        assert!(folds[0].people[3][0].live().is_some());
+        assert!(folds[0].people.get(3, 0).live().is_some());
         assert_eq!(compact_ingest(i64::from(i32::MAX) * 1000, 0), Some(i32::MAX));
         assert_eq!(compact_ingest(i64::from(i32::MAX) * 1000 + 1000, 0), None);
         assert_eq!(compact_ingest(1001, 0), None);
@@ -1087,7 +1249,7 @@ mod single_scatter_tests {
 
     #[test]
     fn short_dedup_preserves_winner_and_target_partition() {
-        let mut folds = [EventFold::new(0), EventFold::new(0)];
+        let mut folds = [EventFold::new(0, false), EventFold::new(0, false)];
         copy(&mut folds[0], 20, Some(P - 1));
         copy(&mut folds[1], 10, Some(1));
         for fold in &mut folds {
@@ -1098,13 +1260,36 @@ mod single_scatter_tests {
         let coll = AtomicBool::new(false);
         Dedup::default().shard(&folds, 0, &coll, |f, s| f.short_copies.records(s));
         assert!(!coll.load(Relaxed));
-        assert!(folds[0].people[P - 1][0].live().is_none());
-        assert!(folds[1].people[1][0].live().is_some());
+        assert!(folds[0].people.get(P - 1, 0).live().is_none());
+        assert!(folds[1].people.get(1, 0).live().is_some());
+    }
+
+    #[test]
+    fn tombstones_can_update_the_mapped_prefix_and_overflow() {
+        let mut fold = EventFold::new(4, false);
+        copy(&mut fold, 1, None);
+        copy(&mut fold, 2, Some(3));
+        copy(&mut fold, 3, Some(3));
+        dedup(std::slice::from_ref(&fold));
+        assert!(fold.people.get(3, 0).live().is_none());
+        assert!(fold.people.get(3, 1).live().is_none());
+    }
+
+    #[test]
+    fn mapped_dedup_reuses_and_resets_epochs() {
+        let mut table = Dedup { use_mapping: true, ..Dedup::default() };
+        for _ in 0..260 {
+            let (cells, epoch) = table.cells(2000);
+            assert_ne!(cells[10] >> DEDUP_EPOCH_SHIFT, epoch);
+            cells[10] = epoch << DEDUP_EPOCH_SHIFT;
+        }
+        let (cells, epoch) = table.cells(4000);
+        assert_ne!(cells[10] >> DEDUP_EPOCH_SHIFT, epoch);
     }
 
     #[test]
     fn short_arena_reads_reservation_before_overflow() {
-        let mut arena = ShortArena::new(1);
+        let mut arena = Arena::<ShortD, SH>::new(1, false);
         {
             let mut writer = arena.writer();
             for key in 0..3 {
@@ -1112,7 +1297,7 @@ mod single_scatter_tests {
             }
         }
         let [prefix, overflow] = arena.records(SH - 1);
-        if arena.storage.is_some() {
+        if arena._storage.is_some() {
             assert_eq!((prefix.len(), overflow.len()), (1, 2));
         }
         assert_eq!(prefix.iter().chain(overflow).map(|r| r.key).collect::<Vec<_>>(), [0, 1, 2]);
@@ -1473,23 +1658,24 @@ fn fast(seed: u64) -> bool {
         (per_shard + per_shard / 8).min(32_768)
     });
     let window_seconds = w0.div_euclid(1000);
+    let prefault = cfg!(target_os = "linux") && std::env::var_os("BLUE2_EVENT_PREFAULT").is_some();
     let folds: Vec<EventFold> = pt(ech.par_iter(),
-            || EventFold::new(shard_capacity),
+            || EventFold::new(shard_capacity, prefault),
             |mut acc, &(line_bias, c)| {
                 let mut dates = Dates::default();
                 let mut batch = Vec::<ParsedEvent>::with_capacity(16);
                 let mut short_writer = acc.short_copies.writer();
+                let mut people = acc.people.writer();
                 let mut flush = |batch: &mut Vec<ParsedEvent>| {
                     for mut r in batch.drain(..) {
                         if r.ts != TOMBSTONE {
                             let (pkey, pchk) = resolve_person(r.pkey, r.pchk);
                             let partition = (pkey >> (64 - PB)) as usize;
-                            let events = &mut acc.people[partition];
-                            let Ok(index) = u32::try_from(events.len()) else {
+                            let Ok(index) = u32::try_from(people.len(partition)) else {
                                 coll.store(true, Relaxed);
                                 continue;
                             };
-                            events.push(EvP {
+                            people.push(partition, EvP {
                                 person: PersonData::new(pkey, pchk, r.line_ref),
                                 ts: AtomicU32::new(r.ts),
                                 price: r.price,
@@ -1573,7 +1759,8 @@ fn fast(seed: u64) -> bool {
 
     // Events phase B: keep the earliest copy and tombstone valid losers.
     // Every EvP location belongs to exactly one event-ID shard.
-    pt((0..SH).into_par_iter(), Dedup::default, |mut table, shard| {
+    let use_mapping = cfg!(target_os = "linux") && std::env::var_os("BLUE2_DEDUP_MMAP").is_some();
+    pt((0..SH).into_par_iter(), || Dedup { use_mapping, ..Dedup::default() }, |mut table, shard| {
         table.shard(&folds, shard, &coll, |f, s| f.short_copies.records(s));
         table.shard(&folds, shard, &coll, |f, s| [&f.copies[s], &[]]);
         table
@@ -1654,7 +1841,7 @@ fn fast(seed: u64) -> bool {
             |mut st, p| {
                 st.ev.clear();
                 for a in &paccs {
-                    st.ev.extend(a[p].iter().filter_map(EvP::live));
+                    st.ev.extend(a.records(p).into_iter().flatten().filter_map(EvP::live));
                 }
                 st.ck.clear();
                 for a in &caccs {
