@@ -1747,7 +1747,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
             t.core.agg.set_ptr(sh.agg as *mut [u32; 2]);
             t.core.aggp.set_ptr(sh.aggp as *mut [u64; 2]);
         }
-        t.cx_raw.reserve(g.ev_bytes / 64 / g.nt / 16);
+        t.cx_raw.reserve(((t.n_ev_rows as usize) / 16).max(64));
         slab_cols(&mut t.core, sh.slab, sh.slab_len);
     }
     let mut xp = Xp::new();
