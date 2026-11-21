@@ -2096,7 +2096,7 @@ fn fast(seed: u64, nova: bool) -> bool {
         |mut acc, ci| {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
-            let mut dates = Dates::default();
+            let mut dates = nova::Dates::default();
             let mut batch = Vec::with_capacity(16);
             let mut flush = |batch: &mut Vec<PendingClick>| {
                 for PendingClick { mut click, key, check } in batch.drain(..) {
@@ -2106,7 +2106,7 @@ fn fast(seed: u64, nova: bool) -> bool {
                     acc[person as usize & (P - 1)].push(click);
                 }
             };
-            mask_rows::<4>(chunk, |_, [cid, user, cmp, ts]| {
+            nova::click_rows(chunk, |_, [cid, user, cmp, ts]| {
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }

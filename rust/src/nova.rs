@@ -386,6 +386,67 @@ fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     event_rows(bytes, |line, fields| sink.row(line, fields));
 }
 
+/// Click rows usually fit in two vectors. Decode their separators and quote
+/// endpoints together, retaining the generic scanner for short/long rows and tails.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2,bmi2")]
+unsafe fn fused_click_rows<'a>(mut bytes: &'a [u8], row: &mut impl FnMut(&'a [u8], [&'a [u8]; 4])) {
+    use std::arch::x86_64::*;
+    let mask = |value, byte| _mm256_movemask_epi8(_mm256_cmpeq_epi8(value, _mm256_set1_epi8(byte))) as u32;
+    while bytes.len() >= 64 {
+        let a = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast()) };
+        let b = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(32).cast()) };
+        let newlines = u64::from(mask(a, b'\n' as i8)) | (u64::from(mask(b, b'\n' as i8)) << 32);
+        if newlines == 0 {
+            let n = memchr::memchr(b'\n', &bytes[64..]).map_or(bytes.len(), |n| n + 64);
+            if let Some(fields) = crate::row_fields::<4>(&bytes[..n]) { row(&bytes[..n], fields); }
+            bytes = &bytes[(n + 1).min(bytes.len())..];
+            continue;
+        }
+        let n = newlines.trailing_zeros() as usize;
+        let line = &bytes[..n];
+        let clip = (1u64 << n) - 1;
+        let join = |byte| (u64::from(mask(a, byte)) | (u64::from(mask(b, byte)) << 32)) & clip;
+        let commas = join(b',' as i8);
+        if commas.count_ones() == 3 {
+            let quotes = join(b'"' as i8);
+            if commas & 1 != 0 {
+                if let Some(fields) = crate::row_fields::<4>(line) { row(line, fields); }
+            } else {
+                let opens = (commas << 1) | 1;
+                let closes = (commas | (1u64 << n)) >> 1;
+                let wrapped = _pext_u64(quotes, opens);
+                if quotes & !(opens | closes) == 0 && wrapped == _pext_u64(quotes, closes)
+                    && quotes.count_ones() == wrapped.count_ones() * 2 {
+                    let mut cuts = [0usize; 5];
+                    let mut remaining = commas;
+                    for cut in &mut cuts[1..4] {
+                        *cut = remaining.trailing_zeros() as usize + 1;
+                        remaining &= remaining - 1;
+                    }
+                    cuts[4] = n + 1;
+                    row(line, std::array::from_fn(|i| {
+                        let trim = ((wrapped >> i) & 1) as usize;
+                        // Matched endpoints and quote count ensure each trim is in bounds.
+                        unsafe { line.get_unchecked(cuts[i] + trim..cuts[i + 1] - 1 - trim) }
+                    }));
+                }
+            }
+        }
+        bytes = &bytes[n + 1..];
+    }
+    crate::mask_rows::<4>(bytes, row);
+}
+
+#[inline]
+pub(super) fn click_rows<'a>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 4])) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if std::is_x86_feature_detected!("bmi2") {
+        return unsafe { fused_click_rows(bytes, &mut row) };
+    }
+    crate::mask_rows::<4>(bytes, &mut row);
+}
+
 #[inline]
 fn swar_digits(word: u64) -> bool {
     const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
@@ -422,7 +483,7 @@ fn clock_seconds(s: &[u8]) -> Option<i64> {
 }
 
 #[derive(Default)]
-struct Dates([([u8; 10], i64); 32]);
+pub(super) struct Dates([([u8; 10], i64); 32]);
 
 impl Dates {
     #[inline]
@@ -451,7 +512,7 @@ impl Dates {
     }
 
     #[inline]
-    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+    pub(super) fn parse(&mut self, s: &[u8]) -> Option<i64> {
         if s.len() == 20 && s[19] == b'Z' {
             return self.utc_seconds(s).map(|t| t * 1000);
         }
@@ -782,6 +843,57 @@ pub(super) fn run_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_router_keeps_earliest_invalid_and_changed_person_copies() {
+        let mut folds = vec![Streams::new(), Streams::new()];
+        // Force overflow in the person output and cross a source block boundary.
+        for i in 0..300u64 {
+            folds[0].push(0, Event { key: i + 1, ingest: 20, person: 3, ts: 10, price: 1 });
+        }
+        folds[1].push(0, Event { key: 1, ingest: 10, person: 7, ts: INVALID, price: 0 });
+        folds[1].push(0, Event { key: 2, ingest: 10, person: 7, ts: 5, price: 2 });
+        folds[1].push(0, Event { key: 2, ingest: 30, person: 3, ts: 20, price: 3 });
+        folds[1].push(0, Event { key: 3, ingest: 20, person: 3, ts: 10, price: 1 });
+        let mut router = Router::new(1);
+        router.route(&folds, 0).unwrap();
+        let live = |part| router.people.records(part).into_iter().flatten()
+            .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
+        assert_eq!(live(3), vec![(3, 10, 1); 298]);
+        assert_eq!(live(7), vec![(7, 5, 2)]);
+    }
+
+    #[test]
+    fn click_scanner_matches_scalar_at_boundaries_and_quote_forms() {
+        let mut input = Vec::new();
+        for width in 0..140 {
+            for wraps in 0..16 {
+                let fields = ["c".repeat(width), "u01234567".into(), "c_123".into(), "2028-02-29T12:01:02Z".into()];
+                let start = input.len();
+                for (i, field) in fields.iter().enumerate() {
+                    if i != 0 { input.push(b','); }
+                    if wraps & (1 << i) != 0 { input.push(b'"'); }
+                    input.extend_from_slice(field.as_bytes());
+                    if wraps & (1 << i) != 0 { input.push(b'"'); }
+                }
+                input.push(b'\n');
+                let mut corrupt = input[start..].to_vec();
+                let at = width.min(corrupt.len() - 1);
+                corrupt[at] = b'"';
+                input.extend(corrupt);
+            }
+        }
+        for text in ["\n", ",,,\n", "\",u,c,t\n", "c,\",c,t\n", "c,u,\",t\n", "c,u,c,\"\n", "c,u,c,\"\"\n", "c,,c,t\n", "c,u,c,\"t\"x\n", "c,u,c,t,extra\n", "c,u,c,t\r\n", "c,u,c,t"] {
+            input.extend_from_slice(text.as_bytes());
+        }
+        let mut expected = Vec::new();
+        crate::for_lines(&input, |line| {
+            if let Some(fields) = crate::fields::<4>(line) { expected.push((line, fields)); }
+        });
+        let mut actual = Vec::new();
+        click_rows(&input, |line, fields| actual.push((line, fields)));
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn canonical_names_round_trip_byte_for_byte() {
