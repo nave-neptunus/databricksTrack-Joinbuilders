@@ -9,6 +9,25 @@ extern "C" {
     static environ: *const *const c_char;
 }
 use std::ffi::{c_char, CString};
+
+#[cfg(feature = "pgo")]
+#[inline]
+pub unsafe fn pgo_flush() {
+    unsafe extern "C" {
+        fn __llvm_profile_write_file() -> i32;
+    }
+    let _ = unsafe { __llvm_profile_write_file() };
+}
+
+#[cfg(not(feature = "pgo"))]
+#[inline]
+pub unsafe fn pgo_flush() {}
+
+#[inline]
+pub unsafe fn exit(code: i32) -> ! {
+    unsafe { pgo_flush() };
+    unsafe { _exit(code) }
+}
 pub const PROT_READ: i32 = 1;
 pub const PROT_WRITE: i32 = 2;
 pub const MAP_PRIVATE: i32 = 2;
@@ -129,16 +148,19 @@ pub fn fallback(why: &str) -> ! {
             // missing do we re-exec this binary in its own generic mode.
             if let (Ok(d), Ok(o)) = (CString::new(e.data.as_str()), CString::new(e.out.as_str())) {
                 let argv = [c"/fallback".as_ptr(), d.as_ptr(), o.as_ptr(), std::ptr::null()];
+                pgo_flush();
                 execve(c"/fallback".as_ptr(), argv.as_ptr(), environ);
             }
+            pgo_flush();
             execve(c"/proc/self/exe".as_ptr(), e.ptrs.as_ptr(), environ);
+            pgo_flush();
             execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
             eprintln!("[v2b] exec failed");
             if !WORKERS.load(Ordering::SeqCst) && std::thread::current().name() == Some("main") {
                 crate::run_generic(&e.data, &e.out, e.ncpu);
             }
         }
-        _exit(3)
+        exit(3)
     }
 }
 

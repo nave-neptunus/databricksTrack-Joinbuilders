@@ -2112,7 +2112,7 @@ pub fn sort_bench(g: &G) {
             norm(&mut b);
             if a != b {
                 eprintln!("[sortbench] SORT WRONG n={n} rep={rep}");
-                unsafe { crate::sys::_exit(9) };
+                unsafe { crate::sys::exit(9) };
             }
         }
     }

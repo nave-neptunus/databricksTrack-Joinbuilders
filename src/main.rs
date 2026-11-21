@@ -39,10 +39,10 @@ pub fn ncpu_env() -> usize {
 
 pub fn run_generic(data: &str, out: &str, ncpu: usize) -> ! {
     match generic::run(std::path::Path::new(data), std::path::Path::new(out), ncpu) {
-        Ok(()) => unsafe { sys::_exit(0) },
+        Ok(()) => unsafe { sys::exit(0) },
         Err(e) => {
             eprintln!("[generic] error: {e}");
-            unsafe { sys::_exit(1) }
+            unsafe { sys::exit(1) }
         }
     }
 }
@@ -372,19 +372,19 @@ fn main() {
             let (v, len) = enc36(y);
             if v.to_be_bytes()[..len] != s[..] || (len < 8 && v.to_be_bytes()[len] != 0) {
                 eprintln!("[v2b] CHECK FAILED: enc36({y})");
-                unsafe { sys::_exit(5) }
+                unsafe { sys::exit(5) }
             }
         }
     }
     if std::env::var("XL_MEMTEST").is_ok() {
         eprintln!("[memtest] {}", if sys::mem_test() { "OK" } else { "FAILED" });
-        unsafe { sys::_exit(0) };
+        unsafe { sys::exit(0) };
     }
     let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, &outdir, nt, check)));
     lap("setup");
     if std::env::var("XL_SORTBENCH").is_ok() {
         links::sort_bench(g);
-        unsafe { sys::_exit(0) };
+        unsafe { sys::exit(0) };
     }
     {
         let gr: &G = g;
@@ -540,5 +540,5 @@ fn main() {
             for (kb, n) in v.iter().rev().take(12) { eprintln!("[dbg] rss {kb} kB {n}"); }
         }
     }
-    unsafe { sys::_exit(0) }
+    unsafe { sys::exit(0) }
 }
