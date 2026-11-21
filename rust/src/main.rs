@@ -2467,7 +2467,7 @@ impl PartitionState {
 
 /// Each span is either a single event or an exact summary of a connected
 /// half-hour bucket. Session credit and day totals consume either directly.
-#[inline]
+#[inline(always)]
 fn aggregate_sessions<T: Copy>(
     rows: &[T],
     origin: i64,
@@ -2600,6 +2600,7 @@ impl EventBuckets {
         }
     }
 
+    #[inline(always)]
     fn aggregate(&self, index: usize, sums: &mut [i64], touched: &mut Vec<u32>) -> (i64, i64) {
         let bucket = &self.by_time[index];
         let mut revenue = 0;
