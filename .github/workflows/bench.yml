@@ -2,7 +2,7 @@ name: g7 x86 benchmark
 
 on:
   push:
-    branches: [g7/bench-run]
+    branches: [g7/bench-run, g7/bench-run2]
 
 env:
   DATA_SEED: "3"
