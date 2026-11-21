@@ -220,14 +220,15 @@ fn csv_rows<'a, const N: usize>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [
 /// Collect two masks for the whole row, then decode exactly six cuts.
 #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
-fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
+fn row_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(target_arch = "aarch64")]
     const WIDTH: usize = 16;
     #[cfg(target_arch = "x86_64")]
     const WIDTH: usize = 32;
 
+    const { assert!(N >= 2 && N <= 15) };
     if !(WIDTH..=128).contains(&line.len()) {
-        return fields::<7>(line);
+        return fields::<N>(line);
     }
     let masks = |offset: usize| {
         // The caller loads full vectors inside the row, overlapping the last
@@ -273,18 +274,18 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
         commas |= u128::from(c >> overlap) << offset;
         quotes |= u128::from(q >> overlap) << offset;
     }
-    if commas.count_ones() != 6 {
+    if commas.count_ones() as usize != N - 1 {
         return None;
     }
-    let mut cuts = [0; 8];
-    for cut in &mut cuts[1..7] {
+    let mut cuts = [0; 16];
+    for cut in &mut cuts[1..N] {
         *cut = commas.trailing_zeros() as usize + 1;
         commas &= commas - 1;
     }
-    cuts[7] = line.len() + 1;
+    cuts[N] = line.len() + 1;
     if quotes == 0 {
         return Some(std::array::from_fn(|i| {
-            // Six distinct cuts precede the terminal offset.
+            // N - 1 distinct cuts precede the terminal offset.
             unsafe { line.get_unchecked(cuts[i]..cuts[i + 1] - 1) }
         }));
     }
@@ -304,10 +305,16 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
 }
 
 #[inline]
-fn event_rows<'a>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+fn event_rows<'a>(bytes: &'a [u8], row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+    mask_rows::<7>(bytes, row)
+}
+
+/// Fixed-arity rows: newline iterator, then two masks per row (see row_fields).
+#[inline]
+fn mask_rows<'a, const N: usize>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; N])) {
     #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
     for_lines(bytes, |line| {
-        if let Some(values) = event_fields(line) {
+        if let Some(values) = row_fields::<N>(line) {
             row(line, values);
         }
     });
@@ -1308,13 +1315,46 @@ mod single_scatter_tests {
     }
 }
 
+/// n for an id spelled exactly c_<n> with ASCII digits, no leading zero, n < 10^9.
+#[inline]
+fn campaign_number(c: &[u8]) -> Option<usize> {
+    let d = c.strip_prefix(b"c_")?;
+    if d.is_empty() || d.len() > 9 || (d[0] == b'0' && d.len() > 1) {
+        return None;
+    }
+    let mut n = 0usize;
+    for &b in d {
+        let x = b.wrapping_sub(b'0');
+        if x > 9 {
+            return None;
+        }
+        n = n * 10 + x as usize;
+    }
+    Some(n)
+}
+
 /// A validated click, with exact click ID available for tie-breaking.
 #[derive(Clone, Copy)]
 struct Click {
-    person: u64,
-    id: u64,
+    // Pointer to the click_id bytes (low 48 bits) and the campaign index (high 16).
+    tag: u64,
+    person: u32,
     ts: u32,
-    campaign: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Click>() == 16);
+
+/// The click_id that starts at `p` (from Click::tag). The row was valid, so the
+/// field ends at its closing quote or its comma, and both always follow it.
+#[inline]
+fn click_id_at(p: u64) -> &'static [u8] {
+    let start = (p & ((1 << 48) - 1)) as *const u8;
+    let mut n = 0;
+    // SAFETY: a validated row has a ',' after its first field inside the mapping.
+    while !matches!(unsafe { *start.add(n) }, b',' | b'"') {
+        n += 1;
+    }
+    unsafe { std::slice::from_raw_parts(start, n) }
 }
 
 struct PendingClick {
@@ -1772,6 +1812,37 @@ fn fast(seed: u64) -> bool {
         }
     });
     let ncamp = camp_names.len();
+    if ncamp >= 1 << 16 {
+        return false; // the campaign index must fit in 16 bits of Click::tag
+    }
+    // Campaign ids shaped c_<digits> (no leading zero) resolve through an array by number,
+    // then compare bytes, so the answer is the map's; anything else uses the map.
+    let mut by_number: Vec<u32> = Vec::new();
+    for (i, c) in camp_names.iter().enumerate() {
+        if let Some(n) = campaign_number(c) {
+            if n < 1 << 20 {
+                if by_number.len() <= n {
+                    by_number.resize(n + 1, u32::MAX);
+                }
+                if by_number[n] == u32::MAX {
+                    by_number[n] = i as u32;
+                }
+            }
+        }
+    }
+    let campaign_of = |c: &[u8]| -> Option<u32> {
+        if let Some(n) = campaign_number(c) {
+            if let Some(&i) = by_number.get(n) {
+                if i != u32::MAX && camp_names[i as usize] == c {
+                    return Some(i);
+                }
+            }
+            if n < 1 << 20 {
+                return None; // every c_<n> below the bound is in by_number if it exists
+            }
+        }
+        camp.get(c).copied()
+    };
 
     let est_users = evb.iter().find(|b| b.len() >= 1 << 16).map_or(0, |b| {
         let rows = memchr::memchr_iter(b'\n', &b[..1 << 16]).count().max(1);
@@ -1934,26 +2005,28 @@ fn fast(seed: u64) -> bool {
                 for PendingClick { mut click, key, check } in batch.drain(..) {
                     // A user id not in the table has no valid event, so no session to credit.
                     let Some(person) = users.find(key, check, &coll) else { continue };
-                    click.person = u64::from(person);
+                    click.person = person;
                     acc.push(person as usize & (P - 1), click);
                 }
             };
-            csv_rows(chunk, |_, [cid, user, cmp, ts]| {
+            mask_rows::<4>(chunk, |_, [cid, user, cmp, ts]| {
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }
-                let Some(&campaign) = camp.get(cmp) else { return };
+                let Some(campaign) = campaign_of(cmp) else { return };
                 let ts = match dates.parse(ts) {
                     Some(t) if t >= click_start && t < w1 => (t - click_start) as u32,
                     _ => return,
                 };
-                let (Some(person), Some(id)) = (pack_ref(user), pack_ref(cid)) else {
+                let ptr = cid.as_ptr() as u64;
+                if ptr >> 48 != 0 {
                     coll.store(true, Relaxed);
                     return;
-                };
+                }
                 let (key, check) = hs(user, seed);
                 users.prefetch(key);
-                batch.push(PendingClick { click: Click { person, id, ts, campaign }, key, check });
+                let tag = ptr | (u64::from(campaign) << 48);
+                batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
                 if batch.len() == 16 {
                     flush(&mut batch);
                 }
@@ -2178,10 +2251,10 @@ impl PartitionState {
         }
         for fold in clicks {
             for click in fold.records(partition).into_iter().flatten() {
-                let person = (click.person >> PB) as u32;
+                let person = click.person >> PB;
                 if self.ends[person as usize] != 0 {
                     self.click_people_times.push((person, click.ts));
-                    self.click_meta.push(ClickMeta { id: click.id, campaign: click.campaign });
+                    self.click_meta.push(ClickMeta { id: click.tag & ((1 << 48) - 1), campaign: (click.tag >> 48) as u32 });
                 }
             }
         }
@@ -2259,7 +2332,7 @@ impl PartitionState {
                         active.push(campaign as u32);
                     }
                     if best_click.is_none_or(|(t, old_id, _)| {
-                        time > t || (id != old_id && unpack_ref(id) < unpack_ref(old_id))
+                        time > t || (id != old_id && click_id_at(id) < click_id_at(old_id))
                     }) {
                         best_click = Some((time, id, campaign));
                     }
@@ -2412,4 +2485,42 @@ mod all_uid_tests {
         assert_eq!(names[3], b"u_linked_no_events");
         assert_eq!(names[fresh as usize], b"u_event_user");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn four_field_row_masks_match_scalar() {
+    let alphabet = [b'a', b'0', b',', b'"', b'\r', b' ', b'Z', b'-'];
+    let mut x = 0x1234_5678_9abc_def1u64;
+    let mut data = Vec::new();
+    for _ in 0..50_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let len = (x % 140) as usize;
+        let mut y = x;
+        for i in 0..len {
+            y = y.rotate_left(5) ^ (i as u64).wrapping_mul(0x9e37_79b9);
+            // Mostly letters, with commas often enough to hit 4 fields.
+            let c = if y % 7 == 0 { alphabet[(y >> 8) as usize % 8] } else if y % 5 == 0 { b',' } else { b'k' };
+            data.push(c);
+        }
+        data.push(b'\n');
+    }
+    let mut expected = Vec::new();
+    for_lines(&data, |line| {
+        if let Some(v) = fields::<4>(line) {
+            expected.push((line, v));
+        }
+    });
+    let mut actual = Vec::new();
+    mask_rows::<4>(&data, |line, v| actual.push((line, v)));
+    assert!(expected.len() > 1000);
+    assert_eq!(actual, expected);
+    assert_eq!(campaign_number(b"c_123"), Some(123));
+    assert_eq!(campaign_number(b"c_0"), Some(0));
+    assert_eq!(campaign_number(b"c_0123"), None);
+    assert_eq!(campaign_number(b"C_123"), None);
+    assert_eq!(campaign_number(b"c_12a"), None);
+    assert_eq!(campaign_number(b"c_"), None);
 }
