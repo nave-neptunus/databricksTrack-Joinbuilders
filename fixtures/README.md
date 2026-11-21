@@ -28,6 +28,8 @@ All cases share a window of 2026-10-01 to 2026-10-15, the products `p1` (shoes) 
 | E18 | F3 with leading zeros (kept); F3 `86400000`, in Arabic-Indic digits, and 21 digits long; a year with a full-width digit; purchases priced `２５０` and `٢٥٠` (all dropped); one priced `0250` (kept) | Digits are ASCII only; leading zeros are fine; an F3 value outside the window is bad, however short or long |
 | E19 | Users `u1`, ` u1`, `u1 ` and `" u1"`; product ` p1`; event type ` view`; event IDs `e1` and `e1 `; a click by ` u1`, one for campaign ` c_1` | Spaces are part of a value, quoted or not |
 | E20 | Lines ending `\r\n`: a view (kept), a purchase whose price becomes `1000\r` (dropped), a click whose `ts` becomes `...Z\r` (dropped); event IDs `e3` and `e3\r` | `\r` is an ordinary character, never a line ending |
+| E21 | Duplicate purchases with first ingest at window start + 2^24 seconds (late) and second at window start | Ingest orders outside Nova's 24-bit router encoding decline to exact fallback; the valid 200-cent copy wins |
+| E22 | Duplicate purchases with first ingest at window start - 2^21 - 1 seconds and second at window start | A too-early ingest still wins under the full ordering; the 100-cent copy is retained |
 
 ## Attribution
 
