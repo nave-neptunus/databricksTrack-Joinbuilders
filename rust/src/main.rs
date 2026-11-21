@@ -1227,18 +1227,35 @@ impl PeopleWriter<'_> {
     }
 
     #[inline]
-    fn push(&mut self, person: u32, ts: u32, price: u32) {
+    fn push(&mut self, person: u32, ts: u32, price: u32) -> Option<u32> {
         let part = person as usize & (P - 1);
         let len = self.lengths[part];
         let row = EvP { person, ts: AtomicU32::new(ts), price };
-        if len < self.stride {
+        let index = if len < self.stride {
             // Nonzero stride requires an owned mapping; this partition's
             // initialized prefix is extended by exactly one exclusive write.
             unsafe { self.base.add(part * self.stride + len).write(row) };
             self.lengths[part] = len + 1;
+            len
         } else {
+            let index = self.stride + self.overflow[part].len();
             self.overflow[part].push(row);
-        }
+            index
+        };
+        u32::try_from(index).ok()
+    }
+
+    /// Mark a previously scattered row as a loser without another traversal.
+    #[inline]
+    fn invalidate(&self, part: usize, index: usize) {
+        let ts: &AtomicU32 = if index < self.stride {
+            unsafe { &(*self.base.add(part * self.stride + index)).ts }
+        } else {
+            &self.overflow[part][index - self.stride].ts
+        };
+        // `EvP.ts` is atomic because the shard owns the row and sessions may
+        // read it concurrently after dedup.
+        ts.store(TOMBSTONE, Relaxed);
     }
 }
 

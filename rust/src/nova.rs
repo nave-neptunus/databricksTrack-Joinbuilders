@@ -696,18 +696,32 @@ fn events(
 
 type EventStream = Streams<Event, SHARDS>;
 
-// Tag bits avoid an indirect load for almost every occupied cell with a
-// different key. The location refers to a record in an immutable stream.
-const LOCATION_BITS: u32 = 26;
-const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
+// One 16-byte cell holds the full key, the winning ingest time and the
+// destination of the winning copy. The high byte of `meta` is a generation,
+// so a table can be reused for all shards without clearing it. A destination
+// packs the source fold, person partition and output row; invalid copies win
+// comparisons but have no destination.
+const META_GEN_SHIFT: u32 = 24;
+const META_INGEST_MASK: u32 = (1 << META_GEN_SHIFT) - 1;
+const INGEST_BIAS: i32 = 1 << 21;
+const LOC_INDEX_BITS: u32 = 22;
+const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
+const INDEX_MASK: u32 = (1 << LOC_INDEX_BITS) - 1;
+const NO_LOC: u32 = u32::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    key: u64,
+    meta: u32,
+    loc: u32,
+}
 
 struct Router {
     people: People,
-    winners: Vec<u32>,
-    losers: Vec<u8>,
-    bases: Vec<usize>,
-    hash_ns: u64,
-    scatter_ns: u64,
+    slots: Vec<Slot>,
+    generation: u32,
+    route_ns: u64,
     table_percent: usize,
 }
 
@@ -715,99 +729,82 @@ impl Router {
     fn new(reservation: usize) -> Self {
         Self {
             people: People::new(reservation),
-            winners: Vec::new(),
-            losers: Vec::new(),
-            bases: Vec::new(),
-            hash_ns: 0,
-            scatter_ns: 0,
+            slots: Vec::new(),
+            generation: 0,
+            route_ns: 0,
             table_percent: std::env::var("BREAKER_TABLE_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(110),
         }
     }
 
     fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
         let begin = std::time::Instant::now();
-        let mut count = 0;
-        let mut longest = 1;
-        self.bases.clear();
-        for fold in folds {
-            self.bases.push(count);
-            let rows = fold.len(shard);
-            count += rows;
-            longest = longest.max(rows);
-        }
+        let count: usize = folds.iter().map(|fold| fold.len(shard)).sum();
         if count == 0 {
             return Some(());
         }
-        let stride = longest.checked_next_power_of_two()?;
-        if folds.len() > LOCATION_MASK as usize / stride {
-            return None;
-        }
-        let shift = stride.trailing_zeros();
         let mask = (count * self.table_percent / 100).next_power_of_two() - 1;
-        self.winners.clear();
-        self.winners.resize(mask + 1, 0);
-        self.losers.clear();
-        self.losers.resize(count, 0);
+        if self.slots.len() < mask + 1 {
+            self.slots.resize(mask + 1, Slot::default());
+        }
+        self.generation += 1;
+        if self.generation == 1 << (32 - META_GEN_SHIFT) {
+            self.slots.fill(Slot::default());
+            self.generation = 1;
+        }
+        let generation = self.generation << META_GEN_SHIFT;
 
-        for (file, fold) in folds.iter().enumerate() {
-            let mut block_base = 0;
+        // Winners are routed as they are found: one traversal reads the
+        // streams, probes the table and appends each winner to its final
+        // person partition. A later, earlier-ingest copy tombstones the
+        // previous destination directly, so no loser bitmap or second pass
+        // is needed.
+        let mut writer = self.people.writer();
+        for fold in folds {
             for block in fold.chunks(shard) {
                 for (offset, row) in block.iter().enumerate() {
-                    let index = block_base + offset;
                     if let Some(next) = block.get(offset + 16) {
-                        crate::prefetch_read(self.winners.as_ptr().wrapping_add(next.key as usize & mask).cast());
+                        crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
                     }
-                    let hash = row.key;
-                    let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
-                    let location = ((file << shift) + index + 1) as u32;
-                    let mut slot = hash as usize & mask;
+                    let meta = generation | ((row.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
+                    let mut slot = row.key as usize & mask;
                     loop {
-                        let winner = self.winners[slot];
-                        if winner == 0 {
-                            self.winners[slot] = tag | location;
+                        let winner = self.slots[slot];
+                        if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
+                            let loc = if row.ts != INVALID {
+                                let part = row.person as usize & (P - 1);
+                                let index = writer.push(row.person, row.ts, row.price)?;
+                                ((part as u32) << LOC_PART_SHIFT) | (index as u32 & INDEX_MASK)
+                            } else {
+                                NO_LOC
+                            };
+                            self.slots[slot] = Slot { key: row.key, meta, loc };
                             break;
                         }
-                        if winner & !LOCATION_MASK == tag {
-                            let previous = ((winner & LOCATION_MASK) - 1) as usize;
-                            let prior_file = previous >> shift;
-                            let prior_index = previous & (stride - 1);
-                            let prior = folds[prior_file].get(shard, prior_index);
-                            if prior.key == row.key {
-                                // Invalid copies still compete for earliest ingest.
-                                if row.ingest < prior.ingest {
-                                    self.losers[self.bases[prior_file] + prior_index] = 1;
-                                    self.winners[slot] = tag | location;
-                                } else {
-                                    self.losers[self.bases[file] + index] = 1;
+                        if winner.key == row.key {
+                            let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
+                            if row.ingest < previous {
+                                if winner.loc != NO_LOC {
+                                    let part = (winner.loc >> LOC_PART_SHIFT) as usize;
+                                    let index = (winner.loc & INDEX_MASK) as usize;
+                                    writer.invalidate(part, index);
                                 }
-                                break;
+                                let loc = if row.ts != INVALID {
+                                    let part = row.person as usize & (P - 1);
+                                    let index = writer.push(row.person, row.ts, row.price)?;
+                                    ((part as u32) << LOC_PART_SHIFT) | (index as u32 & INDEX_MASK)
+                                } else {
+                                    NO_LOC
+                                };
+                                self.slots[slot] = Slot { key: row.key, meta, loc };
                             }
+                            break;
                         }
                         slot = (slot + 1) & mask;
                     }
                 }
-                block_base += block.len();
             }
         }
-        self.hash_ns += begin.elapsed().as_nanos() as u64;
-        let begin = std::time::Instant::now();
-        let mut writer = self.people.writer();
-        for (file, fold) in folds.iter().enumerate() {
-            let base = self.bases[file];
-            let mut block_base = base;
-            for block in fold.chunks(shard) {
-                for (offset, row) in block.iter().enumerate() {
-                    if let Some(next) = block.get(offset + 16) {
-                        writer.prefetch(next.person);
-                    }
-                    if row.ts != INVALID && self.losers[block_base + offset] == 0 {
-                        writer.push(row.person, row.ts, row.price);
-                    }
-                }
-                block_base += block.len();
-            }
-        }
-        self.scatter_ns += begin.elapsed().as_nanos() as u64;
+        self.route_ns += begin.elapsed().as_nanos() as u64;
         Some(())
     }
 }
@@ -851,7 +848,7 @@ pub(super) fn run_events(
     .into_iter()
     .map(|router| {
         if std::env::var_os("TIMING").is_some() {
-            eprintln!("ROUTER hash={:.1} scatter={:.1}", router.hash_ns as f64 / 1e6, router.scatter_ns as f64 / 1e6);
+            eprintln!("ROUTER route={:.1}", router.route_ns as f64 / 1e6);
         }
         router.people
     })
