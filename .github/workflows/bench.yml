@@ -2,7 +2,7 @@ name: g7 x86 benchmark
 
 on:
   push:
-    branches: [g7/bench-ci]
+    branches: [g7/bench-run]
 
 env:
   DATA_SEED: "3"
@@ -17,22 +17,9 @@ jobs:
       matrix:
         include:
           - { label: baseline, ref: ed40599 }
-          - { label: baseline-pmu, ref: ed40599, fast_features: "--features pmu" }
-          - { label: lanes8, ref: 6fafb87 }
-          - { label: io-popread-a, ref: 2005c71 }
-          - { label: io-popread-b, ref: d937261 }
-          - { label: io-serialgaps, ref: 71cc59b }
-          - { label: core-prerelease, ref: 92b062f }
-          - { label: core-prefault, ref: 49449d5 }
-          - { label: io-prefault2, ref: abe261c }
-          - { label: stack1, ref: 96572eb }
-          - { label: stack1-lanes8, ref: ed40599, combined: "true" }
-          - { label: core-pgo, ref: d61d19c }
-          - { label: stack1-pgo, ref: 7760829 }
           - { label: io-pfd, ref: 603a066 }
           - { label: io-fuse, ref: 74d051a }
           - { label: core-runpath, ref: ec7479b }
-          - { label: core-purchase, ref: d38b295 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -80,38 +67,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: lanes8, candidate_ref: 6fafb87, image: lanes8, setting: '' }
-          - { label: pinstart-1, candidate_ref: ed40599, image: baseline, setting: XL_PINSTART=1 }
-          - { label: rel-0, candidate_ref: ed40599, image: baseline, setting: XL_REL=0 }
-          - { label: spin-50, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=50 }
-          - { label: spin-100, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=100 }
-          - { label: spin-1000, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=1000 }
           # XL_ENDREL=1 is default conditional behavior; 2 actually forces release.
-          - { label: endrel-2, candidate_ref: ed40599, image: baseline, setting: XL_ENDREL=2 }
-          - { label: rd-0, candidate_ref: ed40599, image: baseline, setting: XL_RD=0 }
-          - { label: rd-512, candidate_ref: ed40599, image: baseline, setting: XL_RD=512 }
-          - { label: ch-2048, candidate_ref: ed40599, image: baseline, setting: XL_CH=2048 }
-          - { label: ch-4096, candidate_ref: ed40599, image: baseline, setting: XL_CH=4096 }
-          - { label: io-popread-a, candidate_ref: 2005c71, image: io-popread-a, setting: '' }
-          - { label: io-popread-b, candidate_ref: d937261, image: io-popread-b, setting: '' }
-          - { label: io-serialgaps, candidate_ref: 71cc59b, image: io-serialgaps, setting: '' }
-          - { label: core-prerelease, candidate_ref: 92b062f, image: core-prerelease, setting: '' }
-          - { label: core-prefault, candidate_ref: 49449d5, image: core-prefault, setting: '' }
-          - { label: io-prefault2, candidate_ref: abe261c, image: io-prefault2, setting: '' }
-          - { label: stack1, candidate_ref: 96572eb, image: stack1, setting: '' }
-          - { label: stack1-lanes8, candidate_ref: 96572eb, candidate_label: 'synthetic merge ed40599 + 6fafb87 + 96572eb', image: stack1-lanes8, setting: '' }
-          - { label: core-pgo, candidate_ref: d61d19c, image: core-pgo, setting: '' }
-          - { label: stack1-pgo, candidate_ref: 7760829, image: stack1-pgo, setting: '' }
           - { label: io-pfd-default, candidate_ref: 603a066, image: io-pfd, setting: '', pairs: '8' }
           - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0, pairs: '8' }
-          - { label: io-pfd-512, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=512, pairs: '8' }
-          - { label: io-pfd-1024, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=1024, pairs: '8' }
           - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048, pairs: '8' }
           - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096, pairs: '8' }
           # 5f08834 only fixes test data; 74d051a is the identical engine timed below.
           - { label: io-fuse, candidate_ref: 74d051a, test_ref: 5f08834, image: io-fuse, setting: '', run_tests: 'true', pairs: '8' }
           - { label: core-runpath, candidate_ref: ec7479b, image: core-runpath, setting: '', run_tests: 'true', pairs: '8' }
-          - { label: core-purchase, candidate_ref: d38b295, image: core-purchase, setting: '', run_tests: 'true', pairs: '8' }
     env:
       BASELINE_REF: ${{ matrix.baseline_ref || 'ed40599' }}
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
@@ -212,6 +175,7 @@ jobs:
           retention-days: 7
 
   profile-baseline:
+    if: false
     needs: build-images
     runs-on: ubuntu-latest
     timeout-minutes: 90
