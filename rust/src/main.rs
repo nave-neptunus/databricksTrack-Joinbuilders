@@ -2324,3 +2324,34 @@ fn top_cat(catsum: &mut [i64], touched: &mut Vec<u32>, names: &[&[u8]]) -> u32 {
     touched.clear();
     top
 }
+
+#[cfg(test)]
+mod all_uid_tests {
+    use super::*;
+
+    // A linked id with no events must still resolve to its person for clicks, and an unlinked
+    // event user gets a fresh dense id that clicks then find.
+    #[test]
+    fn linked_ids_without_events_resolve_for_clicks() {
+        let mut tab = Tab::new(64);
+        let (kl, cl) = hs(b"u_linked_no_events", 7);
+        let (ke, ce) = hs(b"u_event_user", 7);
+        // As the links build leaves it: key, then (check << 32) | PERSON_SET | person.
+        let i = (kl as usize) & tab.mask;
+        tab.slots[i] = (kl, (u64::from(cl) << 32) | PERSON_SET | 3);
+        let coll = AtomicBool::new(false);
+        let users = Users::new(&mut tab, 1, 5);
+        let mut block = (0, 0);
+        let fresh = users.person(ke, ce, pack_ref(b"u_event_user").unwrap(), &mut block, &coll);
+        assert!(fresh as usize >= P, "unlinked ids start after the linked block");
+        assert_eq!(users.person(ke, ce, 0, &mut block, &coll), fresh);
+        assert_eq!(users.find(kl, cl, &coll), Some(3));
+        assert_eq!(users.find(ke, ce, &coll), Some(fresh));
+        let (kn, cn) = hs(b"u_never_seen", 7);
+        assert_eq!(users.find(kn, cn, &coll), None);
+        assert!(!coll.load(Relaxed));
+        let (_, names) = users.names(&[&b"a"[..], b"b", b"c", b"u_linked_no_events", b"e"], &coll);
+        assert_eq!(names[3], b"u_linked_no_events");
+        assert_eq!(names[fresh as usize], b"u_event_user");
+    }
+}
