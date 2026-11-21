@@ -856,6 +856,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             while !(sbytes.done.load(Ordering::Acquire) && cbytes.done.load(Ordering::Acquire)) && !keys.done.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
+            while help() {}
             let m = mem.get();
             let (ev, ev_len) = m.ev_arena.span();
             let (us, us_len) = m.us_arena.span();
