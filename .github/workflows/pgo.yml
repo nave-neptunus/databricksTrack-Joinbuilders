@@ -2,7 +2,7 @@ name: g7 fast-path PGO profile
 
 on:
   push:
-    branches: [g7/core-pgo]
+    branches: [g7/core-pgo, g7/stack1-pgo]
 
 jobs:
   collect:
