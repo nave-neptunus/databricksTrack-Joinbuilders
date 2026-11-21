@@ -1,7 +1,7 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
 use crate::{
-    DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, hs, lap, pack_ref, parse_price,
+    DAY, EvP, EventChunks, P, People, Users, event_rows, hs, lap, pack_ref, parse_price, persist_ref,
     unpack_ref,
 };
 use ahash::AHashMap;
@@ -383,13 +383,13 @@ fn event_hash(key: u64) -> u64 {
 }
 
 fn events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+    work: &EventChunks<'_>,
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
 ) -> Vec<Streams<Event, SHARDS>> {
     let next = AtomicUsize::new(0);
+    let reuse_input = work.ring.is_some();
     let window_seconds = input.start.div_euclid(1000);
     rayon::broadcast(|_| {
         let mut streams = Streams::new();
@@ -411,71 +411,85 @@ fn events(
             if index >= work.len() {
                 break;
             }
-            read_ahead.wait(work.raw(index));
-            let chunk = work.get(index);
-            scan_event_rows::<true>(chunk, |_, [id, user, ts, ingest, kind, product, price]| {
-                if id.is_empty() {
-                    return;
-                }
-                let key = match short_key(id, b'e') {
-                    Some(key) => permute_short(key),
-                    None => {
-                        let Some(name) = pack_ref(id).filter(|name| name & SHORT_KEY == 0) else {
-                            declined.store(true, Relaxed);
-                            return;
+            if work.with_chunk(index, |chunk| {
+                scan_event_rows::<true>(chunk, |_, [id, user, ts, ingest, kind, product, price]| {
+                    if id.is_empty() {
+                        return;
+                    }
+                    let key = match short_key(id, b'e') {
+                        Some(key) => permute_short(key),
+                        None => {
+                            let Some(name) = pack_ref(id).filter(|name| name & SHORT_KEY == 0) else {
+                                declined.store(true, Relaxed);
+                                return;
+                            };
+                            if reuse_input {
+                                let Some(stable) = persist_ref(name) else {
+                                    declined.store(true, Relaxed);
+                                    return;
+                                };
+                                stable
+                            } else {
+                                name
+                            }
+                        }
+                    };
+                    let Some(seconds) = dates.utc_seconds(ingest) else {
+                        declined.store(true, Relaxed);
+                        return;
+                    };
+                    let Ok(order) = i32::try_from(seconds - window_seconds) else {
+                        declined.store(true, Relaxed);
+                        return;
+                    };
+                    let mut pending = Pending::EMPTY;
+                    pending.row.key = key;
+                    pending.row.ingest = order;
+                    'valid: {
+                        if user.is_empty() || product.is_empty() {
+                            break 'valid;
+                        }
+                        let purchase = match kind {
+                            b"purchase" => true,
+                            b"view" | b"cart" => false,
+                            _ => break 'valid,
                         };
-                        name
-                    }
-                };
-                let Some(seconds) = dates.utc_seconds(ingest) else {
-                    declined.store(true, Relaxed);
-                    return;
-                };
-                let Ok(order) = i32::try_from(seconds - window_seconds) else {
-                    declined.store(true, Relaxed);
-                    return;
-                };
-                let mut pending = Pending::EMPTY;
-                pending.row.key = key;
-                pending.row.ingest = order;
-                'valid: {
-                    if user.is_empty() || product.is_empty() {
-                        break 'valid;
-                    }
-                    let purchase = match kind {
-                        b"purchase" => true,
-                        b"view" | b"cart" => false,
-                        _ => break 'valid,
-                    };
-                    let Some(time) = dates.parse(ts) else {
-                        break 'valid;
-                    };
-                    if time < input.start || time >= input.end || seconds * 1000 - time > DAY {
-                        break 'valid;
-                    }
-                    if purchase {
-                        let Some(value) = parse_price(price) else {
+                        let Some(time) = dates.parse(ts) else {
                             break 'valid;
                         };
-                        let category = *input.products.get(product).unwrap_or(&input.unknown);
-                        pending.row.price = value | (category << 24);
+                        if time < input.start || time >= input.end || seconds * 1000 - time > DAY {
+                            break 'valid;
+                        }
+                        if purchase {
+                            let Some(value) = parse_price(price) else {
+                                break 'valid;
+                            };
+                            let category = *input.products.get(product).unwrap_or(&input.unknown);
+                            pending.row.price = value | (category << 24);
+                        }
+                        let (Some(uid), Some(name)) = (user_key(user), pack_ref(user)) else {
+                            declined.store(true, Relaxed);
+                            break 'valid;
+                        };
+                        users.prefetch(uid);
+                        pending.row.ts = (time - input.start) as u32;
+                        pending.uid = uid;
+                        pending.name = name;
                     }
-                    let (Some(uid), Some(name)) = (user_key(user), pack_ref(user)) else {
-                        declined.store(true, Relaxed);
-                        break 'valid;
-                    };
-                    users.prefetch(uid);
-                    pending.row.ts = (time - input.start) as u32;
-                    pending.uid = uid;
-                    pending.name = name;
-                }
-                batch[len] = pending;
-                len += 1;
-                if len == batch.len() {
-                    flush(&batch);
+                    batch[len] = pending;
+                    len += 1;
+                    if len == batch.len() {
+                        flush(&batch);
+                        len = 0;
+                    }
+                });
+                if reuse_input {
+                    flush(&batch[..len]);
                     len = 0;
                 }
-            });
+            }).is_none() {
+                declined.store(true, Relaxed);
+            }
         }
         flush(&batch[..len]);
         streams
@@ -587,14 +601,13 @@ fn same_event(a: u64, b: u64) -> bool {
 }
 
 pub(super) fn run_events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+    work: &EventChunks<'_>,
     users: &Users<'_>,
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let folds = events(work, read_ahead, users, input, declined);
+    let folds = events(work, users, input, declined);
     let (local_count, names) = users.names(linked_names, declined);
     lap(&format!(
         "events parsed (nova, {} folds, {} persons)",
