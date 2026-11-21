@@ -21,16 +21,6 @@ const GAP: i64 = 1_800_000;
 const LOOK: i64 = 7 * DAY;
 
 static mut T0: Option<Instant> = None;
-
-/// Process-wide CPU counters from /proc/self/stat (fields 14 and 15, in ticks).
-pub(crate) fn cpu_ticks() -> (u64, u64) {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    let tail = stat.rsplit_once(')').map_or(stat.as_str(), |(_, t)| t);
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    let get = |i: usize| fields.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (get(11), get(12))
-}
-
 fn lap(name: &str) {
     if std::env::var_os("TIMING").is_some() {
         #[allow(static_mut_refs)]
@@ -1961,21 +1951,9 @@ fn fast(seed: u64, nova: bool) -> bool {
     let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs) = if nova {
         let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let clock = Instant::now();
-        let (user0, sys0) = cpu_ticks();
         let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
             return false;
         };
-        let (user1, sys1) = cpu_ticks();
-        eprintln!(
-            "EVENT_STAGE wall_ms={:.2} user_ticks={} sys_ticks={}",
-            clock.elapsed().as_secs_f64() * 1000.0,
-            user1 - user0,
-            sys1 - sys0
-        );
-        if std::env::var_os("EVENT_ONLY").is_some() {
-            std::process::exit(0);
-        }
         result
     } else {
         let shard_capacity = evb.iter().find(|b| b.len() >= 1 << 17).map_or(0, |b| {
