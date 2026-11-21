@@ -2107,8 +2107,10 @@ fn fast(seed: u64) -> bool {
     use arrow_array::builder::StringBuilder;
     use arrow_schema::{DataType, Field, Schema};
     let props = parquet::file::properties::WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+        .set_compression(parquet::basic::Compression::SNAPPY)
         .set_dictionary_enabled(false)
+        .set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from("top_category"), true)
+        .set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from("channel"), true)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
         .build();
     let write = |path: String, batch: RecordBatch| {
