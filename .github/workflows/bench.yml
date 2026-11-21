@@ -8,7 +8,6 @@ env:
   DATA_SEED: "3"
 
 jobs:
-  # Each x86 image is compiled once; benchmark jobs load these immutable images.
   build-images:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -17,22 +16,9 @@ jobs:
       matrix:
         include:
           - { label: baseline, ref: ed40599 }
-          - { label: baseline-pmu, ref: ed40599, fast_features: "--features pmu" }
-          - { label: lanes8, ref: 6fafb87 }
-          - { label: io-popread-a, ref: 2005c71 }
-          - { label: io-popread-b, ref: d937261 }
-          - { label: io-serialgaps, ref: 71cc59b }
-          - { label: core-prerelease, ref: 92b062f }
-          - { label: core-prefault, ref: 49449d5 }
-          - { label: io-prefault2, ref: abe261c }
-          - { label: stack1, ref: 96572eb }
-          - { label: stack1-lanes8, ref: ed40599, combined: "true" }
-          - { label: core-pgo, ref: d61d19c }
-          - { label: stack1-pgo, ref: 7760829 }
-          - { label: io-pfd, ref: 603a066 }
-          - { label: io-fuse, ref: 74d051a }
           - { label: core-runpath, ref: ec7479b }
-          - { label: core-purchase, ref: d38b295 }
+          - { label: io-fuse, ref: 5f08834 }
+          - { label: io-pfd, ref: 603a066 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -40,31 +26,10 @@ jobs:
         env:
           REF: ${{ matrix.ref }}
           LABEL: ${{ matrix.label }}
-          COMBINED: ${{ matrix.combined }}
-          FAST_FEATURES: ${{ matrix.fast_features }}
         run: |
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          if [ "$COMBINED" = "true" ]; then
-            # Bench-only synthetic merge; neither implementation branch is pushed.
-            git config user.name bench-ci
-            git config user.email bench-ci@local.invalid
-            git switch -C g7/bench-stack1-lanes8 ed40599
-            git merge --no-edit 6fafb87
-            git merge --no-edit 96572eb
-            SHA=$(git rev-parse HEAD)
-          else
-            SHA=$(git rev-parse "$REF^{commit}")
-          fi
-          echo "Building $SHA as g7-bench-$LABEL"
-          if [ -n "$FAST_FEATURES" ]; then
-            work=$(mktemp -d)
-            git archive --format=tar "$SHA" | tar -x -C "$work"
-            sed -i '/^WORKDIR \/src$/a ARG FAST_FEATURES=""' "$work/Dockerfile"
-            sed -i 's/cargo build --release --target x86_64-unknown-linux-musl/cargo build --release --target x86_64-unknown-linux-musl $FAST_FEATURES/' "$work/Dockerfile"
-            docker build --platform linux/amd64 --build-arg FAST_FEATURES="$FAST_FEATURES" --load --tag "g7-bench-$LABEL" "$work"
-          else
-            git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
-          fi
+          SHA=$(git rev-parse "$REF^{commit}")
+          git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
           docker save "g7-bench-$LABEL" | zstd -T0 -3 -o "$RUNNER_TEMP/g7-bench-$LABEL.tar.zst"
       - uses: actions/upload-artifact@v4
         with:
@@ -75,64 +40,34 @@ jobs:
   benchmark:
     needs: build-images
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { label: lanes8, candidate_ref: 6fafb87, image: lanes8, setting: '' }
-          - { label: pinstart-1, candidate_ref: ed40599, image: baseline, setting: XL_PINSTART=1 }
-          - { label: rel-0, candidate_ref: ed40599, image: baseline, setting: XL_REL=0 }
-          - { label: spin-50, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=50 }
-          - { label: spin-100, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=100 }
-          - { label: spin-1000, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=1000 }
-          # XL_ENDREL=1 is default conditional behavior; 2 actually forces release.
-          - { label: endrel-2, candidate_ref: ed40599, image: baseline, setting: XL_ENDREL=2 }
-          - { label: rd-0, candidate_ref: ed40599, image: baseline, setting: XL_RD=0 }
-          - { label: rd-512, candidate_ref: ed40599, image: baseline, setting: XL_RD=512 }
-          - { label: ch-2048, candidate_ref: ed40599, image: baseline, setting: XL_CH=2048 }
-          - { label: ch-4096, candidate_ref: ed40599, image: baseline, setting: XL_CH=4096 }
-          - { label: io-popread-a, candidate_ref: 2005c71, image: io-popread-a, setting: '' }
-          - { label: io-popread-b, candidate_ref: d937261, image: io-popread-b, setting: '' }
-          - { label: io-serialgaps, candidate_ref: 71cc59b, image: io-serialgaps, setting: '' }
-          - { label: core-prerelease, candidate_ref: 92b062f, image: core-prerelease, setting: '' }
-          - { label: core-prefault, candidate_ref: 49449d5, image: core-prefault, setting: '' }
-          - { label: io-prefault2, candidate_ref: abe261c, image: io-prefault2, setting: '' }
-          - { label: stack1, candidate_ref: 96572eb, image: stack1, setting: '' }
-          - { label: stack1-lanes8, candidate_ref: 96572eb, candidate_label: 'synthetic merge ed40599 + 6fafb87 + 96572eb', image: stack1-lanes8, setting: '' }
-          - { label: core-pgo, candidate_ref: d61d19c, image: core-pgo, setting: '' }
-          - { label: stack1-pgo, candidate_ref: 7760829, image: stack1-pgo, setting: '' }
-          - { label: io-pfd-default, candidate_ref: 603a066, image: io-pfd, setting: '', pairs: '8' }
-          - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0, pairs: '8' }
-          - { label: io-pfd-512, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=512, pairs: '8' }
-          - { label: io-pfd-1024, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=1024, pairs: '8' }
-          - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048, pairs: '8' }
-          - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096, pairs: '8' }
-          # 5f08834 only fixes test data; 74d051a is the identical engine timed below.
-          - { label: io-fuse, candidate_ref: 74d051a, test_ref: 5f08834, image: io-fuse, setting: '', run_tests: 'true', pairs: '8' }
-          - { label: core-runpath, candidate_ref: ec7479b, image: core-runpath, setting: '', run_tests: 'true', pairs: '8' }
-          - { label: core-purchase, candidate_ref: d38b295, image: core-purchase, setting: '', run_tests: 'true', pairs: '8' }
+          - { label: core-runpath, candidate_ref: ec7479b, image: core-runpath, run_tests: 'true' }
+          - { label: io-fuse, candidate_ref: 5f08834, image: io-fuse, run_tests: 'true' }
+          - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0 }
+          - { label: io-pfd-512, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=512 }
+          - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048 }
+          - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096 }
     env:
       BASELINE_REF: ${{ matrix.baseline_ref || 'ed40599' }}
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
-      CANDIDATE_LABEL: ${{ matrix.candidate_label }}
       CANDIDATE_ENV: ${{ matrix.setting }}
       BASELINE_IMAGE: g7-bench-${{ matrix.baseline_image || 'baseline' }}
       CANDIDATE_IMAGE: g7-bench-${{ matrix.image }}
-      PAIRS: ${{ matrix.pairs || '10' }}
+      PAIRS: "8"
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - name: Intel AVX-512 capability and thread count
         run: |
           lscpu
-          free -h
-          df -h /
           if ! grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || ! grep -qw avx512f /proc/cpuinfo; then
             echo 'Intel AVX512F=no; refusing non-representative run' >&2
             exit 1
           fi
-          echo 'Intel AVX512F=yes'
           echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
           printf 'THP: '; cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: Fetch pinned benchmark support
@@ -141,35 +76,16 @@ jobs:
           git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
           echo "tree=$(git rev-parse origin/ci-bench:generator)" >> "$GITHUB_OUTPUT"
           git checkout origin/ci-bench -- generator fixtures scripts
-      - name: Run candidate unit tests on this Intel AVX-512 runner
+      - name: Run candidate x86 unit tests
         if: matrix.run_tests == 'true'
         env:
-          TEST_REF: ${{ matrix.test_ref || matrix.candidate_ref }}
-          KNOWN_TEST_FAILURE: ${{ matrix.known_test_failure }}
+          TEST_REF: ${{ matrix.candidate_ref }}
         run: |
-          run_test() {
-            ref="$1"
-            testdir="$RUNNER_TEMP/candidate-test-$ref"
-            mkdir -p "$testdir"
-            git archive --format=tar "$ref" | tar -x -C "$testdir"
-            (cd "$testdir" && cargo test --locked)
-          }
-          if [ "$KNOWN_TEST_FAILURE" = "true" ]; then
-            mkdir -p "$HOME/g7-bench/logs"
-            set +e
-            run_test ed40599 >"$HOME/g7-bench/logs/baseline-cargo-test.txt" 2>&1
-            base_status=$?
-            run_test "$TEST_REF" >"$HOME/g7-bench/logs/candidate-cargo-test.txt" 2>&1
-            candidate_status=$?
-            set -e
-            test "$base_status" -ne 0
-            test "$candidate_status" -ne 0
-            grep -q 'ck_vec_matches_scalar' "$HOME/g7-bench/logs/baseline-cargo-test.txt"
-            grep -q 'ck_vec_matches_scalar' "$HOME/g7-bench/logs/candidate-cargo-test.txt"
-            echo "confirmed inherited ck_vec_matches_scalar test-data failure in baseline and candidate"
-          else
-            run_test "$TEST_REF"
-          fi
+          testdir="$RUNNER_TEMP/candidate-test"
+          mkdir -p "$testdir"
+          git archive --format=tar "$TEST_REF" | tar -x -C "$testdir"
+          cd "$testdir"
+          cargo test --locked
       - name: Restore 20M corpus cache
         id: corpus
         uses: actions/cache@v4
@@ -182,8 +98,6 @@ jobs:
         run: |
           cargo build --release --locked --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
-      - name: Prepare image directory
-        run: mkdir -p "$RUNNER_TEMP/images"
       - uses: actions/download-artifact@v4
         with:
           name: image-baseline
@@ -195,8 +109,7 @@ jobs:
       - name: Load baseline and candidate
         run: |
           for archive in "$RUNNER_TEMP"/images/*/*.tar.zst; do zstd -dc "$archive" | docker load; done
-          docker image ls --format '{{.Repository}}:{{.Tag}}'
-      - name: Gate and 10 alternating warm pairs (${{ matrix.label }})
+      - name: Gate and 8 alternating warm pairs (${{ matrix.label }})
         run: python3 bench/ci_bench.py "$HOME/big20" "$HOME/g7-bench" 2>&1 | tee "$HOME/g7-bench.log"
       - if: always()
         run: cat "$HOME/g7-bench/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
@@ -209,71 +122,4 @@ jobs:
             ~/g7-bench/summary.md
             ~/g7-bench/observations.json
             ~/g7-bench/logs/**
-          retention-days: 7
-
-  profile-baseline:
-    needs: build-images
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - name: Intel AVX-512 capability and thread count
-        run: |
-          lscpu
-          if ! grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || ! grep -qw avx512f /proc/cpuinfo; then
-            echo 'Intel AVX512F=no; refusing non-representative profile' >&2
-            exit 1
-          fi
-          echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
-          printf 'THP: '; cat /sys/kernel/mm/transparent_hugepage/enabled
-      - name: Fetch pinned benchmark support
-        id: generator
-        run: |
-          git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
-          echo "tree=$(git rev-parse origin/ci-bench:generator)" >> "$GITHUB_OUTPUT"
-          git checkout origin/ci-bench -- generator fixtures scripts
-      - name: Restore 20M corpus cache
-        id: corpus
-        uses: actions/cache@v4
-        with:
-          path: ~/big20
-          key: big20-${{ runner.os }}-seed${{ env.DATA_SEED }}-${{ steps.generator.outputs.tree }}
-      - run: python3 -m pip install --quiet polars
-      - name: Generate 20M corpus on a cache miss
-        if: steps.corpus.outputs.cache-hit != 'true'
-        run: |
-          cargo build --release --locked --manifest-path generator/Cargo.toml
-          generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
-      - uses: actions/download-artifact@v4
-        with:
-          name: image-baseline
-          path: ${{ runner.temp }}/perf-image
-      - name: Extract the static fast-path binary from the image
-        run: |
-          zstd -dc "$RUNNER_TEMP"/perf-image/*.tar.zst | docker load
-          docker create --name g7-perf-source g7-bench-baseline
-          docker cp g7-perf-source:/pipeline "$RUNNER_TEMP/pipeline"
-          docker rm g7-perf-source
-          chmod 0755 "$RUNNER_TEMP/pipeline"
-      - name: Perf stat and call-graph profile of a warm direct run
-        run: |
-          set -o pipefail
-          sudo apt-get update
-          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
-          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
-          mkdir -p "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch" "$RUNNER_TEMP/perf-results"
-          find "$HOME/big20" -type f -exec cat {} + >/dev/null
-          export NCPU DATA_DIR="$HOME/big20" OUTPUT_DIR="$RUNNER_TEMP/perf-output" SCRATCH_DIR="$RUNNER_TEMP/perf-scratch" XL_TIMING=1
-          perf stat -e cycles,instructions,branch-misses,cache-misses,LLC-load-misses,dTLB-load-misses -o "$RUNNER_TEMP/perf-results/perf-stat.txt" "$RUNNER_TEMP/pipeline" 2>"$RUNNER_TEMP/perf-results/pipeline-stat.stderr"
-          find "$HOME/big20" -type f -exec cat {} + >/dev/null
-          sudo rm -rf "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch"
-          mkdir -p "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch"
-          perf record -g --call-graph=fp -o "$RUNNER_TEMP/perf-results/perf.data" "$RUNNER_TEMP/pipeline" 2>"$RUNNER_TEMP/perf-results/pipeline-record.stderr"
-          perf report --no-children --percent-limit 1 --stdio -i "$RUNNER_TEMP/perf-results/perf.data" > "$RUNNER_TEMP/perf-results/perf-report.txt"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: perf-baseline-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/perf-results/**
           retention-days: 7
