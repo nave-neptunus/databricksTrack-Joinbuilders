@@ -1,4 +1,4 @@
-name: g7 x86 benchmark
+name: g7 final safety measurement
 
 on:
   push:
@@ -8,118 +8,134 @@ env:
   DATA_SEED: "3"
 
 jobs:
-  build-images:
+  build-baseline:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { label: baseline, ref: ed40599 }
-          - { label: core-runpath, ref: ec7479b }
-          - { label: io-fuse, ref: 5f08834 }
-          - { label: io-pfd, ref: 603a066 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Build ${{ matrix.ref }} once for linux/amd64
-        env:
-          REF: ${{ matrix.ref }}
-          LABEL: ${{ matrix.label }}
+      - name: Build ed40599 once for linux/amd64
         run: |
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          SHA=$(git rev-parse "$REF^{commit}")
-          git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
-          docker save "g7-bench-$LABEL" | zstd -T0 -3 -o "$RUNNER_TEMP/g7-bench-$LABEL.tar.zst"
+          SHA=$(git rev-parse 'ed40599^{commit}')
+          git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag g7-bench-baseline -
+          docker save g7-bench-baseline | zstd -T0 -3 -o "$RUNNER_TEMP/g7-bench-baseline.tar.zst"
       - uses: actions/upload-artifact@v4
         with:
-          name: image-${{ matrix.label }}
-          path: ${{ runner.temp }}/g7-bench-${{ matrix.label }}.tar.zst
+          name: image-baseline
+          path: ${{ runner.temp }}/g7-bench-baseline.tar.zst
           retention-days: 1
 
-  benchmark:
-    needs: build-images
+  final-safety:
+    needs: build-baseline
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { label: core-runpath, candidate_ref: ec7479b, image: core-runpath, run_tests: 'true' }
-          - { label: io-fuse, candidate_ref: 5f08834, image: io-fuse, run_tests: 'true' }
-          - { label: io-pfd-0, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=0 }
-          - { label: io-pfd-512, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=512 }
-          - { label: io-pfd-2048, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=2048 }
-          - { label: io-pfd-4096, baseline_ref: 603a066, baseline_image: io-pfd, candidate_ref: 603a066, image: io-pfd, setting: XL_PFD=4096 }
-    env:
-      BASELINE_REF: ${{ matrix.baseline_ref || 'ed40599' }}
-      CANDIDATE_REF: ${{ matrix.candidate_ref }}
-      CANDIDATE_ENV: ${{ matrix.setting }}
-      BASELINE_IMAGE: g7-bench-${{ matrix.baseline_image || 'baseline' }}
-      CANDIDATE_IMAGE: g7-bench-${{ matrix.image }}
-      PAIRS: "8"
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Intel AVX-512 capability and thread count
+      - name: Intel AVX-512 capacity gate
         run: |
           lscpu
+          free -h
+          df -h /
           if ! grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || ! grep -qw avx512f /proc/cpuinfo; then
-            echo 'Intel AVX512F=no; refusing non-representative run' >&2
+            echo 'Intel AVX512F=no; refusing non-representative safety run' >&2
             exit 1
           fi
           echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
           printf 'THP: '; cat /sys/kernel/mm/transparent_hugepage/enabled
-      - name: Fetch pinned benchmark support
+      - name: Fetch pinned generator and comparator
         id: generator
         run: |
           git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
           echo "tree=$(git rev-parse origin/ci-bench:generator)" >> "$GITHUB_OUTPUT"
-          git checkout origin/ci-bench -- generator fixtures scripts
-      - name: Run candidate x86 unit tests
-        if: matrix.run_tests == 'true'
-        env:
-          TEST_REF: ${{ matrix.candidate_ref }}
-        run: |
-          testdir="$RUNNER_TEMP/candidate-test"
-          mkdir -p "$testdir"
-          git archive --format=tar "$TEST_REF" | tar -x -C "$testdir"
-          cd "$testdir"
-          cargo test --locked
-      - name: Restore 20M corpus cache
+          git checkout origin/ci-bench -- generator scripts
+      - name: Restore practice corpus cache
         id: corpus
         uses: actions/cache@v4
         with:
           path: ~/big20
           key: big20-${{ runner.os }}-seed${{ env.DATA_SEED }}-${{ steps.generator.outputs.tree }}
       - run: python3 -m pip install --quiet polars
-      - name: Generate 20M corpus on a cache miss
+      - name: Generate practice corpus on a cache miss
         if: steps.corpus.outputs.cache-hit != 'true'
         run: |
           cargo build --release --locked --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
+      - name: Generate final-scale corpus (seed 17)
+        run: |
+          free_gb=$(df -BG "$HOME" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+          if [ "$free_gb" -ge 20 ]; then events=60000000; clicks=15000000; else events=40000000; clicks=10000000; fi
+          echo "FINAL_EVENTS=$events" >> "$GITHUB_ENV"
+          echo "FINAL_CLICKS=$clicks" >> "$GITHUB_ENV"
+          echo "FINAL_DISK_GB_BEFORE=$free_gb" >> "$GITHUB_ENV"
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed 17 --events "$events" --clicks "$clicks" --output "$HOME/big-final"
+          du -sh "$HOME/big-final"
+          df -h /
       - uses: actions/download-artifact@v4
         with:
           name: image-baseline
-          path: ${{ runner.temp }}/images/baseline
-      - uses: actions/download-artifact@v4
-        with:
-          name: image-${{ matrix.image }}
-          path: ${{ runner.temp }}/images/candidate
-      - name: Load baseline and candidate
+          path: ${{ runner.temp }}/image
+      - name: Load cached baseline image
+        run: zstd -dc "$RUNNER_TEMP"/image/*.tar.zst | docker load
+      - name: Final-scale correctness, fallback check, and fixed-overhead timings
         run: |
-          for archive in "$RUNNER_TEMP"/images/*/*.tar.zst; do zstd -dc "$archive" | docker load; done
-      - name: Gate and 8 alternating warm pairs (${{ matrix.label }})
-        run: python3 bench/ci_bench.py "$HOME/big20" "$HOME/g7-bench" 2>&1 | tee "$HOME/g7-bench.log"
+          set -euo pipefail
+          work="$HOME/g7-final-safety"
+          mkdir -p "$work"/large-ref "$work"/large-ref-scratch "$work"/large-fast "$work"/large-fast-scratch "$work"/empty-out "$work"/empty-scratch "$work"/real20-out "$work"/real20-scratch
+          chmod -R 777 "$work"
+          docker_run() {
+            entry="$1"; data="$2"; out="$3"; scratch="$4"; err="$5"
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --memory 12g --memory-swap 12g --user 1000:1000 \
+              -v "$data:/data:ro" -v "$out:/output" -v "$scratch:/scratch" \
+              -e "NCPU=$NCPU" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e XL_TIMING=1 \
+              --entrypoint "$entry" g7-bench-baseline 2>"$err"
+          }
+          seconds() { awk -v a="$1" -v b="$2" 'BEGIN {printf "%.6f", (b-a)/1000000000}'; }
+          # /fallback is the independent reference on exactly the same corpus.
+          begin=$(date +%s%N); docker_run /fallback "$HOME/big-final" "$work/large-ref" "$work/large-ref-scratch" "$work/fallback.stderr"; end=$(date +%s%N)
+          fallback_s=$(seconds "$begin" "$end")
+          find "$HOME/big-final" -type f -exec cat {} + >/dev/null
+          begin=$(date +%s%N); docker_run /pipeline "$HOME/big-final" "$work/large-fast" "$work/large-fast-scratch" "$work/final.stderr"; end=$(date +%s%N)
+          final_s=$(seconds "$begin" "$end")
+          python3 scripts/compare.py "$work/large-fast" "$work/large-ref" | tee "$work/compare.txt"
+          grep -q 'MATCH$' "$work/compare.txt"
+          if grep -qi fallback "$work/final.stderr"; then echo 'FAIL: fast path emitted fallback' >&2; exit 1; fi
+          final_engine=$(sed -n 's/.*exit at \([0-9.]*\) ms.*/\1/p' "$work/final.stderr" | tail -1)
+          final_rss=$(sed -n 's/.*peak_rss_kb=\([0-9]*\).*/\1/p' "$work/final.stderr" | tail -1)
+          test -n "$final_engine"; test -n "$final_rss"
+          # Scratch image has no /bin/true. The fast binary on an empty input is
+          # the requested trivial-entrypoint proxy and must exit cleanly.
+          empty="$work/empty-input"; mkdir -p "$empty"
+          begin=$(date +%s%N); docker_run /pipeline "$empty" "$work/empty-out" "$work/empty-scratch" "$work/empty.stderr"; end=$(date +%s%N)
+          empty_s=$(seconds "$begin" "$end")
+          find "$HOME/big20" -type f -exec cat {} + >/dev/null
+          begin=$(date +%s%N); docker_run /pipeline "$HOME/big20" "$work/real20-out" "$work/real20-scratch" "$work/real20.stderr"; end=$(date +%s%N)
+          real20_s=$(seconds "$begin" "$end")
+          real20_engine=$(sed -n 's/.*exit at \([0-9.]*\) ms.*/\1/p' "$work/real20.stderr" | tail -1)
+          cat > "$work/summary.md" <<EOF
+          # Final safety measurement
+          final_events=$FINAL_EVENTS final_clicks=$FINAL_CLICKS seed=17 disk_gb_before=$FINAL_DISK_GB_BEFORE
+          final_reference_container_seconds=$fallback_s
+          final_fast_container_seconds=$final_s
+          final_fast_engine_ms=$final_engine
+          final_peak_rss_kb=$final_rss
+          final_exact_output=MATCH
+          final_fallback_line=ABSENT
+          empty_input_container_seconds=$empty_s
+          warm_20m_container_seconds=$real20_s
+          warm_20m_engine_ms=$real20_engine
+          EOF
+          cat "$work/summary.md"
       - if: always()
-        run: cat "$HOME/g7-bench/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat "$HOME/g7-final-safety/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: result-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: final-safety-${{ github.run_id }}-${{ github.run_attempt }}
           path: |-
-            ~/g7-bench.log
-            ~/g7-bench/summary.md
-            ~/g7-bench/observations.json
-            ~/g7-bench/logs/**
+            ~/g7-final-safety/summary.md
+            ~/g7-final-safety/*.stderr
+            ~/g7-final-safety/compare.txt
           retention-days: 7
