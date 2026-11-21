@@ -87,9 +87,8 @@ fn chunks<'a>(bufs: &[&'a [u8]], target: usize) -> Vec<&'a [u8]> {
 
 // ------------------------------------------------------------------ cold input reader
 /// Input bytes. When the page cache does not already hold the events (sampled with mincore),
-/// reader threads issue O_DIRECT reads in the order the engine consumes them: links and clicks
-/// (kept for the whole run) into one region, then the events in 4 MiB blocks into a ring of
-/// reused, already-faulted slots. Each event block is read with a 64 KiB overlap so the line
+/// reader threads issue O_DIRECT reads for links and clicks into one persistent region, and
+/// for events in 4 MiB blocks into a ring of reused, already-faulted slots. Each event block is read with a 64 KiB overlap so the line
 /// that crosses its end is whole; a longer line declines to the exact fallback. Parsers wait on
 /// per-block ready flags and hand the slot back when done. Nothing but O_DIRECT DMA touches the
 /// event bytes before the parser, and no fresh memory is faulted per block. Warm data,
@@ -113,6 +112,7 @@ mod dio {
     struct Shared {
         files: Vec<(std::fs::File, std::fs::File, usize)>, // (direct, plain, length)
         jobs: Vec<Job>,
+        read_order: Vec<usize>,
         ev0: usize, // first event job
         ring: usize,
         ready: Vec<AtomicU8>,
@@ -167,10 +167,10 @@ mod dio {
             if s.cancel.load(Relaxed) {
                 return;
             }
-            let i = s.next.fetch_add(1, Relaxed);
-            if i >= s.jobs.len() {
+            let next = s.next.fetch_add(1, Relaxed);
+            let Some(&i) = s.read_order.get(next) else {
                 return;
-            }
+            };
             let j = &s.jobs[i];
             let dest = if j.dest != 0 {
                 j.dest
@@ -291,7 +291,7 @@ mod dio {
         if all == 0 { 1.0 } else { yes as f64 / all as f64 }
     }
 
-    /// Files are indexed links, events, clicks. Reads go links, clicks, events.
+    /// Files are indexed links, events, clicks.
     pub fn open(
         paths: &[String],
         lens: &[usize],
@@ -354,6 +354,7 @@ mod dio {
             let mut slices = vec![(0usize, 0usize); paths.len()];
             let mut jobs = vec![];
             let mut at = base;
+            let mut link_jobs = 0;
             let link_files = 0..ev_files.start;
             let click_files = ev_files.end..paths.len();
             for f in link_files.chain(click_files) {
@@ -364,6 +365,9 @@ mod dio {
                     o += BLK;
                 }
                 at += (lens[f] + 4095) & !4095;
+                if f < ev_files.start {
+                    link_jobs = jobs.len();
+                }
             }
             let ev0 = jobs.len();
             for f in ev_files.clone() {
@@ -373,10 +377,17 @@ mod dio {
                     o += BLK;
                 }
             }
+            // Let link estimation read the first event sample while clicks are still in flight.
+            let early = (jobs.len() - ev0).min(nthreads).min(RING);
+            let read_order = (0..link_jobs)
+                .chain(ev0..ev0 + early)
+                .chain(link_jobs..ev0)
+                .chain(ev0 + early..jobs.len())
+                .collect();
             let shared = Arc::new(Shared {
                 files,
                 ready: (0..jobs.len()).map(|_| AtomicU8::new(0)).collect(),
-                jobs, ev0,
+                jobs, read_order, ev0,
                 ring: ring.as_mut_ptr() as usize,
                 freed: (0..RING).map(|_| AtomicUsize::new(0)).collect(),
                 next: AtomicUsize::new(0), cancel: AtomicBool::new(false), failed: AtomicBool::new(false),
