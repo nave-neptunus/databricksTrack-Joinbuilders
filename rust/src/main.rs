@@ -1913,34 +1913,53 @@ fn radix_sort<T: Copy>(ev: &mut Vec<T>, rs: &mut RadixScratch<T>, key: impl Fn(&
         ev.sort_unstable_by_key(|e| (key(e), tsf(e)));
         return;
     }
+    const DB: u32 = 11;
+    const BUCKETS: usize = 1 << DB;
+    const MASK: usize = BUCKETS - 1;
+    let sort_bits = tb + rb;
+    let passes = sort_bits.div_ceil(DB) as usize;
+    if passes == 0 {
+        return;
+    }
+
+    // Every pass uses the same digits regardless of previous permutations.
+    // Count them as we build the packed keys so the scatter passes only read
+    // their inputs once.
+    let mut counts = [[0u32; BUCKETS]; 6];
+    let [first, second, third, fourth, ..] = &mut counts;
     rs.a.clear();
     rs.a.extend(ev.iter().zip(&rs.lid).enumerate().map(|(i, (e, &l))| {
-        ((((rs.rank[l as usize] as u64) << tb) | tsf(e) as u64) << ib) | i as u64
+        let order_key = ((rs.rank[l as usize] as u64) << tb) | u64::from(tsf(e));
+        first[order_key as usize & MASK] += 1;
+        second[(order_key >> DB) as usize & MASK] += 1;
+        third[(order_key >> (2 * DB)) as usize & MASK] += 1;
+        fourth[(order_key >> (3 * DB)) as usize & MASK] += 1;
+        (order_key << ib) | i as u64
     }));
-    rs.b.clear();
-    rs.b.resize(n, 0);
-    const DB: u32 = 11;
-    let mut cnt = [0u32; 1 << DB];
-    let mut shift = ib;
-    let top = ib + tb + rb;
-    while shift < top {
-        cnt.iter_mut().for_each(|c| *c = 0);
-        for &x in rs.a.iter() {
-            cnt[((x >> shift) as usize) & ((1 << DB) - 1)] += 1;
+    for (pass, count) in counts.iter_mut().enumerate().take(passes).skip(4) {
+        let shift = ib + pass as u32 * DB;
+        for &x in &rs.a {
+            count[(x >> shift) as usize & MASK] += 1;
         }
+    }
+    rs.b.resize(n, 0);
+    for (pass, count) in counts.iter_mut().enumerate().take(passes) {
+        let digit_offset = pass as u32 * DB;
+        let shift = ib + digit_offset;
+        let digit = |x: u64| (x >> shift) as usize & MASK;
+        let count = &mut count[..1 << DB.min(sort_bits - digit_offset)];
         let mut sum = 0;
-        for c in cnt.iter_mut() {
+        for c in count.iter_mut() {
             let t = *c;
             *c = sum;
             sum += t;
         }
-        for &x in rs.a.iter() {
-            let d = ((x >> shift) as usize) & ((1 << DB) - 1);
-            rs.b[cnt[d] as usize] = x;
-            cnt[d] += 1;
+        for &x in &rs.a {
+            let cursor = &mut count[digit(x)];
+            rs.b[*cursor as usize] = x;
+            *cursor += 1;
         }
         std::mem::swap(&mut rs.a, &mut rs.b);
-        shift += DB;
     }
     let im = (1u64 << ib) - 1;
     rs.out.clear();
