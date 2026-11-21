@@ -260,8 +260,18 @@ fn event_fields(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; 7
 
 // One load per input vector supplies the comma, quote and newline masks.
 #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
-#[inline]
-fn event_structure(block: &[u8; 64]) -> (u64, u64, u64) {
+#[inline(always)]
+fn event_structure<const WIDE: bool>(block: &[u8; 64]) -> (u64, u64, u64) {
+    // AVX-512BW: the same three byte-equality masks, one compare per byte class.
+    #[cfg(target_arch = "x86_64")]
+    if WIDE {
+        return unsafe {
+            use std::arch::x86_64::*;
+            let v = _mm512_loadu_si512(block.as_ptr().cast());
+            let mask = |byte: u8| _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(byte as i8));
+            (mask(b','), mask(b'"'), mask(b'\n'))
+        };
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::*;
@@ -296,8 +306,36 @@ fn event_structure(block: &[u8; 64]) -> (u64, u64, u64) {
     }
 }
 
+/// True when the AVX-512BW row scan may run: detected at runtime, and not disabled by
+/// BLUE2_NO_AVX512 (for A/B runs). The AVX2 path is the fallback everywhere else.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn wide_scan() -> bool {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WIDE.get_or_init(|| {
+        std::env::var_os("BLUE2_NO_AVX512").is_none()
+            && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn event_rows_wide<'a>(bytes: &'a [u8], row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+    event_rows_impl::<true>(bytes, row)
+}
+
 #[inline]
-fn event_rows<'a>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+fn event_rows<'a>(bytes: &'a [u8], row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if wide_scan() {
+        // SAFETY: wide_scan() checked avx512f and avx512bw on this CPU.
+        return unsafe { event_rows_wide(bytes, row) };
+    }
+    event_rows_impl::<false>(bytes, row)
+}
+
+#[inline(always)]
+fn event_rows_impl<'a, const WIDE: bool>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
     #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
     {
         let mut start = 0;
@@ -305,7 +343,7 @@ fn event_rows<'a>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7]))
         let (blocks, tail) = bytes.as_chunks::<64>();
         for (i, block) in blocks.iter().enumerate() {
             let base = i * 64;
-            let (commas, quotes, mut newlines) = event_structure(block);
+            let (commas, quotes, mut newlines) = event_structure::<WIDE>(block);
             let mut pos = 0;
             while newlines != 0 {
                 let end = newlines.trailing_zeros() as usize;
@@ -2289,4 +2327,27 @@ fn top_cat(catsum: &mut [i64], touched: &mut Vec<u32>, names: &[&[u8]]) -> u32 {
     }
     touched.clear();
     top
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
+#[test]
+fn wide_structure_masks_match_avx2() {
+    if !(std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")) {
+        return;
+    }
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..100_000 {
+        let mut block = [0u8; 64];
+        for b in &mut block {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = [b',', b'"', b'\n', b'a', b'0', 0x80, 0xff, b' '][(x & 7) as usize];
+        }
+        #[target_feature(enable = "avx512f,avx512bw")]
+        unsafe fn wide(b: &[u8; 64]) -> (u64, u64, u64) {
+            event_structure::<true>(b)
+        }
+        assert_eq!(unsafe { wide(&block) }, event_structure::<false>(&block));
+    }
 }
