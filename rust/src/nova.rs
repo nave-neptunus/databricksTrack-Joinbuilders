@@ -690,6 +690,9 @@ struct Parser<'a, 'catalog, 'table> {
     streams: Streams<Claim, SHARDS>,
     people: PeopleWriter<'a>,
     worker: u32,
+    claims: usize,
+    payloads: usize,
+    invalid: usize,
 }
 
 impl Parser<'_, '_, '_> {
@@ -722,6 +725,8 @@ impl Parser<'_, '_, '_> {
                 (pending.key >> 55) as u8 as usize,
                 Claim { key: pending.key, ingest: pending.ingest, loc },
             );
+            self.claims += 1;
+            if loc == NO_LOC { self.invalid += 1; } else { self.payloads += 1; }
         }
         self.count = 0;
     }
@@ -802,7 +807,7 @@ fn events(
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
-) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
+) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>, ClaimProfile) {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
@@ -830,6 +835,9 @@ fn events(
                 streams: Streams::new(),
                 people: PeopleWriter::new(&mut people),
                 worker,
+                claims: 0,
+                payloads: 0,
+                invalid: 0,
             };
             loop {
                 let index = next.fetch_add(1, Relaxed);
@@ -841,23 +849,37 @@ fn events(
             }
             parser.flush();
             parser.people.finish();
-            parser.streams
+            (parser.streams, ClaimProfile { claims: parser.claims, payloads: parser.payloads, invalid: parser.invalid, ..ClaimProfile::default() })
         };
-        (worker, streams, people)
+        (worker, streams.0, people, streams.1)
     });
     // `broadcast` returns results in completion order, but locations encode
     // the assigned worker id, so restore that order before indexing.
-    parsed.sort_unstable_by_key(|(worker, _, _)| *worker);
+    parsed.sort_unstable_by_key(|(worker, _, _, _)| *worker);
     let mut streams = Vec::with_capacity(parsed.len());
     let mut people = Vec::with_capacity(parsed.len());
-    for (_, s, p) in parsed {
+    let mut profile = ClaimProfile::default();
+    for (_, s, p, stats) in parsed {
         streams.push(s);
         people.push(p);
+        profile.claims += stats.claims;
+        profile.payloads += stats.payloads;
+        profile.invalid += stats.invalid;
     }
-    (streams, people)
+    (streams, people, profile)
 }
 
 type ClaimStream = Streams<Claim, SHARDS>;
+
+#[derive(Clone, Copy, Default)]
+struct ClaimProfile {
+    claims: usize,
+    payloads: usize,
+    invalid: usize,
+    probes: usize,
+    duplicates: usize,
+    table_bytes: usize,
+}
 
 // One 16-byte cell holds the full event key, the winning ingest time and the
 // location of the payload parse already wrote into its final person partition.
@@ -879,6 +901,11 @@ struct Router {
     generation: u32,
     route_ns: u64,
     table_percent: usize,
+    probes: usize,
+    duplicates: usize,
+    filter_seen: Vec<u8>,
+    filter_repeat: Vec<u8>,
+    prefilter: bool,
 }
 
 impl Router {
@@ -888,7 +915,49 @@ impl Router {
             generation: 0,
             route_ns: 0,
             table_percent: std::env::var("BREAKER_TABLE_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(110),
+            probes: 0,
+            duplicates: 0,
+            filter_seen: Vec::new(),
+            filter_repeat: Vec::new(),
+            prefilter: std::env::var_os("NOVA_DUP_PREFILTER").is_some(),
         }
+    }
+
+    #[inline]
+    fn filter_slot(key: u64, mask: usize) -> usize {
+        // A separate mix prevents the candidate filter from repeating the
+        // primary table's low-bit clustering.
+        (key ^ key.rotate_left(23) ^ (key >> 31)) as usize & mask
+    }
+
+    fn mark_repeat_buckets(&mut self, claims: &[ClaimStream], shard: usize, count: usize) {
+        let buckets = count.next_power_of_two();
+        let bytes = buckets.div_ceil(8);
+        self.filter_seen.resize(bytes, 0);
+        self.filter_repeat.resize(bytes, 0);
+        self.filter_seen[..bytes].fill(0);
+        self.filter_repeat[..bytes].fill(0);
+        let mask = buckets - 1;
+        for fold in claims {
+            for block in fold.chunks(shard) {
+                for claim in block {
+                    let slot = Self::filter_slot(claim.key, mask);
+                    let byte = slot >> 3;
+                    let bit = 1u8 << (slot & 7);
+                    if self.filter_seen[byte] & bit != 0 {
+                        self.filter_repeat[byte] |= bit;
+                    } else {
+                        self.filter_seen[byte] |= bit;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn candidate(&self, key: u64, count: usize) -> bool {
+        let slot = Self::filter_slot(key, count.next_power_of_two() - 1);
+        self.filter_repeat[slot >> 3] & (1u8 << (slot & 7)) != 0
     }
 
     #[inline]
@@ -909,6 +978,9 @@ impl Router {
         if count == 0 {
             return;
         }
+        if self.prefilter {
+            self.mark_repeat_buckets(claims, shard, count);
+        }
         let mask = (count * self.table_percent / 100).next_power_of_two() - 1;
         if self.slots.len() < mask + 1 {
             self.slots.resize(mask + 1, Slot::default());
@@ -926,18 +998,23 @@ impl Router {
         for fold in claims {
             for block in fold.chunks(shard) {
                 for (offset, claim) in block.iter().enumerate() {
+                    if self.prefilter && !self.candidate(claim.key, count) {
+                        continue;
+                    }
                     if let Some(next) = block.get(offset + 8) {
                         crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
                     }
                     let meta = generation | ((claim.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
                     let mut slot = claim.key as usize & mask;
                     loop {
+                        self.probes += 1;
                         let winner = self.slots[slot];
                         if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
                             self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
                             break;
                         }
                         if winner.key == claim.key {
+                            self.duplicates += 1;
                             let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
                             if claim.ingest < previous {
                                 Self::tombstone(people, winner.loc);
@@ -965,7 +1042,7 @@ pub(super) fn run_events(
     declined: &AtomicBool,
     estimated_rows: usize,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let (claims, people) = events(work, read_ahead, users, input, declined, estimated_rows);
+    let (claims, people, mut profile) = events(work, read_ahead, users, input, declined, estimated_rows);
     if declined.load(Relaxed) {
         return None;
     }
@@ -988,10 +1065,21 @@ pub(super) fn run_events(
     )
     .into_iter()
     .for_each(|router| {
+        profile.probes += router.probes;
+        profile.duplicates += router.duplicates;
+        profile.table_bytes += router.slots.len() * size_of::<Slot>();
         if std::env::var_os("TIMING").is_some() {
             eprintln!("ROUTER tombstone={:.1}", router.route_ns as f64 / 1e6);
         }
     });
+    if std::env::var_os("NOVA_PROFILE").is_some() {
+        eprintln!(
+            "NOVA_PROFILE claims={} claim_bytes={} payloads={} payload_bytes={} invalid={} exact_dups={} dup_pct={:.4} probes={} probe_per_claim={:.3} table_bytes={}",
+            profile.claims, profile.claims * size_of::<Claim>(), profile.payloads, profile.payloads * size_of::<EvP>(),
+            profile.invalid, profile.duplicates, profile.duplicates as f64 * 100.0 / profile.claims.max(1) as f64,
+            profile.probes, profile.probes as f64 / profile.claims.max(1) as f64, profile.table_bytes,
+        );
+    }
     if declined.load(Relaxed) {
         return None;
     }
