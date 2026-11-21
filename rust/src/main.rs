@@ -169,15 +169,21 @@ struct ReadAhead {
 const RA_PIECE: usize = 16 << 20;
 
 impl ReadAhead {
-    fn start(maps: Vec<&'static memmap2::Mmap>, paths: Vec<&'static str>) -> &'static ReadAhead {
+    fn start(
+        maps: Vec<&'static memmap2::Mmap>,
+        paths: Vec<&'static str>,
+        click_maps: usize,
+    ) -> &'static ReadAhead {
         let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
         let mut table = vec![];
         let mut ranges = vec![];
-        for (m, path) in maps.iter().zip(&paths) {
+        let first_click = maps.len() - click_maps;
+        for (index, (m, path)) in maps.iter().zip(&paths).enumerate() {
+            let click = index >= first_click;
             table.push((m.as_ptr() as usize, m.len(), ranges.len()));
             let mut off = 0;
             while off < m.len() {
-                ranges.push((*m, *path, off, RA_PIECE.min(m.len() - off)));
+                ranges.push((*m, *path, off, RA_PIECE.min(m.len() - off), click));
                 off += RA_PIECE;
             }
         }
@@ -188,7 +194,7 @@ impl ReadAhead {
             ready: (0..ranges.len()).map(|_| std::sync::atomic::AtomicBool::new(!on)).collect(),
         }));
         if on {
-            let ranges: &'static [(&'static memmap2::Mmap, &'static str, usize, usize)] = Box::leak(ranges.into_boxed_slice());
+            let ranges: &'static [(&'static memmap2::Mmap, &'static str, usize, usize, bool)] = Box::leak(ranges.into_boxed_slice());
             let populate = std::env::var_os("BLUE2_WARM_POPULATE").is_some();
             let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
             for _ in 0..threads {
@@ -199,9 +205,11 @@ impl ReadAhead {
                     let mut open: Option<(&str, std::fs::File)> = None;
                     loop {
                         let i = next.fetch_add(1, Relaxed);
-                        let Some(&(m, path, off, len)) = ranges.get(i) else { break };
+                        let Some(&(m, path, off, len, click)) = ranges.get(i) else { break };
                         let mut done = false;
-                        if !populate && cfg!(target_os = "linux") {
+                        // Clicks follow the event scan, so fault their PTEs here while
+                        // the hot parser is still working on earlier mappings.
+                        if !populate && !click && cfg!(target_os = "linux") {
                             if let Some(sink) = null.as_mut() {
                                 if open.as_ref().map(|o| o.0) != Some(path) {
                                     open = std::fs::File::open(path).ok().map(|f| (path, f));
@@ -1880,7 +1888,7 @@ fn fast(seed: u64, nova: bool) -> bool {
         let maps: Vec<(&'static memmap2::Mmap, &'static str)> = lkm.iter().chain(evm.iter()).chain(ckm.iter()).zip(files)
             .filter_map(|(m, f)| m.as_ref().map(|m| (m, f))).collect();
         let (maps, paths) = maps.into_iter().unzip();
-        ReadAhead::start(maps, paths)
+        ReadAhead::start(maps, paths, ckm.iter().flatten().count())
     };
     let smm = map_all(&[format!("{data}/products.csv"), format!("{data}/campaigns.csv")]);
     let evb = as_slices(evm);
