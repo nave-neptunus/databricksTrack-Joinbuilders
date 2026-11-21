@@ -629,7 +629,9 @@ impl Dates {
             | (u64::from(s[9]) << 56);
         let index = (s[8] as usize * 10 + s[9] as usize) & 31;
         let entry = &mut self.0[index];
-        if entry.date == date {
+        // A malformed all-NUL date has packed key zero, which is also the
+        // default empty-slot marker.  Only parsed dates may populate a slot.
+        if date != 0 && entry.date == date {
             return Some(entry.seconds + time - adjustment);
         }
         let seconds = crate::parse_ts(s)? / 1000;
@@ -1156,6 +1158,30 @@ mod tests {
             b"179107189000000000000000",
         ] {
             assert_eq!(cache.parse(value), crate::parse_ts(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn timestamp_cache_rejects_zero_packed_key_dates() {
+        let invalid = [
+            &b"\0\0\0\0-\0\0-\0\0T00:00:00Z"[..],
+            b"\0\0\0\0-\0\0-\0\0T00:00:00+02:00",
+            b"\0\0\0\0-\0\0-\0\0T00:00:00-07:30",
+        ];
+        for populated in [false, true] {
+            let mut cache = Dates::default();
+            if populated {
+                let value = b"2028-02-29T23:59:59Z";
+                assert_eq!(cache.parse(value), crate::parse_ts(value));
+            }
+            for value in invalid {
+                assert_eq!(crate::parse_ts(value), None, "{value:?}");
+                assert_eq!(
+                    cache.parse(value),
+                    crate::parse_ts(value),
+                    "{populated}, {value:?}"
+                );
+            }
         }
     }
 
