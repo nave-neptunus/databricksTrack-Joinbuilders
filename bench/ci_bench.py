@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact x86 CI gate plus paired cold timing for two Dockerfile refs.
+"""Exact x86 CI gate plus paired warm timing for two Dockerfile refs.
 
 XL_TIMING is deliberately enabled for every timed run: its "exit at" lap is
 the wall clock inside the pipeline process, while container_seconds includes
@@ -8,7 +8,6 @@ Docker/container setup and teardown.
 import json
 import os
 import re
-import shutil
 import statistics
 import subprocess
 import sys
@@ -22,6 +21,8 @@ CAND = os.environ.get("CANDIDATE_REF", "6fafb87")
 PAIRS = int(os.environ.get("PAIRS", "10"))
 NCPU = int(os.environ["NCPU"])
 CANDIDATE_ENV = os.environ.get("CANDIDATE_ENV", "")
+BASE_IMAGE = os.environ.get("BASELINE_IMAGE", "")
+CAND_IMAGE = os.environ.get("CANDIDATE_IMAGE", "")
 WORK.mkdir(parents=True, exist_ok=True)
 
 
@@ -61,6 +62,18 @@ def drop_caches():
     subprocess.run("echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null", shell=True, check=True)
 
 
+def warm_data():
+    """Fault the corpus into the host page cache outside the measured interval."""
+    total = 0
+    for path in sorted(DATA.rglob("*")):
+        if not path.is_file():
+            continue
+        with path.open("rb", buffering=1024 * 1024) as source:
+            while chunk := source.read(8 * 1024 * 1024):
+                total += len(chunk)
+    print(f"WARM_DATA bytes={total}", flush=True)
+
+
 def candidate_env():
     if not CANDIDATE_ENV:
         return {}
@@ -84,7 +97,12 @@ def timing(stderr):
     rss_match = re.search(r"peak_rss_kb=(\d+)", stderr)
     if not exit_match:
         raise SystemExit("XL_TIMING did not print an internal exit-at lap")
-    return float(exit_match.group(1)), int(rss_match.group(1)) if rss_match else None
+    stage_match = re.search(r"\[v2b\] ms: (.+)", stderr)
+    stages = {}
+    if stage_match:
+        for key, value in re.findall(r"([^\s=]+)=([0-9.]+)", stage_match.group(1)):
+            stages[key] = float(value)
+    return float(exit_match.group(1)), int(rss_match.group(1)) if rss_match else None, stages
 
 
 def run(tag, name, *, cold=False, extra_env=None, preserve=False, capture_minflt=False):
@@ -129,9 +147,9 @@ def run(tag, name, *, cold=False, extra_env=None, preserve=False, capture_minflt
     (logs / f"{name}.stderr").write_text(stderr)
     if process.returncode:
         raise SystemExit(f"{name} failed ({process.returncode}):\n{stderr[-4000:]}")
-    engine_ms, peak_rss_kb = timing(stderr)
+    engine_ms, peak_rss_kb, stages = timing(stderr)
     metrics = {"container_seconds": container_seconds, "engine_ms": engine_ms,
-               "peak_rss_kb": peak_rss_kb, "minflt": max_minflt}
+               "peak_rss_kb": peak_rss_kb, "minflt": max_minflt, "stages": stages}
     if not preserve:
         remove(out)
         remove(scratch)
@@ -168,20 +186,30 @@ def fixture_gate(tag, label, env):
 
 base_sha, cand_sha = ref(BASE), ref(CAND)
 print(f"BASELINE={base_sha} CANDIDATE={cand_sha} NCPU={NCPU} CANDIDATE_ENV={CANDIDATE_ENV or '<none>'}", flush=True)
-build(base_sha, "g7-bench-baseline")
-if cand_sha == base_sha:
+if BASE_IMAGE:
+    call(["docker", "tag", BASE_IMAGE, "g7-bench-baseline"])
+else:
+    build(base_sha, "g7-bench-baseline")
+if CAND_IMAGE:
+    call(["docker", "tag", CAND_IMAGE, "g7-bench-candidate"])
+elif cand_sha == base_sha:
     call(["docker", "tag", "g7-bench-baseline", "g7-bench-candidate"])
 else:
     build(cand_sha, "g7-bench-candidate")
 env = candidate_env()
 fixture_gate("g7-bench-baseline", "baseline", {})
 fixture_gate("g7-bench-candidate", "candidate", env)
+warm_data()
 base_out, _ = run("g7-bench-baseline", "big20-reference", preserve=True)
+warm_data()
 cand_out, _ = run("g7-bench-candidate", "big20-candidate-gate", extra_env=env, preserve=True)
 compare(cand_out, base_out, "big20 candidate vs baseline")
 remove(base_out)
 remove(cand_out)
-_, baseline_profile = run("g7-bench-baseline", "baseline-profile", cold=True, capture_minflt=True)
+remove(WORK / "scratch" / "big20-reference")
+remove(WORK / "scratch" / "big20-candidate-gate")
+warm_data()
+_, baseline_profile = run("g7-bench-baseline", "baseline-profile", capture_minflt=True)
 print("BASELINE_METRICS " + json.dumps(baseline_profile, sort_keys=True), flush=True)
 
 observations = []
@@ -190,11 +218,12 @@ for pair in range(1, PAIRS + 1):
     if pair % 2 == 0:
         order.reverse()
     row = {"pair": pair, "order": "-".join(x[0] for x in order)}
+    warm_data()
     for label, image, overrides in order:
-        _, metrics = run(image, f"cold-{pair}-{label}", cold=True, extra_env=overrides)
+        _, metrics = run(image, f"warm-{pair}-{label}", extra_env=overrides)
         row[label] = metrics
     observations.append(row)
-    print(f"PAIR {pair} {row['order']} "
+    print(f"WARM_PAIR {pair} {row['order']} "
           f"baseline={row['baseline']['engine_ms']:.1f}ms/{row['baseline']['container_seconds']:.3f}s "
           f"candidate={row['candidate']['engine_ms']:.1f}ms/{row['candidate']['container_seconds']:.3f}s", flush=True)
 
@@ -203,14 +232,26 @@ def med(label, metric):
 
 engine_savings = [row["baseline"]["engine_ms"] - row["candidate"]["engine_ms"] for row in observations]
 container_savings = [(row["baseline"]["container_seconds"] - row["candidate"]["container_seconds"]) * 1000 for row in observations]
+# One deliberately cold pair is a storage sanity check, never part of the warm medians.
+_, cold_baseline = run("g7-bench-baseline", "cold-sanity-baseline", cold=True)
+_, cold_candidate = run("g7-bench-candidate", "cold-sanity-candidate", cold=True, extra_env=env)
+stage_keys = sorted({key for row in observations for label in ("baseline", "candidate") for key in row[label]["stages"]})
+stage_lines = []
+for key in stage_keys:
+    base_stage = statistics.median(row["baseline"]["stages"].get(key, 0.0) for row in observations)
+    cand_stage = statistics.median(row["candidate"]["stages"].get(key, 0.0) for row in observations)
+    stage_lines.append((key, base_stage, cand_stage, base_stage - cand_stage))
+largest_stage = max(stage_lines, key=lambda item: abs(item[3]), default=("n/a", 0.0, 0.0, 0.0))
 summary = [
-    "# g7 x86 cold benchmark", f"baseline={base_sha}", f"candidate={cand_sha}",
+    "# g7 x86 warm benchmark", f"baseline={base_sha}", f"candidate={cand_sha}",
     f"candidate_env={CANDIDATE_ENV or '<none>'}", f"pairs={PAIRS}, NCPU={NCPU}",
     "", "| pair | order | baseline engine ms | candidate engine ms | engine saving ms | baseline container s | candidate container s |",
     "|---:|---|---:|---:|---:|---:|---:|",
 ]
 summary += [f"| {r['pair']} | {r['order']} | {r['baseline']['engine_ms']:.1f} | {r['candidate']['engine_ms']:.1f} | {r['baseline']['engine_ms']-r['candidate']['engine_ms']:+.1f} | {r['baseline']['container_seconds']:.6f} | {r['candidate']['container_seconds']:.6f} |" for r in observations]
-summary += ["", f"baseline engine median: {med('baseline', 'engine_ms'):.1f} ms", f"candidate engine median: {med('candidate', 'engine_ms'):.1f} ms", f"median paired engine saving: {statistics.median(engine_savings):+.3f} ms", f"baseline container median: {med('baseline', 'container_seconds'):.6f} s", f"candidate container median: {med('candidate', 'container_seconds'):.6f} s", f"median paired container saving: {statistics.median(container_savings):+.3f} ms", f"baseline profile: peak_rss_kb={baseline_profile['peak_rss_kb']} minflt={baseline_profile['minflt']} engine_ms={baseline_profile['engine_ms']:.1f}", "", "Correctness: fixtures MATCH; big20 candidate vs baseline MATCH."]
+summary += ["", f"baseline engine median: {med('baseline', 'engine_ms'):.1f} ms", f"candidate engine median: {med('candidate', 'engine_ms'):.1f} ms", f"median paired engine saving: {statistics.median(engine_savings):+.3f} ms", f"baseline container median: {med('baseline', 'container_seconds'):.6f} s", f"candidate container median: {med('candidate', 'container_seconds'):.6f} s", f"median paired container saving: {statistics.median(container_savings):+.3f} ms", f"baseline profile: peak_rss_kb={baseline_profile['peak_rss_kb']} minflt={baseline_profile['minflt']} engine_ms={baseline_profile['engine_ms']:.1f}", f"cold sanity: baseline={cold_baseline['engine_ms']:.1f} ms candidate={cold_candidate['engine_ms']:.1f} ms", "", "| stage | baseline median ms | candidate median ms | saving ms |", "|---|---:|---:|---:|"]
+summary += [f"| {key} | {base:.1f} | {cand:.1f} | {saving:+.1f} |" for key, base, cand, saving in stage_lines]
+summary += [f"", f"largest stage movement: {largest_stage[0]} ({largest_stage[3]:+.1f} ms)", "", "Correctness: fixtures MATCH; big20 candidate vs baseline MATCH."]
 (WORK / "summary.md").write_text("\n".join(summary) + "\n")
 (WORK / "observations.json").write_text(json.dumps(observations, indent=2) + "\n")
 print((WORK / "summary.md").read_text(), flush=True)

@@ -8,100 +8,132 @@ env:
   DATA_SEED: "3"
 
 jobs:
-  lanes8:
+  # Each x86 image is compiled once; benchmark jobs load these immutable images.
+  build-images:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      BASELINE_REF: ed40599
-      CANDIDATE_REF: 6fafb87
-      PAIRS: "10"
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: baseline, ref: ed40599 }
+          - { label: lanes8, ref: 6fafb87 }
+          - { label: io-popread-a, ref: 2005c71 }
+          - { label: io-popread-b, ref: d937261 }
+          - { label: io-serialgaps, ref: 71cc59b }
+          - { label: core-prerelease, ref: 92b062f }
+          - { label: core-prefault, ref: 49449d5 }
+          - { label: io-prefault2, ref: abe261c }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Runner capabilities and thread count
+      - name: Build ${{ matrix.ref }} once for linux/amd64
+        env:
+          REF: ${{ matrix.ref }}
+          LABEL: ${{ matrix.label }}
         run: |
-          lscpu
-          free -h
-          df -h /
-          if ! grep -qw avx512f /proc/cpuinfo; then echo 'AVX512F=no; refusing non-representative run' >&2; exit 1; fi
-          echo 'AVX512F=yes'
-          echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
-          cat /sys/kernel/mm/transparent_hugepage/enabled
-      - name: Fetch pinned benchmark support
-        run: |
-          git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
-          git checkout origin/ci-bench -- generator fixtures scripts
-      - run: python3 -m pip install --quiet polars
-      - name: Generate 20M corpus
-        run: |
-          cargo build --release --locked --manifest-path generator/Cargo.toml
-          generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
-      - name: Gate, profile, and 10 cold pairs
-        run: python3 bench/ci_bench.py "$HOME/big20" "$HOME/g7-bench" 2>&1 | tee "$HOME/g7-bench.log"
-      - if: always()
-        run: cat "$HOME/g7-bench/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          SHA=$(git rev-parse "$REF^{commit}")
+          echo "Building $SHA as g7-bench-$LABEL"
+          git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
+          docker save "g7-bench-$LABEL" | zstd -T0 -3 -o "$RUNNER_TEMP/g7-bench-$LABEL.tar.zst"
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: lanes8-${{ github.run_id }}
-          path: |-
-            ~/g7-bench.log
-            ~/g7-bench/summary.md
-            ~/g7-bench/observations.json
-            ~/g7-bench/logs/**
+          name: image-${{ matrix.label }}
+          path: ${{ runner.temp }}/g7-bench-${{ matrix.label }}.tar.zst
+          retention-days: 1
 
-  knob-sweep:
+  benchmark:
+    needs: build-images
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { label: pinstart-1, setting: XL_PINSTART=1 }
-          - { label: rel-0, setting: XL_REL=0 }
-          - { label: spin-50, setting: XL_SPIN=50 }
-          - { label: spin-100, setting: XL_SPIN=100 }
-          - { label: spin-1000, setting: XL_SPIN=1000 }
-          # XL_ENDREL=1 is the default conditional behavior; 2 actually forces release.
-          - { label: endrel-2, setting: XL_ENDREL=2 }
-          - { label: rd-0, setting: XL_RD=0 }
-          - { label: rd-512, setting: XL_RD=512 }
-          - { label: ch-2048, setting: XL_CH=2048 }
-          - { label: ch-4096, setting: XL_CH=4096 }
+          - { label: lanes8, candidate_ref: 6fafb87, image: lanes8, setting: '' }
+          - { label: pinstart-1, candidate_ref: ed40599, image: baseline, setting: XL_PINSTART=1 }
+          - { label: rel-0, candidate_ref: ed40599, image: baseline, setting: XL_REL=0 }
+          - { label: spin-50, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=50 }
+          - { label: spin-100, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=100 }
+          - { label: spin-1000, candidate_ref: ed40599, image: baseline, setting: XL_SPIN=1000 }
+          # XL_ENDREL=1 is default conditional behavior; 2 actually forces release.
+          - { label: endrel-2, candidate_ref: ed40599, image: baseline, setting: XL_ENDREL=2 }
+          - { label: rd-0, candidate_ref: ed40599, image: baseline, setting: XL_RD=0 }
+          - { label: rd-512, candidate_ref: ed40599, image: baseline, setting: XL_RD=512 }
+          - { label: ch-2048, candidate_ref: ed40599, image: baseline, setting: XL_CH=2048 }
+          - { label: ch-4096, candidate_ref: ed40599, image: baseline, setting: XL_CH=4096 }
+          - { label: io-popread-a, candidate_ref: 2005c71, image: io-popread-a, setting: '' }
+          - { label: io-popread-b, candidate_ref: d937261, image: io-popread-b, setting: '' }
+          - { label: io-serialgaps, candidate_ref: 71cc59b, image: io-serialgaps, setting: '' }
+          - { label: core-prerelease, candidate_ref: 92b062f, image: core-prerelease, setting: '' }
+          - { label: core-prefault, candidate_ref: 49449d5, image: core-prefault, setting: '' }
+          - { label: io-prefault2, candidate_ref: abe261c, image: io-prefault2, setting: '' }
     env:
       BASELINE_REF: ed40599
-      CANDIDATE_REF: ed40599
+      CANDIDATE_REF: ${{ matrix.candidate_ref }}
       CANDIDATE_ENV: ${{ matrix.setting }}
+      BASELINE_IMAGE: g7-bench-baseline
+      CANDIDATE_IMAGE: g7-bench-${{ matrix.image }}
       PAIRS: "10"
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Runner capabilities and thread count
+      - name: Intel AVX-512 capability and thread count
         run: |
           lscpu
-          if ! grep -qw avx512f /proc/cpuinfo; then echo 'AVX512F=no; refusing non-representative run' >&2; exit 1; fi
-          echo 'AVX512F=yes'
+          free -h
+          df -h /
+          if ! grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || ! grep -qw avx512f /proc/cpuinfo; then
+            echo 'Intel AVX512F=no; refusing non-representative run' >&2
+            exit 1
+          fi
+          echo 'Intel AVX512F=yes'
           echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
-          cat /sys/kernel/mm/transparent_hugepage/enabled
+          printf 'THP: '; cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: Fetch pinned benchmark support
+        id: generator
         run: |
           git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
+          echo "tree=$(git rev-parse origin/ci-bench:generator)" >> "$GITHUB_OUTPUT"
           git checkout origin/ci-bench -- generator fixtures scripts
+      - name: Restore 20M corpus cache
+        id: corpus
+        uses: actions/cache@v4
+        with:
+          path: ~/big20
+          key: big20-${{ runner.os }}-seed${{ env.DATA_SEED }}-${{ steps.generator.outputs.tree }}
       - run: python3 -m pip install --quiet polars
-      - name: Generate 20M corpus
+      - name: Generate 20M corpus on a cache miss
+        if: steps.corpus.outputs.cache-hit != 'true'
         run: |
           cargo build --release --locked --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
-      - name: Gate and 10 cold pairs (${{ matrix.label }})
+      - name: Prepare image directory
+        run: mkdir -p "$RUNNER_TEMP/images"
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-baseline
+          path: ${{ runner.temp }}/images/baseline
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.image }}
+          path: ${{ runner.temp }}/images/candidate
+      - name: Load baseline and candidate
+        run: |
+          for archive in "$RUNNER_TEMP"/images/*/*.tar.zst; do zstd -dc "$archive" | docker load; done
+          docker image ls --format '{{.Repository}}:{{.Tag}}'
+      - name: Gate and 10 alternating warm pairs (${{ matrix.label }})
         run: python3 bench/ci_bench.py "$HOME/big20" "$HOME/g7-bench" 2>&1 | tee "$HOME/g7-bench.log"
       - if: always()
         run: cat "$HOME/g7-bench/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: knob-${{ matrix.label }}-${{ github.run_id }}
+          name: result-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |-
             ~/g7-bench.log
             ~/g7-bench/summary.md
             ~/g7-bench/observations.json
             ~/g7-bench/logs/**
+          retention-days: 7
