@@ -464,6 +464,7 @@ fn chunk_bound(d: &Data, p: &Plan) -> usize {
 }
 
 
+#[derive(Clone, Copy)]
 struct Meta { ptype: i32, dict: bool, size: u64, data_off: u64, dict_off: u64, nv: usize }
 
 #[inline(always)]
@@ -786,7 +787,7 @@ fn emit_chunk(o: &mut Out, d: &Data, p: &Plan) -> io::Result<Meta> {
 }
 
 
-fn footer(cols: &[Column], groups: &[(usize, Vec<Meta>)], nrows: usize) -> Vec<u8> {
+fn footer<M: AsRef<[Meta]>>(cols: &[Column], groups: &[(usize, M)], nrows: usize) -> Vec<u8> {
     let mut b = Vec::with_capacity(256 + 128 * cols.len() * groups.len().max(1));
     let mut t = Tw::new(&mut b);
     t.i32(1, 1);
@@ -811,6 +812,7 @@ fn footer(cols: &[Column], groups: &[(usize, Vec<Meta>)], nrows: usize) -> Vec<u
     t.list(4, 12, groups.len());
     for (gi, (rows, metas)) in groups.iter().enumerate() {
         t.elem();
+        let metas = metas.as_ref();
         t.list(1, 12, metas.len());
         let mut total = 0i64;
         for (c, m) in cols.iter().zip(metas) {
@@ -1055,7 +1057,7 @@ fn user_cols<'a>(u: &UserCols<'a>) -> [Column<'a>; 6] {
 
 pub struct UserFile {
     o: Out,
-    groups: Vec<(usize, Vec<Meta>)>,
+    groups: Vec<(usize, [Meta; 6])>,
     rows: usize,
 }
 impl UserFile {
@@ -1070,16 +1072,16 @@ impl UserFile {
         assert!(n > 0 && u.head <= n && u.day.len() == n && u.ses.len() == n && u.evs.len() == n && u.rev.len() == n && u.cat.len() == n);
         let cols = user_cols(u);
         let o = &mut self.o;
-        let mut metas = Vec::with_capacity(cols.len());
-        unsafe {
-            metas.push(emit_user_ids(o, &narrow(cols[0].data), u.head, scratch)?);
-            for c in &cols[1..4] {
-                let p = plan(&c.data);
-                metas.push(emit_chunk(o, &c.data, &p)?);
-            }
-            metas.push(emit_zero_head(o, u.rev, u.head)?);
-            metas.push(emit_null_head(o, &u.cats, u.cat, u.head)?);
-        }
+        let metas = unsafe {
+            [
+                emit_user_ids(o, &narrow(cols[0].data), u.head, scratch)?,
+                emit_chunk(o, &cols[1].data, &plan(&cols[1].data))?,
+                emit_chunk(o, &cols[2].data, &plan(&cols[2].data))?,
+                emit_chunk(o, &cols[3].data, &plan(&cols[3].data))?,
+                emit_zero_head(o, u.rev, u.head)?,
+                emit_null_head(o, &u.cats, u.cat, u.head)?,
+            ]
+        };
         self.groups.push((n, metas));
         self.rows += n;
         Ok(())
