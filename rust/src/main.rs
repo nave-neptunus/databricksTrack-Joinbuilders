@@ -11,8 +11,8 @@ mod slow;
 
 use ahash::AHashMap as HashMap;
 use rayon::prelude::*;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
@@ -730,13 +730,14 @@ fn hs(b: &[u8], seed: u64) -> (u64, u32) {
 
 /// Open-addressing map from a 64-bit key (plus check) to a u32 value.
 struct Tab {
-    slots: Vec<(u64, u64)>, // (key, (chk << 32) | val); key 0 = empty
+    slots: Vec<(AtomicU64, AtomicU64)>, // (key, (chk << 32) | val); key 0 = empty
     mask: usize,
 }
 impl Tab {
     fn new(n: usize) -> Tab {
         let cap = (n * 2).next_power_of_two().max(16);
-        Tab { slots: vec![(0, 0); cap], mask: cap - 1 }
+        let slots = (0..cap).map(|_| (AtomicU64::new(0), AtomicU64::new(0))).collect();
+        Tab { slots, mask: cap - 1 }
     }
     #[inline]
     #[allow(dead_code)]
@@ -760,7 +761,8 @@ impl Tab {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
         loop {
-            let (kk, vv) = self.slots[i];
+            let (kk, vv) = &self.slots[i];
+            let (kk, vv) = (kk.load(Relaxed), vv.load(Relaxed));
             if kk == 0 {
                 return None;
             }
@@ -983,29 +985,25 @@ const PERSON_SET: u64 = 1 << 31;
 /// The all-uid table over the link table's slots (see `fast`): key, then
 /// (check << 32) | PERSON_SET | person. A claimed key whose value is still 0 is being
 /// inserted by another thread, which publishes the value right after its key.
-struct Users<'a> {
-    sl: &'a [std::sync::atomic::AtomicU64],
+struct Users {
+    sl: Vec<(AtomicU64, AtomicU64)>,
     mask: usize,
     limit: usize,
     used: std::sync::atomic::AtomicUsize,
     next: std::sync::atomic::AtomicU32,
-    names: &'a [std::sync::atomic::AtomicU64],
+    names: Vec<AtomicU64>,
 }
 
-impl<'a> Users<'a> {
-    fn new(tab: &'a mut Tab, nids: usize, npersons: usize) -> Self {
-        use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
+impl Users {
+    fn new(tab: Tab, nids: usize, npersons: usize) -> Self {
+        use std::sync::atomic::AtomicUsize;
         let cap = tab.mask + 1;
-        // The slots are not otherwise accessed until the table is dropped; AtomicU64 has u64's layout.
-        let sl = unsafe { std::slice::from_raw_parts(tab.slots.as_mut_ptr() as *const AtomicU64, cap * 2) };
         // Dense ids never exceed: linked persons, one block of padding, one id per slot,
-        // and one partial block per worker.
+        // and one partial block per worker in each of scan and routing.
         let first = npersons.div_ceil(P) * P;
-        let ids = first + cap + (rayon::current_num_threads() + 1) * P;
-        let v: Vec<u64> = vec![0; ids];
-        let names = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU64, ids) };
-        std::mem::forget(v);
-        Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names }
+        let ids = first + cap + (2 * rayon::current_num_threads() + 1) * P;
+        let names = (0..ids).map(|_| AtomicU64::new(0)).collect();
+        Users { sl: tab.slots, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names }
     }
 
     #[inline]
@@ -1025,7 +1023,7 @@ impl<'a> Users<'a> {
     #[allow(dead_code)]
     fn prefetch(&self, key: u64) {
         let index = (if key == 0 { 1 } else { key }) as usize & self.mask;
-        let ptr = self.sl.as_ptr().wrapping_add(2 * index);
+        let ptr = self.sl.as_ptr().wrapping_add(index);
         #[cfg(target_arch = "aarch64")]
         unsafe {
             std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
@@ -1045,9 +1043,10 @@ impl<'a> Users<'a> {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
         loop {
-            let mut kk = self.sl[2 * i].load(Acquire);
+            let (key, value) = &self.sl[i];
+            let mut kk = key.load(Acquire);
             if kk == 0 {
-                match self.sl[2 * i].compare_exchange(0, k, AcqRel, Acquire) {
+                match key.compare_exchange(0, k, AcqRel, Acquire) {
                     Ok(_) => {
                         let id = self.fresh(block, coll);
                         if let Some(slot) = self.names.get(id as usize) {
@@ -1056,17 +1055,17 @@ impl<'a> Users<'a> {
                             coll.store(true, Relaxed);
                         }
                         let v = (u64::from(c) << 32) | PERSON_SET | u64::from(id & (PERSON_SET as u32 - 1));
-                        self.sl[2 * i + 1].store(v, Release);
+                        value.store(v, Release);
                         return id & (PERSON_SET as u32 - 1);
                     }
                     Err(x) => kk = x,
                 }
             }
             if kk == k {
-                let mut v = self.sl[2 * i + 1].load(Acquire);
+                let mut v = value.load(Acquire);
                 while v == 0 {
                     std::hint::spin_loop();
-                    v = self.sl[2 * i + 1].load(Acquire);
+                    v = value.load(Acquire);
                 }
                 if (v >> 32) as u32 != c {
                     coll.store(true, Relaxed);
@@ -1084,12 +1083,13 @@ impl<'a> Users<'a> {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
         loop {
-            let kk = self.sl[2 * i].load(Relaxed);
+            let (key, value) = &self.sl[i];
+            let kk = key.load(Relaxed);
             if kk == 0 {
                 return None;
             }
             if kk == k {
-                let v = self.sl[2 * i + 1].load(Relaxed);
+                let v = value.load(Relaxed);
                 if (v >> 32) as u32 != c {
                     coll.store(true, Relaxed);
                     return None;
@@ -1581,7 +1581,7 @@ enum LinkSlot {
 
 #[inline]
 fn link_slot(
-    slots: &mut [(u64, u64)],
+    slots: &mut [(AtomicU64, AtomicU64)],
     mut i: usize,
     mask: usize,
     e: LinkEnd,
@@ -1589,16 +1589,18 @@ fn link_slot(
     names: &[LinkName],
     collision: &AtomicBool,
 ) -> LinkSlot {
-    while let Some(slot) = slots.get_mut(i) {
-        if slot.0 == 0 {
+    while let Some((key, value)) = slots.get_mut(i) {
+        let (key, value) = (key.get_mut(), value.get_mut());
+        if *key == 0 {
             names[node as usize].set(e.name);
-            *slot = (e.key, (u64::from(e.check) << 32) | u64::from(node));
+            *key = e.key;
+            *value = (u64::from(e.check) << 32) | u64::from(node);
             return LinkSlot::Inserted(i);
         }
-        if slot.0 == e.key {
-            let other = slot.1 as u32;
+        if *key == e.key {
+            let other = *value as u32;
             let other_name = names[other as usize].reference.load(Relaxed);
-            if (slot.1 >> 32) as u32 != e.check
+            if (*value >> 32) as u32 != e.check
                 || (other_name != e.name && unpack_ref(other_name) != unpack_ref(e.name))
             {
                 collision.store(true, Relaxed);
@@ -1829,7 +1831,7 @@ fn build_links(
                 0 => node,
                 p => p - 1,
             };
-            let value = &mut slots[slot as usize & range_mask].1;
+            let value = slots[slot as usize & range_mask].1.get_mut();
             *value = (*value & !0xffff_ffff) | PERSON_SET | u64::from(person[r as usize].load(Relaxed));
         }
     });
@@ -1922,22 +1924,51 @@ fn fast(seed: u64, nova: bool) -> bool {
         let total: usize = evb.iter().map(|b| b.len()).sum();
         total / ((1 << 16) / rows).max(1) / 12
     });
-    for b in &lkb {
-        ra.wait(b);
-    }
-    lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, nova) else {
+    let coll = AtomicBool::new(false);
+    let ech = LazyChunks::new(&evb, 1 << 20);
+    let links = OnceLock::new();
+    let build_users = || {
+        for b in &lkb {
+            ra.wait(b);
+        }
+        lap("  links read");
+        let result = build_links(&lkb, est_users, seed, nova).map(|(tab, edges, nids, names)| {
+            let users = Users::new(tab, nids, names.len());
+            lap(&format!("links: {edges} edges, {nids} ids, {} persons", names.len()));
+            (users, names)
+        });
+        assert!(links.set(result).is_ok());
+    };
+    let scanned = if nova {
+        Some(std::thread::scope(|scope| {
+            scope.spawn(build_users);
+            let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
+            nova::scan_events(
+                ech.len(),
+                |index| {
+                    ra.wait(ech.raw(index));
+                    if links.get().is_none() {
+                        // Event workers can service queued link jobs between chunks.
+                        rayon::yield_now();
+                    }
+                    ech.get(index)
+                },
+                || links.get().and_then(Option::as_ref).map(|(users, _)| users),
+                &input,
+                &coll,
+            )
+        }))
+    } else {
+        build_users();
+        None
+    };
+    let Some((users, pname)) = links.into_inner().flatten() else {
         return false;
     };
-    let coll = AtomicBool::new(false);
-    let users = Users::new(&mut ltab, nids, pname.len());
-    lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Produce person partitions with exactly the retained, valid events.
-    let ech = LazyChunks::new(&evb, 1 << 20);
-    let (linked_count, pname, paccs) = if nova {
-        let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
+    let (linked_count, pname, paccs) = if let Some(scanned) = scanned {
+        let Some(result) = nova::route_events(scanned, &users, &pname, &coll) else {
             return false;
         };
         result
@@ -2246,7 +2277,8 @@ fn fast(seed: u64, nova: bool) -> bool {
     };
     camp_job();
     lap("parquet written");
-    true
+    // Both output tables have closed. Skip teardown of the in-memory engine.
+    std::process::exit(0);
 }
 
 /// Like rayon's fold, but exactly one accumulator per worker thread (fold makes one per split,
