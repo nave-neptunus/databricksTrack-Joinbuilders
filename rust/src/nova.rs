@@ -15,7 +15,7 @@ const INVALID: u32 = u32::MAX;
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
 #[inline]
-fn short_key(id: &[u8], prefix: u8) -> Option<u64> {
+pub(super) fn short_key(id: &[u8], prefix: u8) -> Option<u64> {
     let (&first, tail) = id.split_first()?;
     if first | 32 != prefix {
         return None;
