@@ -13,6 +13,8 @@ const SHORT_KEY: u64 = 1 << 63;
 const INVALID: u32 = u32::MAX;
 static EVENT_DIGEST: AtomicU64 = AtomicU64::new(0);
 
+type EventStream = Streams<Event, SHARDS>;
+
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
 #[inline]
@@ -223,6 +225,50 @@ const _: () = assert!(size_of::<Event>() == 24);
 struct Pending {
     row: Event,
     uid: u64,
+}
+
+struct Purchase {
+    product: u32,
+    price: u32,
+    end: u32,
+    winner: AtomicU64,
+}
+
+#[derive(Default)]
+struct Purchases {
+    rows: Vec<Purchase>,
+    bytes: Vec<u8>,
+    chunks: Vec<(usize, std::ops::Range<usize>)>,
+}
+
+impl Purchases {
+    fn push(&mut self, product: &[u8], price: &[u8]) -> Option<u32> {
+        let index = u32::try_from(self.rows.len().checked_add(1)?).ok()?;
+        let start = self.bytes.len();
+        let price_start = start.checked_add(product.len())?;
+        let end = u32::try_from(price_start.checked_add(price.len())?).ok()?;
+        self.bytes.extend_from_slice(product);
+        self.bytes.extend_from_slice(price);
+        self.rows.push(Purchase {
+            product: start as u32,
+            price: price_start as u32,
+            end,
+            winner: AtomicU64::new(0),
+        });
+        Some(index)
+    }
+
+    fn fields(&self, row: &Purchase) -> (&[u8], &[u8]) {
+        (
+            &self.bytes[row.product as usize..row.price as usize],
+            &self.bytes[row.price as usize..row.end as usize],
+        )
+    }
+}
+
+struct EventFold {
+    events: EventStream,
+    purchases: Purchases,
 }
 
 impl Pending {
@@ -607,7 +653,11 @@ struct FastDates([WindowDate; 32]);
 
 impl FastDates {
     const EMPTY: Self = Self(
-        [WindowDate { prefix: 0, day_and_t: u32::MAX, midnight: 0 }; 32],
+        [WindowDate {
+            prefix: 0,
+            day_and_t: u32::MAX,
+            midnight: 0,
+        }; 32],
     );
 
     #[inline]
@@ -661,6 +711,15 @@ pub(super) struct EventInput<'a> {
     pub(super) end: i64,
 }
 
+impl EventInput<'_> {
+    #[inline]
+    fn purchase(&self, product: &[u8], price: &[u8]) -> Option<u32> {
+        let value = parse_price(price)?;
+        let category = *self.products.get(product).unwrap_or(&self.unknown);
+        Some(value | (category << 24))
+    }
+}
+
 struct Parser<'a, 'catalog, 'table, const FAST: bool> {
     input: &'a EventInput<'catalog>,
     users: &'a Users<'table>,
@@ -672,7 +731,9 @@ struct Parser<'a, 'catalog, 'table, const FAST: bool> {
     ids: (u32, u32),
     batch: [Pending; 16],
     count: usize,
-    streams: Streams<Event, SHARDS>,
+    streams: EventStream,
+    purchases: Purchases,
+    defer_purchases: bool,
     skip_probe: bool,
     skip_store: bool,
     digest: u64,
@@ -777,18 +838,24 @@ impl<'a, const FAST: bool> EventSink<'a> for Parser<'_, '_, '_, FAST> {
             if relative >= self.window_ms || seconds * 1000 - time > DAY {
                 break 'valid;
             }
+            let uid = user_key(user);
             if purchase {
-                let Some(value) = parse_price(fields.field::<6>()) else {
-                    break 'valid;
-                };
-                let category = *self
-                    .input
-                    .products
-                    .get(fields.field::<5>())
-                    .unwrap_or(&self.input.unknown);
-                pending.row.price = value | (category << 24);
+                let product = fields.field::<5>();
+                let price = fields.field::<6>();
+                if self.defer_purchases && uid.is_some() {
+                    let Some(index) = self.purchases.push(product, price) else {
+                        self.declined.store(true, Relaxed);
+                        break 'valid;
+                    };
+                    pending.row.price = index;
+                } else {
+                    let Some(value) = self.input.purchase(product, price) else {
+                        break 'valid;
+                    };
+                    pending.row.price = value;
+                }
             }
-            let Some(uid) = user_key(user) else {
+            let Some(uid) = uid else {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
@@ -797,7 +864,19 @@ impl<'a, const FAST: bool> EventSink<'a> for Parser<'_, '_, '_, FAST> {
             pending.uid = uid;
         }
         if self.digest_on {
-            mix_digest(&mut self.digest, &pending);
+            let mut decoded = pending;
+            if self.defer_purchases && pending.row.ts != INVALID && pending.row.price != 0 {
+                let row = &self.purchases.rows[pending.row.price as usize - 1];
+                let (product, price) = self.purchases.fields(row);
+                if let Some(value) = self.input.purchase(product, price) {
+                    decoded.row.price = value;
+                } else {
+                    decoded.row.price = 0;
+                    decoded.row.ts = INVALID;
+                    decoded.uid = 0;
+                }
+            }
+            mix_digest(&mut self.digest, &decoded);
         }
         self.batch[self.count] = pending;
         self.count += 1;
@@ -814,7 +893,8 @@ fn events<const FAST: bool>(
     input: &EventInput<'_>,
     declined: &AtomicBool,
     mode: &str,
-) -> Vec<Streams<Event, SHARDS>> {
+    defer_purchases: bool,
+) -> Vec<EventFold> {
     let next = AtomicUsize::new(0);
     let dig = digest_enabled();
     rayon::broadcast(|_| {
@@ -829,7 +909,10 @@ fn events<const FAST: bool>(
                 scan_event_rows(work.get(index), &mut sink);
             }
             std::hint::black_box(sink.sum);
-            return Streams::new();
+            return EventFold {
+                events: Streams::new(),
+                purchases: Purchases::default(),
+            };
         }
         let mut parser = Parser::<FAST> {
             input,
@@ -847,6 +930,8 @@ fn events<const FAST: bool>(
             batch: [Pending::EMPTY; 16],
             count: 0,
             streams: Streams::new(),
+            purchases: Purchases::default(),
+            defer_purchases,
             skip_probe: mode == "fields",
             skip_store: mode != "base",
             digest: 0,
@@ -864,7 +949,15 @@ fn events<const FAST: bool>(
             if dig {
                 parser.digest = (index as u64).wrapping_mul(crate::K4);
             }
+            let first_purchase = parser.purchases.rows.len();
             parser.parse_chunk(work.get(index));
+            let end_purchase = parser.purchases.rows.len();
+            if first_purchase != end_purchase {
+                parser
+                    .purchases
+                    .chunks
+                    .push((index, first_purchase..end_purchase));
+            }
             if dig {
                 digest = digest.wrapping_add(parser.digest);
             }
@@ -873,11 +966,12 @@ fn events<const FAST: bool>(
         if dig {
             EVENT_DIGEST.fetch_add(digest, Relaxed);
         }
-        parser.streams
+        EventFold {
+            events: parser.streams,
+            purchases: parser.purchases,
+        }
     })
 }
-
-type EventStream = Streams<Event, SHARDS>;
 
 // Tag bits avoid an indirect load for almost every occupied cell with a
 // different key. The location refers to a record in an immutable stream.
@@ -901,13 +995,13 @@ impl Router {
         }
     }
 
-    fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
+    fn route(&mut self, folds: &[EventFold], shard: usize, defer_purchases: bool) -> Option<()> {
         let mut count = 0;
         let mut longest = 1;
         self.bases.clear();
         for fold in folds {
             self.bases.push(count);
-            let rows = fold.len(shard);
+            let rows = fold.events.len(shard);
             count += rows;
             longest = longest.max(rows);
         }
@@ -926,7 +1020,7 @@ impl Router {
         self.losers.resize(count, 0);
 
         for (file, fold) in folds.iter().enumerate() {
-            for (index, row) in fold.records(shard).enumerate() {
+            for (index, row) in fold.events.records(shard).enumerate() {
                 let hash = row.key;
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
                 let location = ((file << shift) + index + 1) as u32;
@@ -941,7 +1035,7 @@ impl Router {
                         let previous = ((winner & LOCATION_MASK) - 1) as usize;
                         let prior_file = previous >> shift;
                         let prior_index = previous & (stride - 1);
-                        let prior = folds[prior_file].get(shard, prior_index);
+                        let prior = folds[prior_file].events.get(shard, prior_index);
                         if prior.key == row.key {
                             // Invalid copies still compete for earliest ingest.
                             if row.ingest < prior.ingest {
@@ -959,8 +1053,14 @@ impl Router {
         }
         for (file, fold) in folds.iter().enumerate() {
             let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
+            for (index, row) in fold.events.records(shard).enumerate() {
                 if row.ts != INVALID && self.losers[base + index] == 0 {
+                    if row.price != 0 && defer_purchases {
+                        let purchase = &fold.purchases.rows[row.price as usize - 1];
+                        let winner = ((u64::from(row.ts) + 1) << 32) | u64::from(row.person);
+                        purchase.winner.store(winner, Relaxed);
+                        continue;
+                    }
                     self.people.push(
                         row.person as usize & (P - 1),
                         EvP {
@@ -976,6 +1076,52 @@ impl Router {
     }
 }
 
+fn route_purchases(folds: &[EventFold], input: &EventInput<'_>) -> Vec<People> {
+    let mut chunks = Vec::new();
+    let mut count = 0;
+    for fold in folds {
+        let purchases = &fold.purchases;
+        count += purchases.rows.len();
+        for (index, range) in &purchases.chunks {
+            chunks.push((*index, purchases, range.clone()));
+        }
+    }
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    // Each scan task copied only the purchase fields into owned storage.
+    // Claim those chunks in source order and never return to the CSV mappings.
+    chunks.sort_unstable_by_key(|(index, _, _)| *index);
+    let reservation = count.div_ceil(P * rayon::current_num_threads());
+    crate::pt_ordered(
+        chunks.len(),
+        || People::new(reservation),
+        |mut people, i| {
+            let (_, purchases, range) = &chunks[i];
+            for row in &purchases.rows[range.clone()] {
+                let winner = row.winner.load(Relaxed);
+                if winner == 0 {
+                    continue;
+                }
+                let (product, price) = purchases.fields(row);
+                if let Some(price) = input.purchase(product, price) {
+                    let person = winner as u32;
+                    let ts = ((winner >> 32) - 1) as u32;
+                    people.push(
+                        person as usize & (P - 1),
+                        EvP {
+                            person,
+                            ts: AtomicU32::new(ts),
+                            price,
+                        },
+                    );
+                }
+            }
+            people
+        },
+    )
+}
+
 pub(super) fn run_events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
@@ -985,15 +1131,32 @@ pub(super) fn run_events(
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
     let mode = profile_mode();
+    let defer_purchases = std::env::var("NOVA_DEFER_PURCHASE").ok().as_deref() == Some("1");
     let parse_clock = std::time::Instant::now();
     let (user0, sys0) = crate::cpu_ticks();
     if digest_enabled() {
         EVENT_DIGEST.store(0, Relaxed);
     }
     let folds = if fast_fields() {
-        events::<true>(work, read_ahead, users, input, declined, &mode)
+        events::<true>(
+            work,
+            read_ahead,
+            users,
+            input,
+            declined,
+            &mode,
+            defer_purchases,
+        )
     } else {
-        events::<false>(work, read_ahead, users, input, declined, &mode)
+        events::<false>(
+            work,
+            read_ahead,
+            users,
+            input,
+            declined,
+            &mode,
+            defer_purchases,
+        )
     };
     let (user1, sys1) = crate::cpu_ticks();
     if declined.load(Relaxed) {
@@ -1016,7 +1179,7 @@ pub(super) fn run_events(
     }
     let rows: usize = folds
         .iter()
-        .map(|f| (0..SHARDS).map(|shard| f.len(shard)).sum::<usize>())
+        .map(|f| (0..SHARDS).map(|shard| f.events.len(shard)).sum::<usize>())
         .sum();
     eprintln!("EVENT_ROWS {}", rows);
     if digest_enabled() {
@@ -1028,11 +1191,11 @@ pub(super) fn run_events(
     let reservation = rows.div_ceil(P * rayon::current_num_threads()).min(32_768);
     let dedup_clock = std::time::Instant::now();
     let (user2, sys2) = crate::cpu_ticks();
-    let people = crate::pt_ordered(
+    let mut people: Vec<_> = crate::pt_ordered(
         SHARDS,
         || Router::new(reservation),
         |mut router, shard| {
-            if router.route(&folds, shard).is_none() {
+            if router.route(&folds, shard, defer_purchases).is_none() {
                 declined.store(true, Relaxed);
             }
             router
@@ -1041,10 +1204,13 @@ pub(super) fn run_events(
     .into_iter()
     .map(|router| router.people)
     .collect();
-    let (user3, sys3) = crate::cpu_ticks();
     if declined.load(Relaxed) {
         return None;
     }
+    if defer_purchases {
+        people.extend(route_purchases(&folds, input));
+    }
+    let (user3, sys3) = crate::cpu_ticks();
     drop(folds);
     lap("events dedup + validate");
     eprintln!(
@@ -1183,13 +1349,18 @@ mod tests {
         let start = crate::parse_ts(b"2027-12-20T00:00:00Z").unwrap();
         let end = crate::parse_ts(b"2028-01-07T00:00:00Z").unwrap();
         let fast = FastDates::new(start, end);
-        for (year, month, day) in (20..=31).map(|d| (2027, 12, d))
+        for (year, month, day) in (20..=31)
+            .map(|d| (2027, 12, d))
             .chain((1..=6).map(|d| (2028, 1, d)))
         {
             for (hour, minute, second) in [(0, 0, 0), (11, 22, 33), (23, 59, 59)] {
                 let text = format!("{year}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
                 let bytes = text.as_bytes();
-                assert_eq!(fast.fast_iso(bytes), crate::parse_ts(bytes).map(|ms| ms / 1000), "{text}");
+                assert_eq!(
+                    fast.fast_iso(bytes),
+                    crate::parse_ts(bytes).map(|ms| ms / 1000),
+                    "{text}"
+                );
             }
         }
         for value in [
@@ -1207,10 +1378,7 @@ mod tests {
 
     #[test]
     fn fast_window_dates_keep_signed_epoch_seconds() {
-        for timestamp in [
-            &b"1969-12-31T12:34:56Z"[..],
-            b"2106-02-08T12:34:56Z",
-        ] {
+        for timestamp in [&b"1969-12-31T12:34:56Z"[..], b"2106-02-08T12:34:56Z"] {
             let ms = crate::parse_ts(timestamp).unwrap();
             let fast = FastDates::new(ms - 1000, ms + 1000);
             assert_eq!(fast.fast_iso(timestamp), Some(ms / 1000));
