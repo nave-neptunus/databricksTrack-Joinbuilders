@@ -167,7 +167,7 @@ const RA_PIECE: usize = 16 << 20;
 
 impl ReadAhead {
     fn start(maps: Vec<&'static memmap2::Mmap>, paths: Vec<&'static str>) -> &'static ReadAhead {
-        let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
         let mut table = vec![];
         let mut ranges = vec![];
         for (m, path) in maps.iter().zip(&paths) {
