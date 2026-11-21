@@ -422,7 +422,7 @@ fn clock_seconds(s: &[u8]) -> Option<i64> {
 }
 
 #[derive(Default)]
-struct Dates([([u8; 10], i64); 32]);
+pub(super) struct Dates([([u8; 10], i64); 32]);
 
 impl Dates {
     #[inline]
@@ -451,7 +451,7 @@ impl Dates {
     }
 
     #[inline]
-    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+    pub(super) fn parse(&mut self, s: &[u8]) -> Option<i64> {
         if s.len() == 20 && s[19] == b'Z' {
             return self.utc_seconds(s).map(|t| t * 1000);
         }
