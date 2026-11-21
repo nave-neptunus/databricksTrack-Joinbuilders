@@ -1963,11 +1963,70 @@ fn fast(seed: u64, nova: bool) -> bool {
     let users = Users::new(&mut ltab, nids, pname.len());
     lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
+    // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
+    // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
+    let parse_clicks = || {
+        let cch = LazyChunks::new(&ckb, 1 << 20);
+        let rows_per_partition = cch.total() / 32 / rayon::current_num_threads() / P;
+        let reserve = if rows_per_partition >= 128 { rows_per_partition.next_multiple_of(128).min(32_768) } else { 0 };
+        let caccs = pt(
+            (0..cch.len()).into_par_iter(),
+            || clicks::Partitions::new(reserve),
+            |mut acc, ci| {
+                ra.wait(cch.raw(ci));
+                let chunk = cch.get(ci);
+                let mut dates = nova::Dates::default();
+                let mut batch = [PendingClick::default(); 48];
+                let mut count = 0;
+                let mut flush = |batch: &[PendingClick]| {
+                    for &PendingClick { key, tag, ts, check } in batch {
+                        let Some(person) = users.find(key, check, &coll) else { continue };
+                        acc.push(Click { tag, person, ts });
+                    }
+                };
+                clicks::rows(chunk, |[cid, user, cmp, ts]| {
+                    if cid.is_empty() || user.is_empty() {
+                        return;
+                    }
+                    let Some(campaign) = campaign_of(cmp) else { return };
+                    let ts = match dates.parse(ts) {
+                        Some(t) if t >= click_start && t < w1 => (t - click_start) as u32,
+                        _ => return,
+                    };
+                    let ptr = cid.as_ptr() as u64;
+                    if ptr >> 48 != 0 {
+                        coll.store(true, Relaxed);
+                        return;
+                    }
+                    let (key, check) = if nova {
+                        // A supported link or event user always has a short key.
+                        let Some(key) = nova::user_key(user) else { return };
+                        (key, 0)
+                    } else {
+                        hs(user, seed)
+                    };
+                    users.prefetch(key);
+                    let tag = ptr | (u64::from(campaign) << 48);
+                    batch[count] = PendingClick { key, tag, ts, check };
+                    count += 1;
+                    if count == batch.len() {
+                        flush(&batch);
+                        count = 0;
+                    }
+                });
+                flush(&batch[..count]);
+                acc
+            },
+        );
+        lap("click workers done");
+        caccs
+    };
+
     // Produce person partitions with exactly the retained, valid events.
     let ech = LazyChunks::new(&evb, 1 << 20);
-    let (linked_count, pname, paccs) = if nova {
+    let (linked_count, pname, paccs, caccs) = if nova {
         let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
+        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll, parse_clicks) else {
             return false;
         };
         result
@@ -2100,63 +2159,9 @@ fn fast(seed: u64, nova: bool) -> bool {
         }
         let paccs: Vec<_> = folds.into_par_iter().map(|fold| fold.people).collect();
         lap("events dedup + validate");
-        (linked_count, pname, paccs)
+        (linked_count, pname, paccs, parse_clicks())
     };
 
-    // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
-    // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
-    let cch = LazyChunks::new(&ckb, 1 << 20);
-    let rows_per_partition = cch.total() / 32 / rayon::current_num_threads() / P;
-    let reserve = if rows_per_partition >= 128 { rows_per_partition.next_multiple_of(128).min(32_768) } else { 0 };
-    let caccs = pt_ordered(
-        cch.len(),
-        || clicks::Partitions::new(reserve),
-        |mut acc, ci| {
-            ra.wait(cch.raw(ci));
-            let chunk = cch.get(ci);
-            let mut dates = nova::Dates::default();
-            let mut batch = [PendingClick::default(); 48];
-            let mut count = 0;
-            let mut flush = |batch: &[PendingClick]| {
-                for &PendingClick { key, tag, ts, check } in batch {
-                    let Some(person) = users.find(key, check, &coll) else { continue };
-                    acc.push(Click { tag, person, ts });
-                }
-            };
-            clicks::rows(chunk, |[cid, user, cmp, ts]| {
-                if cid.is_empty() || user.is_empty() {
-                    return;
-                }
-                let Some(campaign) = campaign_of(cmp) else { return };
-                let ts = match dates.parse(ts) {
-                    Some(t) if t >= click_start && t < w1 => (t - click_start) as u32,
-                    _ => return,
-                };
-                let ptr = cid.as_ptr() as u64;
-                if ptr >> 48 != 0 {
-                    coll.store(true, Relaxed);
-                    return;
-                }
-                let (key, check) = if nova {
-                    // A supported link or event user always has a short key.
-                    let Some(key) = nova::user_key(user) else { return };
-                    (key, 0)
-                } else {
-                    hs(user, seed)
-                };
-                users.prefetch(key);
-                let tag = ptr | (u64::from(campaign) << 48);
-                batch[count] = PendingClick { key, tag, ts, check };
-                count += 1;
-                if count == batch.len() {
-                    flush(&batch);
-                    count = 0;
-                }
-            });
-            flush(&batch[..count]);
-            acc
-        },
-    );
     lap("clicks parsed");
     if coll.load(Relaxed) {
         return false;

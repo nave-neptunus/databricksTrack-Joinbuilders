@@ -732,14 +732,15 @@ impl Router {
     }
 }
 
-pub(super) fn run_events(
+pub(super) fn run_events<T: Send>(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
     users: &Users<'_>,
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
-) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
+    parse_clicks: impl FnOnce() -> T + Send,
+) -> Option<(u32, Vec<&'static [u8]>, Vec<People>, T)> {
     let folds = events(work, read_ahead, users, input, declined);
     if declined.load(Relaxed) {
         return None;
@@ -758,25 +759,33 @@ pub(super) fn run_events(
         .map(|f| (0..SHARDS).map(|shard| f.len(shard)).sum::<usize>())
         .sum();
     let reservation = rows.div_ceil(P * rayon::current_num_threads()).min(32_768);
-    let people = crate::pt_ordered(
-        SHARDS,
-        || Router::new(reservation),
-        |mut router, shard| {
-            if router.route(&folds, shard).is_none() {
-                declined.store(true, Relaxed);
-            }
-            router
+    // The user table is read-only after the event scan. Click workers and
+    // dedup shards can now share the pool without publishing intermediate rows.
+    let (people, clicks) = rayon::join(
+        || {
+            let people = crate::pt(
+                (0..SHARDS).into_par_iter(),
+                || Router::new(reservation),
+                |mut router, shard| {
+                    if router.route(&folds, shard).is_none() {
+                        declined.store(true, Relaxed);
+                    }
+                    router
+                },
+            )
+            .into_iter()
+            .map(|router| router.people)
+            .collect();
+            drop(folds);
+            lap("events dedup + validate");
+            people
         },
-    )
-    .into_iter()
-    .map(|router| router.people)
-    .collect();
+        parse_clicks,
+    );
     if declined.load(Relaxed) {
         return None;
     }
-    drop(folds);
-    lap("events dedup + validate");
-    Some((local_count, names, people))
+    Some((local_count, names, people, clicks))
 }
 
 #[cfg(test)]
