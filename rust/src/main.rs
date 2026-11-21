@@ -373,6 +373,47 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
 
 // One small cache per parsing task. Store all ten date bytes, so a hit also
 // verifies the calendar date and punctuation validated by the cold path.
+/// True if all 8 bytes are ASCII digits (a '9' after a byte >= 0xFA can read as false,
+/// which only sends the caller to the scalar path).
+#[inline]
+fn swar_digits(w: u64) -> bool {
+    const HI: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    (w & HI) | ((w.wrapping_add(0x0606_0606_0606_0606) & HI) >> 4) == 0x3333_3333_3333_3333
+}
+
+/// Value of 8 ASCII digits, first digit in the lowest byte.
+#[inline]
+fn swar_value(w: u64) -> u64 {
+    let v = w - 0x3030_3030_3030_3030;
+    let v = v * 10 + (v >> 8);
+    (((v & 0x0000_00FF_0000_00FF) * (100 + (1_000_000 << 32)))
+        + (((v >> 16) & 0x0000_00FF_0000_00FF) * (1 + (10_000 << 32))))
+        >> 32
+}
+
+#[cfg(test)]
+#[test]
+fn swar_f3_matches_scalar() {
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for n in 0..200_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let mut s = format!("{:013}", x % 10_000_000_000_000).into_bytes();
+        if n % 3 == 0 {
+            let i = (x >> 50) as usize % 13;
+            s[i] = [b'/', b':', b'a', b' ', 0xff, b'.'][(x >> 40) as usize % 6];
+        }
+        let mut d = Dates::default();
+        let want = if s.iter().all(|c| c.is_ascii_digit()) {
+            Some(std::str::from_utf8(&s).unwrap().parse::<i64>().unwrap())
+        } else {
+            None
+        };
+        assert_eq!(d.parse(&s), want, "{:?}", std::str::from_utf8(&s));
+    }
+}
+
 #[derive(Default)]
 struct Dates([([u8; 10], i64); 32]);
 
@@ -397,6 +438,14 @@ impl Dates {
             let t = parse_ts(s)?;
             *entry = (date, t - time);
             return Some(t);
+        }
+        if s.len() == 13 {
+            // F3 epoch milliseconds: 5 + 8 digits, word at a time.
+            let hi = (rd8(s, 0) << 24) | 0x30_3030;
+            let lo = rd8(s, 5);
+            if swar_digits(hi) && swar_digits(lo) {
+                return Some((swar_value(hi) * 100_000_000 + swar_value(lo)) as i64);
+            }
         }
         if !s.is_empty() && s.len() <= 18 {
             let mut value = 0;
@@ -949,23 +998,23 @@ impl<'a> Users<'a> {
 /// Valid event copies of one worker, by person partition. Each partition owns an initialized
 /// prefix of one anonymous mapping (huge pages on Linux, so the 1,024 write streams share a few
 /// TLB entries and fault in 2 MB steps) plus a growable overflow.
-struct People {
+struct Parts<T> {
     storage: Option<memmap2::MmapMut>,
     stride: usize,
     lengths: Vec<usize>,
-    overflow: Vec<Vec<EvP>>,
+    overflow: Vec<Vec<T>>,
 }
 
 // The mapping is only written through &mut self; shared access reads initialized prefixes.
-unsafe impl Send for People {}
-unsafe impl Sync for People {}
+unsafe impl<T: Send> Send for Parts<T> {}
+unsafe impl<T: Sync> Sync for Parts<T> {}
 
-impl People {
+impl<T> Parts<T> {
     fn new(reservation: usize) -> Self {
         let storage = if reservation == 0 || std::env::var_os("BLUE2_NO_PEOPLE_MAP").is_some() {
             None
         } else {
-            memmap2::MmapMut::map_anon(reservation * P * std::mem::size_of::<EvP>()).ok()
+            memmap2::MmapMut::map_anon(reservation * P * std::mem::size_of::<T>()).ok()
         };
         #[cfg(target_os = "linux")]
         if let Some(mapping) = &storage {
@@ -982,10 +1031,10 @@ impl People {
     }
 
     #[inline]
-    fn push(&mut self, part: usize, row: EvP) {
+    fn push(&mut self, part: usize, row: T) {
         let len = self.lengths[part];
         if len < self.stride {
-            let base = self.storage.as_mut().unwrap().as_mut_ptr().cast::<EvP>();
+            let base = self.storage.as_mut().unwrap().as_mut_ptr().cast::<T>();
             // This partition's next prefix slot is in the mapping and not yet initialized.
             unsafe { base.add(part * self.stride + len).write(row) };
             self.lengths[part] = len + 1;
@@ -995,20 +1044,22 @@ impl People {
     }
 
     #[inline]
-    fn records(&self, part: usize) -> [&[EvP]; 2] {
+    fn records(&self, part: usize) -> [&[T]; 2] {
         let prefix = self.storage.as_ref().map_or(&[][..], |mapping| {
             // Only the recorded prefix is initialized; no writes occur through &self.
-            unsafe { std::slice::from_raw_parts(mapping.as_ptr().cast::<EvP>().add(part * self.stride), self.lengths[part]) }
+            unsafe { std::slice::from_raw_parts(mapping.as_ptr().cast::<T>().add(part * self.stride), self.lengths[part]) }
         });
-        [prefix, &self.overflow[part]]
+        [prefix, &self.overflow[part][..]]
     }
 
     #[inline]
-    fn get(&self, part: usize, index: usize) -> &EvP {
+    fn get(&self, part: usize, index: usize) -> &T {
         let [prefix, overflow] = self.records(part);
         prefix.get(index).unwrap_or_else(|| &overflow[index - prefix.len()])
     }
 }
+
+type People = Parts<EvP>;
 
 struct EventFold {
     copies: Vec<Vec<D>>,
@@ -1866,9 +1917,16 @@ fn fast(seed: u64) -> bool {
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
     let cch = chunks(&ckb, 1 << 20);
-    let caccs: Vec<Vec<Vec<Click>>> = pt(
+    // Per-worker click partitions in one huge-page mapping, sized from a row sample.
+    let click_capacity = cch.iter().find(|chunk| chunk.len() >= 1 << 16).map_or(0, |sample| {
+        let rows = memchr::memchr_iter(b'\n', &sample[..1 << 16]).count().max(1);
+        let input_bytes: usize = cch.iter().map(|chunk| chunk.len()).sum();
+        let per = (input_bytes / ((1 << 16) / rows).max(1)).div_ceil(P * rayon::current_num_threads());
+        (per + per / 8 + 4).min(1 << 16)
+    });
+    let caccs: Vec<Parts<Click>> = pt(
         cch.par_iter(),
-        || (0..P).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
+        || Parts::<Click>::new(click_capacity),
         |mut acc, chunk| {
             let mut dates = Dates::default();
             let mut batch = Vec::with_capacity(16);
@@ -1877,7 +1935,7 @@ fn fast(seed: u64) -> bool {
                     // A user id not in the table has no valid event, so no session to credit.
                     let Some(person) = users.find(key, check, &coll) else { continue };
                     click.person = u64::from(person);
-                    acc[person as usize & (P - 1)].push(click);
+                    acc.push(person as usize & (P - 1), click);
                 }
             };
             csv_rows(chunk, |_, [cid, user, cmp, ts]| {
@@ -1947,7 +2005,7 @@ fn fast(seed: u64) -> bool {
     let mut order = Vec::with_capacity(P);
     for partition in 0..P {
         let events: usize = paccs.iter().map(|fold| fold.len(partition)).sum();
-        let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
+        let clicks: usize = caccs.iter().map(|fold| fold.len(partition)).sum();
         if clicks > u32::MAX as usize {
             return false;
         }
@@ -2102,7 +2160,7 @@ impl PartitionState {
         partition: usize,
         linked_count: u32,
         events: &[People],
-        clicks: &[Vec<Vec<Click>>],
+        clicks: &[Parts<Click>],
     ) {
         self.click_people_times.clear();
         self.click_meta.clear();
@@ -2119,7 +2177,7 @@ impl PartitionState {
             }
         }
         for fold in clicks {
-            for click in &fold[partition] {
+            for click in fold.records(partition).into_iter().flatten() {
                 let person = (click.person >> PB) as u32;
                 if self.ends[person as usize] != 0 {
                     self.click_people_times.push((person, click.ts));
