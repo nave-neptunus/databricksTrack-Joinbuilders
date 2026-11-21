@@ -1867,10 +1867,10 @@ mod tests {
         // Fill every lane first, mimicking a previous full batch.  Thus the
         // lanes past n in each case below are deliberately valid stale rows.
         for n in 1..=4 {
-            let ea = Arena::new(1 << 20);
-            let eb_arena = Arena::new(1 << 20);
-            let ca = Arena::new(1 << 20);
-            let cb_arena = Arena::new(1 << 20);
+            let ea = Arena::new(64 << 20);
+            let eb_arena = Arena::new(64 << 20);
+            let ca = Arena::new(64 << 20);
+            let cb_arena = Arena::new(64 << 20);
             let mut epush = Part::new(&ea, 1);
             let mut efused = Part::new(&eb_arena, 1);
             let mut cpush = Part::new(&ca, 1);
