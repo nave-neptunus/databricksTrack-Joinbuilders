@@ -1,0 +1,72 @@
+name: g7 fast-path PGO profile
+
+on:
+  push:
+    branches: [g7/core-pgo]
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NCPU: "8"
+      DATA_SEED: "3"
+      PROFILE_DIR: ${{ github.workspace }}/pgo/raw
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: x86_64-unknown-linux-musl,x86_64-unknown-linux-gnu
+          components: llvm-tools-preview
+      - name: Verify AVX-512 runner
+        run: |
+          lscpu
+          grep -qw avx512f /proc/cpuinfo
+      - name: Fetch pinned benchmark support
+        run: |
+          git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
+          git checkout origin/ci-bench -- generator fixtures scripts
+      - name: Install fixture checker dependency
+        run: python3 -m pip install --quiet polars
+      - name: Generate 20M corpus
+        run: |
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
+      - name: Build instrumented fast path and fallback
+        run: |
+          mkdir -p "$PROFILE_DIR"
+          export RUSTFLAGS='-C target-cpu=cascadelake -C relocation-model=static -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5 -Cprofile-generate='"$PROFILE_DIR"
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/pipeline "$HOME/pipeline-pgo"
+          cargo build --release --locked --manifest-path fallback/Cargo.toml --target x86_64-unknown-linux-gnu
+          sudo install -m 0755 fallback/target/x86_64-unknown-linux-gnu/release/pipeline /fallback
+      - name: Run corpus and fixture gate under instrumentation
+        run: |
+          run_case() {
+            local data="$1" out="$2" scratch="$3"
+            rm -rf "$out" "$scratch"
+            mkdir -p "$out" "$scratch"
+            chmod 777 "$out" "$scratch"
+            LLVM_PROFILE_FILE="$PROFILE_DIR/%m_%p.profraw" DATA_DIR="$data" OUTPUT_DIR="$out" SCRATCH_DIR="$scratch" NCPU="$NCPU" "$HOME/pipeline-pgo"
+          }
+          run_case "$HOME/big20" "$HOME/pgo-big20-output" "$HOME/pgo-big20-scratch"
+          for fixture in fixtures/*; do
+            name=$(basename "$fixture")
+            run_case "$fixture/input" "$HOME/pgo-fixtures/$name" "$HOME/pgo-fixture-scratch/$name"
+            python3 scripts/compare.py "$HOME/pgo-fixtures/$name" "$fixture/expected"
+          done
+      - name: Merge profile data
+        run: |
+          LLVM_PROFDATA="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata"
+          test -x "$LLVM_PROFDATA"
+          "$LLVM_PROFDATA" merge --failure-mode=all -o pgo/fast.profdata "$PROFILE_DIR"/*.profraw
+          ls -lh pgo/fast.profdata
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g7-fast-pgo-${{ github.run_id }}
+          path: |
+            pgo/fast.profdata
+            pgo/raw/*.profraw
+          if-no-files-found: error
