@@ -1984,6 +1984,68 @@ impl Session {
     }
 }
 
+// Any two events in a half-hour bucket are connected. Preserve its
+// endpoints to decide whether neighboring nonempty buckets share a session.
+const EVENT_BUCKET_WIDTH: u32 = GAP as u32;
+const EVENT_BUCKETS: usize = ((1u32 << 31) / EVENT_BUCKET_WIDTH) as usize + 1;
+const BUCKET_TIMELINE_MIN: usize = 512;
+
+#[derive(Default)]
+struct EventBucket {
+    first: u32,
+    last: u32,
+    events: i64,
+    revenue: i64,
+    purchase: Option<usize>,
+}
+
+#[derive(Default)]
+struct BucketTimeline {
+    buckets: Vec<EventBucket>,
+    used: Vec<usize>,
+    purchases: Vec<(u32, Option<usize>)>,
+    rows: Vec<u64>,
+}
+
+impl BucketTimeline {
+    fn build(&mut self, rows: &[u64]) {
+        for index in self.used.drain(..) {
+            self.buckets[index] = EventBucket::default();
+        }
+        self.buckets.resize_with(EVENT_BUCKETS, EventBucket::default);
+        self.purchases.clear();
+        self.rows.clear();
+        for &row in rows {
+            let key = (row >> 32) as u32;
+            if key & 1 == 0 {
+                self.rows.push(row);
+                continue;
+            }
+            let time = key >> 1;
+            let index = (time / EVENT_BUCKET_WIDTH) as usize;
+            let bucket = &mut self.buckets[index];
+            if bucket.events == 0 {
+                bucket.first = time;
+                bucket.last = time;
+                self.used.push(index);
+            } else {
+                bucket.first = bucket.first.min(time);
+                bucket.last = bucket.last.max(time);
+            }
+            bucket.events += 1;
+            let price = row as u32;
+            if price != 0 {
+                bucket.revenue += i64::from(price & 0xff_ffff);
+                self.purchases.push((price, bucket.purchase));
+                bucket.purchase = Some(self.purchases.len() - 1);
+            }
+        }
+        for &index in &self.used {
+            self.rows.push(timeline_payload(self.buckets[index].first, true, index as u32));
+        }
+    }
+}
+
 struct PartitionState {
     cd: Vec<[i64; 4]>,
     counts: Vec<usize>,
@@ -1997,6 +2059,7 @@ struct PartitionState {
     rows: Vec<u64>,
     sort_scratch: Vec<u64>,
     click_window: Vec<(u32, u32)>,
+    bucket_timeline: BucketTimeline,
     user: UserColumns,
 }
 
@@ -2015,6 +2078,7 @@ impl PartitionState {
             rows: Vec::new(),
             sort_scratch: Vec::new(),
             click_window: Vec::new(),
+            bucket_timeline: BucketTimeline::default(),
             user: UserColumns::default(),
         }
     }
@@ -2088,7 +2152,7 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
-            click_meta, ends, rows, sort_scratch, click_window, user, ..
+            click_meta, ends, rows, sort_scratch, click_window, bucket_timeline, user, ..
         } = self;
         let mut flush_day = |name: &[u8], row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
             let category = top_cat(sums, touched, categories);
@@ -2101,6 +2165,13 @@ impl PartitionState {
             if group.is_empty() {
                 continue;
             }
+            let summarized = group.len() >= BUCKET_TIMELINE_MIN;
+            let group = if summarized {
+                bucket_timeline.build(group);
+                &mut bucket_timeline.rows[..]
+            } else {
+                group
+            };
             sort_person(group, sort_scratch);
             debug_assert!(person < linked_count as usize);
             let name = pname[person * P + partition];
@@ -2171,17 +2242,26 @@ impl PartitionState {
                 }
 
                 let session = session.as_mut().unwrap();
-                session.last_event = time;
-                day.events += 1;
-                if payload != 0 {
-                    let price = (payload & 0xff_ffff) as i64;
-                    let category = (payload >> 24) as usize;
-                    if catsum[category] == 0 {
-                        touched_categories.push(category as u32);
+                if summarized {
+                    let bucket = &bucket_timeline.buckets[payload as usize];
+                    session.last_event = bucket.last;
+                    day.events += bucket.events;
+                    day.revenue += bucket.revenue;
+                    session.revenue += bucket.revenue;
+                    let mut next = bucket.purchase;
+                    while let Some(index) = next {
+                        let (price, previous) = bucket_timeline.purchases[index];
+                        add_category(price, catsum, touched_categories);
+                        next = previous;
                     }
-                    catsum[category] += price;
-                    day.revenue += price;
-                    session.revenue += price;
+                } else {
+                    session.last_event = time;
+                    day.events += 1;
+                    if payload != 0 {
+                        let price = add_category(payload, catsum, touched_categories);
+                        day.revenue += price;
+                        session.revenue += price;
+                    }
                 }
             }
             if let Some(session) = session {
@@ -2194,6 +2274,17 @@ impl PartitionState {
             }
         }
     }
+}
+
+#[inline]
+fn add_category(payload: u32, sums: &mut [i64], touched: &mut Vec<u32>) -> i64 {
+    let category = (payload >> 24) as usize;
+    let price = i64::from(payload & 0xff_ffff);
+    if sums[category] == 0 {
+        touched.push(category as u32);
+    }
+    sums[category] += price;
+    price
 }
 
 fn sort_person(rows: &mut [u64], scratch: &mut Vec<u64>) {
