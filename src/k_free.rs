@@ -806,11 +806,6 @@ unsafe fn eq64(p: *const u8, c: u8) -> u64 {
 }
 
 #[inline(always)]
-fn hi32(v: __m256i, c: u8) -> u64 {
-    unsafe { (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64) << 32 }
-}
-
-#[inline(always)]
 unsafe fn ts_date(rs: *const u8, raw: usize, cache: *mut DateEnt) -> (i64, __m128i, *const u8) {
     unsafe {
         let (b, c) = (T.tsb.get_unchecked(raw), T.tsc.get_unchecked(raw));
@@ -1271,6 +1266,10 @@ unsafe fn fix_slot<B, S>(cx: &Cx<B, S>, p: *const u8, a: usize, b: usize, s: *mu
 #[derive(Clone, Copy)]
 struct EvSt {
     jo: usize,
+    r5: usize,
+    r6: usize,
+    qb: usize,
+    qb5: usize,
     x: __m256i,
     days: __m256i,
     bad2: __m256i,
@@ -1308,7 +1307,11 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         if qw != *tr.pat.get_unchecked(qi) {
             return None;
         }
-        let (c0, c1, c2, r4) = (c0 as usize, c1 as usize, c2 as usize, r4 as usize);
+        let i6 = 32 - r6;
+        let i5 = i6.wrapping_sub(r5).wrapping_sub(1);
+        let qbit = |i: u64| if i == 0 { (*pb.wrapping_add(m as usize).wrapping_sub(33) == b'"') as usize } else { ((q32 >> (i as u32 - 1)) & 1) as usize };
+        let (qb, qb5) = (qbit(i6), qbit(i5));
+        let (c0, c1, c2, r4, r5, r6) = (c0 as usize, c1 as usize, c2 as usize, r4 as usize, r5 as usize, r6 as usize);
         let rs4 = pb.wrapping_add(i4 as usize);
         let kr = &*((T.kind2.as_ptr() as *const u8).add((here((r4 * 2 + (*rs4.wrapping_add(3) & 1) as usize) as u64) as usize) << 6) as *const KindRow2);
         let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.maskv.as_ptr()));
@@ -1332,7 +1335,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let bad_k3 = _mm_and_si128(xor_lo(y3, e2, q3), ld(jd.kmask3.as_ptr()));
         let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ld(e2.wrapping_sub(16))), ld(rs4.wrapping_sub(17)));
         let bad = _mm256_or_si256(bad_i, _mm256_zextsi128_si256(_mm_or_si128(bad_k3, bad_kind)));
-        Some(EvSt { jo, x, days: _mm256_permute2x128_si256::<0x31>(y2, y3), bad2: _mm256_or_si256(bad, _mm256_zextsi128_si256(bad_k2)), bad })
+        Some(EvSt { jo, r5, r6, qb, qb5, x, days: _mm256_permute2x128_si256::<0x31>(y2, y3), bad2: _mm256_or_si256(bad, _mm256_zextsi128_si256(bad_k2)), bad })
     }
 }
 
@@ -1385,10 +1388,16 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
                 cold!();
             }
         }
-        if core::ptr::read_volatile((s as *const u8).add(PP + 7)) & 2 != 0
-            && kcall!(ev_purchase as unsafe extern "C" fn(_, _, _) -> u64, p as u64, np as u64, s as u64, 0u64).0 as u8 == 0
-        {
-            cold!();
+        if core::ptr::read_volatile((s as *const u8).add(PP + 7)) & 2 != 0 {
+            let pe = np.wrapping_sub(1);
+            let pt = pe.wrapping_sub(32);
+            let Some(pr) = price(pe.wrapping_sub(st.qb), st.r6 - 2 * st.qb) else { cold!() };
+            let i6 = 32 - st.r6;
+            let (prod, bad_p) = dec(ld(pt.wrapping_add(i6).wrapping_sub(17)), T.prod.get_unchecked(st.r5 * 2 + st.qb5));
+            if nz(bad_p) {
+                cold!();
+            }
+            *(s.byte_add(PP) as *mut u64) = prod as u64 | (pr as u64) << 32 | 2 << 56 | if pr == 0 { PP_INVALID } else { 0 };
         }
         *w = s.add(1);
         if (s.add(1) as usize) & (A - 1) == 0 {
@@ -1411,33 +1420,6 @@ unsafe fn ev_fast<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const
                 r as *const u8
             }
         }
-    }
-}
-
-#[cold]
-#[inline(never)]
-unsafe extern "C" fn ev_purchase(p: *const u8, np: *const u8, s: *mut i64) -> u64 {
-    unsafe {
-        let _ = p;
-        let pe = np.wrapping_sub(1);
-        let pt = pe.wrapping_sub(32);
-        let tw = _mm256_loadu_si256(pt as *const __m256i);
-        let q = hi32(tw, b'"') >> 32;
-        let tb = hi32(tw, b',');
-        let r6 = _lzcnt_u64(tb);
-        let r5 = _lzcnt_u64(tb.wrapping_shl(r6 as u32) << 1);
-        let i6 = 32 - r6;
-        let i5 = i6.wrapping_sub(r5).wrapping_sub(1);
-        let qb = (q.wrapping_shr(i6 as u32) & 1) as usize;
-        let qb5 = (q.wrapping_shr(i5 as u32) & 1) as usize;
-        let (r5, r6) = (r5 as usize, r6 as usize);
-        let Some(pr) = price(pe.wrapping_sub(qb), r6 - 2 * qb) else { return 0 };
-        let (prod, bad_p) = dec(ld(pt.wrapping_add(i6 as usize).wrapping_sub(17)), T.prod.get_unchecked(r5 * 2 + qb5));
-        if nz(bad_p) {
-            return 0;
-        }
-        *(s.byte_add(core::mem::offset_of!(EvBatch, pp)) as *mut u64) = prod as u64 | (pr as u64) << 32 | 2 << 56 | if pr == 0 { PP_INVALID } else { 0 };
-        1
     }
 }
 
