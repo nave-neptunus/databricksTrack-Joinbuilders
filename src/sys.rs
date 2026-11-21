@@ -16,7 +16,7 @@ pub unsafe fn pgo_flush() {
     unsafe extern "C" {
         fn __llvm_profile_write_file() -> i32;
     }
-    eprintln!("[pgo] profile flush: {}", unsafe { __llvm_profile_write_file() });
+    let _ = unsafe { __llvm_profile_write_file() };
 }
 
 #[cfg(not(feature = "pgo"))]
