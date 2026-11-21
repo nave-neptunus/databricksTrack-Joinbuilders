@@ -1,5 +1,6 @@
 // Shopping Sessions pipeline in Rust. This is the submitted pipeline (root Dockerfile).
 // Env: DATA_DIR, OUTPUT_DIR, NCPU, TIMING (stage times on stderr), FORCE_SLOW (use the fallback).
+// V2=1 selects direct-partition ingestion. EVENT_CHECK=stop or digest exits after events.
 //
 // Fast engine: input files are memory-mapped; strings are identified by a 64-bit hash plus an
 // independent 32-bit check instead of being interned. Valid event copies go straight into person
@@ -9,6 +10,7 @@
 mod nova;
 mod slow;
 mod user_parquet;
+mod v2;
 
 use ahash::AHashMap as HashMap;
 use rayon::prelude::*;
@@ -1144,18 +1146,22 @@ unsafe impl Sync for People {}
 
 impl People {
     fn new(reservation: usize) -> Self {
+        Self::with_partitions(reservation, P)
+    }
+
+    fn with_partitions(reservation: usize, partitions: usize) -> Self {
         let storage = if reservation == 0 || std::env::var_os("BLUE2_NO_PEOPLE_MAP").is_some() {
             None
         } else {
-            memmap2::MmapMut::map_anon(reservation * P * std::mem::size_of::<EvP>()).ok()
+            memmap2::MmapMut::map_anon(reservation * partitions * std::mem::size_of::<EvP>()).ok()
         };
         #[cfg(target_os = "linux")]
         if let Some(mapping) = &storage {
             let _ = mapping.advise(memmap2::Advice::HugePage);
         }
         let stride = if storage.is_some() { reservation } else { 0 };
-        let overflow = (0..P).map(|_| if stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }).collect();
-        Self { storage, stride, lengths: vec![0; P], overflow }
+        let overflow = (0..partitions).map(|_| if stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }).collect();
+        Self { storage, stride, lengths: vec![0; partitions], overflow }
     }
 
     #[inline]
@@ -1164,15 +1170,19 @@ impl People {
     }
 
     #[inline]
-    fn push(&mut self, part: usize, row: EvP) {
+    fn push(&mut self, part: usize, row: EvP) -> usize {
         let len = self.lengths[part];
         if len < self.stride {
             let base = self.storage.as_mut().unwrap().as_mut_ptr().cast::<EvP>();
             // This partition's next prefix slot is in the mapping and not yet initialized.
             unsafe { base.add(part * self.stride + len).write(row) };
             self.lengths[part] = len + 1;
+            len
         } else {
-            self.overflow[part].push(row);
+            let spill = &mut self.overflow[part];
+            let index = len + spill.len();
+            spill.push(row);
+            index
         }
     }
 
@@ -1183,6 +1193,18 @@ impl People {
             unsafe { std::slice::from_raw_parts(mapping.as_ptr().cast::<EvP>().add(part * self.stride), self.lengths[part]) }
         });
         [prefix, &self.overflow[part]]
+    }
+
+    #[inline]
+    fn get_mut(&mut self, part: usize, index: usize) -> &mut EvP {
+        let len = self.lengths[part];
+        if index < len {
+            let base = self.storage.as_mut().unwrap().as_mut_ptr().cast::<EvP>();
+            // A record location is published only after its slot is initialized.
+            unsafe { &mut *base.add(part * self.stride + index) }
+        } else {
+            &mut self.overflow[part][index - len]
+        }
     }
 
     #[inline]
@@ -1518,15 +1540,47 @@ fn unpack_ref(r: u64) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts((r & ((1u64 << 48) - 1)) as *const u8, (r >> 48) as usize) }
 }
 
+#[derive(Clone, Copy)]
+enum UserKeys {
+    Legacy,
+    Nova,
+    V2,
+}
+
+impl UserKeys {
+    #[inline]
+    fn for_user(self, uid: &[u8], seed: u64) -> Option<(u64, u32)> {
+        match self {
+            Self::Legacy => Some(hs(uid, seed)),
+            Self::Nova => nova::user_key(uid).map(|key| (key, 0)),
+            Self::V2 => Some(v2::user_key(uid, seed)),
+        }
+    }
+}
+
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
+    let seed = 0x243f_6a88_85a3_08d3;
     let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
-    if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, nova) {
-        if std::env::var_os("TIMING").is_some() {
-            eprintln!("fast engine declined; running the exact fallback");
+    let v2 = std::env::var_os("V2").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let mode = if nova { UserKeys::Nova } else { UserKeys::Legacy };
+    if std::env::var_os("FORCE_SLOW").is_none() {
+        if v2 {
+            if fast(seed, UserKeys::V2) {
+                std::process::exit(0);
+            }
+            if std::env::var_os("TIMING").is_some() {
+                eprintln!("V2 engine declined; running the previous fast path");
+            }
         }
-        slow::run();
+        if fast(seed, mode) {
+            std::process::exit(0);
+        }
     }
+    if std::env::var_os("TIMING").is_some() {
+        eprintln!("fast engine declined; running the exact fallback");
+    }
+    slow::run();
     std::process::exit(0);
 }
 
@@ -1624,7 +1678,7 @@ fn build_links(
     input: &[&[u8]],
     estimated_users: usize,
     seed: u64,
-    nova: bool,
+    mode: UserKeys,
 ) -> Option<(Tab, usize, usize, Vec<&'static [u8]>)> {
     let chunks = chunks(input, 1 << 18);
     // Physical rows give an upper bound on valid links, including a final
@@ -1659,14 +1713,9 @@ fn build_links(
                     collision.store(true, Relaxed);
                     return;
                 };
-                let (key, check) = if nova {
-                    let Some(key) = nova::user_key(s) else {
-                        collision.store(true, Relaxed);
-                        return;
-                    };
-                    (key, 0)
-                } else {
-                    hs(s, seed)
+                let Some((key, check)) = mode.for_user(s, seed) else {
+                    collision.store(true, Relaxed);
+                    return;
                 };
                 let key = if key == 0 { 1 } else { key };
                 let shard = ((key as usize) & table.mask) >> shift;
@@ -1831,7 +1880,10 @@ fn build_links(
 }
 
 /// Runs the fast engine. Returns false (having written nothing) if it cannot guarantee exactness.
-fn fast(seed: u64, nova: bool) -> bool {
+fn fast(seed: u64, mode: UserKeys) -> bool {
+    let v2 = matches!(mode, UserKeys::V2);
+    let person_bits = if v2 { v2::PERSON_BITS } else { PB };
+    let partitions = 1 << person_bits;
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or("/output".into());
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
@@ -1940,7 +1992,12 @@ fn fast(seed: u64, nova: bool) -> bool {
         ra.wait(b);
     }
     lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, nova) else {
+    let est_users = if v2 {
+        est_users.max(P * (rayon::current_num_threads() + 1))
+    } else {
+        est_users
+    };
+    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, mode) else {
         return false;
     };
     let coll = AtomicBool::new(false);
@@ -1949,8 +2006,13 @@ fn fast(seed: u64, nova: bool) -> bool {
 
     // Produce person partitions with exactly the retained, valid events.
     let ech = LazyChunks::new(&evb, 1 << 20);
-    let (linked_count, pname, paccs) = if nova {
-        let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
+    let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
+    let (linked_count, pname, paccs) = if v2 {
+        let Some(result) = v2::run_events(&ech, ra, &users, &input, &pname, &coll, seed) else {
+            return false;
+        };
+        result
+    } else if matches!(mode, UserKeys::Nova) {
         let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
             return false;
         };
@@ -2087,12 +2149,22 @@ fn fast(seed: u64, nova: bool) -> bool {
         (linked_count, pname, paccs)
     };
 
+    if let Some(check) = std::env::var_os("EVENT_CHECK") {
+        if check == "digest" {
+            event_digest(&paccs, &pname, partitions, seed);
+            return true;
+        }
+        if check == "stop" {
+            return true;
+        }
+    }
+
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
     let cch = LazyChunks::new(&ckb, 1 << 20);
     let caccs: Vec<Vec<Vec<Click>>> = pt_ordered(
         cch.len(),
-        || (0..P).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
+        || (0..partitions).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
         |mut acc, ci| {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
@@ -2103,7 +2175,7 @@ fn fast(seed: u64, nova: bool) -> bool {
                     // A user id not in the table has no valid event, so no session to credit.
                     let Some(person) = users.find(key, check, &coll) else { continue };
                     click.person = person;
-                    acc[person as usize & (P - 1)].push(click);
+                    acc[person as usize & (partitions - 1)].push(click);
                 }
             };
             mask_rows::<4>(chunk, |_, [cid, user, cmp, ts]| {
@@ -2120,13 +2192,7 @@ fn fast(seed: u64, nova: bool) -> bool {
                     coll.store(true, Relaxed);
                     return;
                 };
-                let (key, check) = if nova {
-                    // A supported link or event user always has a short key.
-                    let Some(key) = nova::user_key(user) else { return };
-                    (key, 0)
-                } else {
-                    hs(user, seed)
-                };
+                let Some((key, check)) = mode.for_user(user, seed) else { return };
                 users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
                 batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
@@ -2170,8 +2236,8 @@ fn fast(seed: u64, nova: bool) -> bool {
     ]));
     // Schedule large partitions first.
     let ncs = ncamp + 1;
-    let mut order = Vec::with_capacity(P);
-    for partition in 0..P {
+    let mut order = Vec::with_capacity(partitions);
+    for partition in 0..partitions {
         let events: usize = paccs.iter().map(|fold| fold.len(partition)).sum();
         let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
         order.push((std::cmp::Reverse(events + clicks), partition));
@@ -2187,8 +2253,8 @@ fn fast(seed: u64, nova: bool) -> bool {
         let user = user_parquet::UserParquet::new(path, user_schema.clone());
         let mut state = PartitionState::new(ncs, ndays, cat_names.len(), user);
         while let Some(&(_, partition)) = order.get(next.fetch_add(1, Relaxed)) {
-            state.group(partition, linked_count, &paccs, &caccs);
-            state.aggregate(partition, &pname, &cat_names, w0, day0, ndays, ncamp);
+            state.group(partition, person_bits, linked_count, &paccs, &caccs);
+            state.aggregate(partition, partitions, &pname, &cat_names, w0, day0, ndays, ncamp);
         }
         state.user.close();
         (state.user_rows, state.cd)
@@ -2246,6 +2312,27 @@ fn fast(seed: u64, nova: bool) -> bool {
     camp_job();
     lap("parquet written");
     true
+}
+
+/// Compare the normalized event multiset across engines with different dense IDs.
+fn event_digest(folds: &[People], names: &[&[u8]], partitions: usize, seed: u64) {
+    let digests = folds.par_iter().map(|fold| {
+        let mut digest = [0u64; 3];
+        for part in 0..partitions {
+            for event in fold.records(part).into_iter().flatten() {
+                if let Some((person, payload)) = event.session_input() {
+                    let (name, check) = hs(names[person as usize], seed);
+                    let a = mum(name ^ K3, payload ^ K4);
+                    let b = mum(name ^ K1 ^ u64::from(check), payload ^ K2);
+                    digest[0] += 1;
+                    digest[1] = digest[1].wrapping_add(a);
+                    digest[2] = digest[2].wrapping_add(b);
+                }
+            }
+        }
+        digest
+    }).reduce(|| [0; 3], |a, b| std::array::from_fn(|i| a[i].wrapping_add(b[i])));
+    eprintln!("event_digest count={} {:016x} {:016x}", digests[0], digests[1], digests[2]);
 }
 
 /// Like rayon's fold, but exactly one accumulator per worker thread (fold makes one per split,
@@ -2309,6 +2396,7 @@ impl PartitionState {
     fn group(
         &mut self,
         partition: usize,
+        person_bits: u32,
         people: u32,
         event_folds: &[People],
         click_folds: &[Vec<Vec<Click>>],
@@ -2328,12 +2416,12 @@ impl PartitionState {
         // scatter), reloading each atomic timestamp on both passes.
         gather.clear();
         for (person, payload) in event_rows() {
-            let person = (person >> PB) as u32;
+            let person = (person >> person_bits) as u32;
             gather.push((person, payload));
             event_ends[person as usize] += 1;
         }
         for click in click_rows() {
-            let person = (click.person >> PB) as usize;
+            let person = (click.person >> person_bits) as usize;
             if event_ends[person] != 0 {
                 click_ends[person] += 1;
             }
@@ -2342,7 +2430,7 @@ impl PartitionState {
         // The prefix sums then become exclusive ends as records are placed.
         clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0 });
         for &click in click_rows() {
-            let person = (click.person >> PB) as usize;
+            let person = (click.person >> person_bits) as usize;
             if event_ends[person] != 0 {
                 let next = &mut click_ends[person];
                 clicks[*next] = click;
@@ -2361,6 +2449,7 @@ impl PartitionState {
     fn aggregate(
         &mut self,
         partition: usize,
+        partitions: usize,
         pname: &[&[u8]],
         categories: &[&[u8]],
         origin: i64,
@@ -2382,7 +2471,7 @@ impl PartitionState {
                 continue;
             }
             sort_timeline(clicks, click_scratch, |click| click.ts);
-            let name = pname[person * P + partition];
+            let name = pname[person * partitions + partition];
             let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
                 let category = top_cat(sums, touched, categories);
                 user.append(name, row, categories.get(category as usize).copied());

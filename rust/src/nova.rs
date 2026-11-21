@@ -108,7 +108,7 @@ fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec
 
 /// A producer owns disjoint blocks within demand-paged slabs. Stream order is
 /// described by its block IDs. No initialized record moves when a stream grows.
-struct Streams<T, const N: usize> {
+pub(super) struct Streams<T, const N: usize> {
     slabs: Vec<memmap2::MmapMut>,
     blocks: [Vec<u32>; N],
     tails: [*mut T; N],
@@ -125,7 +125,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     const ROWS: usize = BLOCK_BYTES / size_of::<T>();
     const SLAB_BLOCKS: usize = SLAB_BYTES / BLOCK_BYTES;
 
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             slabs: Vec::new(),
             blocks: std::array::from_fn(|_| Vec::new()),
@@ -155,7 +155,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     }
 
     #[inline]
-    fn push(&mut self, stream: usize, row: T) {
+    pub(super) fn push(&mut self, stream: usize, row: T) {
         if self.used[stream] == Self::ROWS {
             self.extend(stream);
         }
@@ -166,7 +166,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     }
 
     #[inline]
-    fn get(&self, stream: usize, index: usize) -> &T {
+    pub(super) fn get(&self, stream: usize, index: usize) -> &T {
         let id = self.blocks[stream][index / Self::ROWS] as usize;
         let slab = &self.slabs[id / Self::SLAB_BLOCKS];
         let offset = id % Self::SLAB_BLOCKS * BLOCK_BYTES;
@@ -180,7 +180,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         }
     }
 
-    fn records(&self, stream: usize) -> impl Iterator<Item = &T> {
+    pub(super) fn records(&self, stream: usize) -> impl Iterator<Item = &T> {
         let block_ids = &self.blocks[stream];
         block_ids.iter().enumerate().flat_map(move |(i, &id)| {
             let id = id as usize;
@@ -197,7 +197,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         })
     }
 
-    fn len(&self, stream: usize) -> usize {
+    pub(super) fn len(&self, stream: usize) -> usize {
         let blocks = self.blocks[stream].len();
         if blocks == 0 {
             0
@@ -237,7 +237,7 @@ impl Pending {
     };
 }
 
-trait Fields<'a> {
+pub(super) trait Fields<'a> {
     fn field<const I: usize>(&self) -> &'a [u8];
 
     #[inline]
@@ -278,7 +278,7 @@ impl<'a> Fields<'a> for RowLayout<'a> {
     }
 }
 
-trait EventSink<'a> {
+pub(super) trait EventSink<'a> {
     fn row(&mut self, source: &'a [u8], fields: impl Fields<'a>);
 }
 
@@ -377,7 +377,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
 }
 
 #[inline]
-fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
+pub(super) fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if std::is_x86_feature_detected!("bmi2") {
         // AVX2 is required by this compilation and BMI2 was checked above.
@@ -422,7 +422,7 @@ fn clock_seconds(s: &[u8]) -> Option<i64> {
 }
 
 #[derive(Default)]
-struct Dates([([u8; 10], i64); 32]);
+pub(super) struct Dates([([u8; 10], i64); 32]);
 
 impl Dates {
     #[inline]
@@ -443,7 +443,7 @@ impl Dates {
     }
 
     #[inline]
-    fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
+    pub(super) fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
         if s.len() != 20 || s[19] != b'Z' {
             return None;
         }
@@ -451,7 +451,7 @@ impl Dates {
     }
 
     #[inline]
-    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+    pub(super) fn parse(&mut self, s: &[u8]) -> Option<i64> {
         if s.len() == 20 && s[19] == b'Z' {
             return self.utc_seconds(s).map(|t| t * 1000);
         }
