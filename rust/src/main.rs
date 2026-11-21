@@ -1218,15 +1218,6 @@ fn prefetch_read(ptr: *const u8) {
 
 impl PeopleWriter<'_> {
     #[inline]
-    fn prefetch(&self, person: u32) {
-        let part = person as usize & (P - 1);
-        let len = self.lengths[part];
-        if len < self.stride {
-            prefetch_read(self.base.wrapping_add(part * self.stride + len).cast());
-        }
-    }
-
-    #[inline]
     fn push(&mut self, person: u32, ts: u32, price: u32) -> Option<u32> {
         let part = person as usize & (P - 1);
         let len = self.lengths[part];
@@ -1243,19 +1234,6 @@ impl PeopleWriter<'_> {
             index
         };
         u32::try_from(index).ok()
-    }
-
-    /// Mark a previously scattered row as a loser without another traversal.
-    #[inline]
-    fn invalidate(&self, part: usize, index: usize) {
-        let ts: &AtomicU32 = if index < self.stride {
-            unsafe { &(*self.base.add(part * self.stride + index)).ts }
-        } else {
-            &self.overflow[part][index - self.stride].ts
-        };
-        // `EvP.ts` is atomic because the shard owns the row and sessions may
-        // read it concurrently after dedup.
-        ts.store(TOMBSTONE, Relaxed);
     }
 }
 
