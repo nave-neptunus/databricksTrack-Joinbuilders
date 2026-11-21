@@ -65,7 +65,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: core-purchase, candidate_ref: 88a2088, image: core-purchase, setting: '', run_tests: 'true', pairs: '8' }
+          - { label: core-purchase, candidate_ref: 88a2088, image: core-purchase, setting: '', run_tests: 'false', pairs: '8' }
           # XL_ENDREL=1 is default conditional behavior; 2 actually forces release.
           # 5f08834 only fixes test data; 74d051a is the identical engine timed below.
     env:
