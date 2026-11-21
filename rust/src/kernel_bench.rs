@@ -114,7 +114,7 @@ fn ingest(dates: &mut Dates, field: &[u8]) -> i64 {
     if let Some(seconds) = dates.utc_seconds(field) {
         seconds
     } else {
-        crate::parse_ts(field).unwrap_or(i64::MAX).div_euclid(1000)
+        crate::parse_ts(field).map_or(i64::MAX, |time| time.div_euclid(1000))
     }
 }
 
@@ -271,6 +271,46 @@ pub(super) fn run(path: &Path) {
         scan_event_rows(input, &mut sink);
         black_box(output.as_slice());
         output.len()
+    });
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use crate::nova::scan_event_rows_blocks;
+
+        measure("block64_boundaries", runs, rows, bytes, || {
+            let mut sink = Boundaries::default();
+            scan_event_rows_blocks(input, &mut sink);
+            (sink.rows, sink.lengths)
+        });
+
+        let mut alternate = Vec::with_capacity(valid);
+        measure("block64_decode_store", runs, rows, bytes, || {
+            alternate.clear();
+            let mut sink = Decode {
+                base,
+                dates: Dates::default(),
+                records: &mut alternate,
+            };
+            scan_event_rows_blocks(input, &mut sink);
+            black_box(alternate.as_slice());
+            alternate.len()
+        });
+        assert!(
+            output == alternate,
+            "block scanner changed the decoded records"
+        );
+        println!("KERNEL block64 compact records MATCH");
+    }
+    let mut stores = Vec::with_capacity(valid);
+    measure("record_store_48b", runs, rows, bytes, || {
+        stores.clear();
+        for ts in 0..valid {
+            stores.push(Compact {
+                ts: ts as i64,
+                ..Compact::default()
+            });
+        }
+        black_box(stores.as_slice());
+        stores.len()
     });
     let mut copy = Vec::with_capacity(valid);
     measure("record_copy_48b", runs, rows, bytes, || {

@@ -386,6 +386,110 @@ pub(super) fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>
     event_rows(bytes, |line, fields| sink.row(line, fields));
 }
 
+/// Experimental block scanner for the standalone kernel measurement.
+/// Keep the delimiter masks for an unfinished row across block boundaries.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub(super) fn scan_event_rows_blocks<'a>(input: &'a [u8], sink: &mut impl EventSink<'a>) {
+    if !std::is_x86_feature_detected!("bmi2") {
+        return scan_event_rows(input, sink);
+    }
+    // The x86-64-v3 build supplies AVX2, and BMI2 was checked above.
+    unsafe { event_blocks(input, sink) };
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2,bmi2")]
+unsafe fn event_blocks<'a>(input: &'a [u8], sink: &mut impl EventSink<'a>) {
+    use std::arch::x86_64::*;
+
+    let mut start = 0;
+    let mut comma_carry = 0u128;
+    let mut quote_carry = 0u128;
+    for (block_id, block) in input.chunks_exact(64).enumerate() {
+        let base = block_id * 64;
+        // This iterator yields complete blocks, so both vectors are in bounds.
+        let (a, b) = unsafe {
+            let ptr = block.as_ptr();
+            (_mm256_loadu_si256(ptr.cast()), _mm256_loadu_si256(ptr.add(32).cast()))
+        };
+        let mask = |c| {
+            let value = _mm256_set1_epi8(c);
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, value)) as u32;
+            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, value)) as u32;
+            u64::from(lo) | (u64::from(hi) << 32)
+        };
+        let commas = mask(b',' as i8);
+        let quotes = mask(b'"' as i8);
+        let mut newlines = mask(b'\n' as i8);
+        let mut cursor = 0;
+        while newlines != 0 {
+            let bit = newlines.trailing_zeros() as usize;
+            let end = base + bit;
+            let line = &input[start..end];
+            if line.len() >= 128 {
+                if let Some(fields) = crate::row_fields::<7>(line) {
+                    sink.row(line, fields);
+                }
+            } else {
+                let offset = base + cursor - start;
+                let prefix = (1u64 << bit) - 1;
+                let c = comma_carry | (u128::from((commas & prefix) >> cursor) << offset);
+                let q = quote_carry | (u128::from((quotes & prefix) >> cursor) << offset);
+                if c.count_ones() == 6 {
+                    let wrapped = if q == 0 {
+                        Some(0)
+                    } else if c & 1 != 0 {
+                        if let Some(fields) = crate::row_fields::<7>(line) {
+                            sink.row(line, fields);
+                        }
+                        None
+                    } else {
+                        let opens = (c << 1) | 1;
+                        let closes = (c | (1u128 << line.len())) >> 1;
+                        let gather = |positions: u128| {
+                            let lo = positions as u64;
+                            let hi = (positions >> 64) as u64;
+                            _pext_u64(q as u64, lo)
+                                | (_pext_u64((q >> 64) as u64, hi) << lo.count_ones())
+                        };
+                        let wrapped = gather(opens);
+                        (q & !(opens | closes) == 0
+                            && wrapped == gather(closes)
+                            && q.count_ones() == wrapped.count_ones() * 2)
+                            .then_some(wrapped as u8)
+                    };
+                    if let Some(wrapped) = wrapped {
+                        let [mut lo, mut hi] = [c as u64, (c >> 64) as u64];
+                        let mut cuts = [0u8; 8];
+                        let split = 1 + lo.count_ones() as usize;
+                        for cut in &mut cuts[1..split] {
+                            *cut = lo.trailing_zeros() as u8 + 1;
+                            lo &= lo - 1;
+                        }
+                        for cut in &mut cuts[split..7] {
+                            *cut = hi.trailing_zeros() as u8 + 65;
+                            hi &= hi - 1;
+                        }
+                        cuts[7] = line.len() as u8 + 1;
+                        sink.row(line, RowLayout { line, cuts, wrapped });
+                    }
+                }
+            }
+            start = end + 1;
+            cursor = bit + 1;
+            comma_carry = 0;
+            quote_carry = 0;
+            newlines &= newlines - 1;
+        }
+        let offset = base + cursor - start;
+        if cursor < 64 && offset < 128 {
+            comma_carry |= u128::from(commas >> cursor) << offset;
+            quote_carry |= u128::from(quotes >> cursor) << offset;
+        }
+    }
+    event_rows(&input[start..], |line, fields| sink.row(line, fields));
+}
+
 #[inline]
 fn swar_digits(word: u64) -> bool {
     const HIGH: u64 = 0xf0f0_f0f0_f0f0_f0f0;
