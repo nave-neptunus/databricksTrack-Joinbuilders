@@ -309,7 +309,11 @@ impl Drop for PeopleWriter<'_> {
         // All streaming destinations are disjoint. Fence before the borrow
         // ends so dedup can read or tombstone these rows on any thread.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
-        std::arch::x86_64::_mm_sfence();
+        #[allow(unused_unsafe)]
+        // Older compilers require an unsafe call. AVX implies SSE.
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
     }
 }
 
