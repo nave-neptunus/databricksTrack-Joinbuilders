@@ -3,7 +3,7 @@ use crate::sys::*;
 use crate::*;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Uf {
     map: U64Map,
@@ -1850,9 +1850,13 @@ pub fn stage2(g: &mut G) {
     lap("st2b");
     odd_events(g);
     DEFER_RAW.store(false, Ordering::SeqCst);
-    for (p, n) in std::mem::take(&mut *DEFERRED.lock().unwrap()) {
-        let grp = unsafe { std::slice::from_raw_parts_mut(p as *mut [u64; 2], n) };
-        grp.sort_by(|x, y| crate::events::cid_cmp(g, y[1], x[1]).then_with(|| x[0].cmp(&y[0])));
+    let deferred = std::mem::take(&mut *DEFERRED.lock().unwrap());
+    if deferred.len() < 2 {
+        for (p, n) in deferred { unsafe { std::slice::from_raw_parts_mut(p as *mut [u64; 2], n) }.sort_by(|x, y| crate::events::cid_cmp(g, y[1], x[1]).then_with(|| x[0].cmp(&y[0]))); }
+    } else {
+        let next = AtomicUsize::new(0);
+        let ptr = deferred.as_ptr() as usize;
+        run_par(g.nt, |_| while { let i = next.fetch_add(1, Ordering::Relaxed); if i >= deferred.len() { false } else { let (p, n) = unsafe { *(ptr as *const (usize, usize)).add(i) }; unsafe { std::slice::from_raw_parts_mut(p as *mut [u64; 2], n) }.sort_by(|x, y| crate::events::cid_cmp(g, y[1], x[1]).then_with(|| x[0].cmp(&y[0]))); true } } {});
     }
     let cx;
     if g.ccap != 0 && g.cpart {
