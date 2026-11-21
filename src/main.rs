@@ -447,14 +447,16 @@ fn main() {
     #[cfg(feature = "tl")]
     let rel0 = sys::tl::now();
     let endrel = std::env::var("XL_ENDREL").ok();
-    let many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
-    if ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
+    {
         let nt = g.nt;
-        let mut r = [[(0usize, 0usize); 12]; 16];
+        let (ev_base, ev_len) = g.ev_arena.span();
+        let (us_base, us_len) = g.us_arena.span();
+        let mut r = [[(0usize, 0usize); 14]; 16];
         for tid in 0..nt {
             let t = g.t(tid);
             let c = &t.core;
             let v = |p: *const u8, n: usize| (p as usize, n);
+            let part = |p: *const u8, n: usize| v(p.wrapping_add(n * tid / nt), n * (tid + 1) / nt - n * tid / nt);
             r[tid] = [
                 v(c.names.as_ptr(), c.names.len()),
                 v(c.names_off.as_ptr() as *const u8, c.names_off.len() * 4),
@@ -465,8 +467,10 @@ fn main() {
                 v(c.rev.as_ptr() as *const u8, c.rev.len() * 4),
                 v(c.cat.as_ptr(), c.cat.len()),
                 v(t.edge.as_ptr() as *const u8, t.edge.len() * 16),
-                if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 16 * tid / nt), g.ncsr * 16 * (tid + 1) / nt - g.ncsr * 16 * tid / nt) },
+                if g.csr.is_null() { (0, 0) } else { part(g.csr as *const u8, g.ncsr * 16) },
                 if endrel.as_deref() == Some("2") { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
+                part(ev_base, ev_len),
+                part(us_base, us_len),
                 (0, 0),
             ];
         }
