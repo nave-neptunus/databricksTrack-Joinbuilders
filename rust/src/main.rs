@@ -1804,6 +1804,9 @@ struct PartitionState {
     click_people_times: Vec<(u32, u32)>,
     click_meta: Vec<ClickMeta>,
     ends: Vec<usize>,
+    bucket_cursors: Vec<usize>,
+    bucket_people: Vec<u32>,
+    bucket_rows: Vec<u64>,
     rows: Vec<u64>,
     sort_scratch: Vec<u64>,
     click_window: Vec<(u32, u32)>,
@@ -1825,6 +1828,9 @@ impl PartitionState {
             click_people_times: Vec::new(),
             click_meta: Vec::new(),
             ends: Vec::new(),
+            bucket_cursors: vec![0; TIME_BUCKETS],
+            bucket_people: Vec::new(),
+            bucket_rows: Vec::new(),
             rows: Vec::new(),
             sort_scratch: Vec::new(),
             click_window: Vec::new(),
@@ -1846,13 +1852,16 @@ impl PartitionState {
         self.click_meta.clear();
         self.ends.clear();
         self.ends.resize(linked_count as usize, 0);
+        self.bucket_cursors.fill(0);
 
         // The linked namespace is dense in each partition. This one-time
         // exact-name interning for unlinked people is the bridge until the
         // all-UID table supplies their dense IDs at ingest.
         for fold in events {
             for event in &fold[partition] {
-                if let Some((token, _)) = event.session_input() {
+                if let Some((token, payload)) = event.session_input() {
+                    let ts = (payload >> 32) as u32 + LOOK as u32;
+                    self.bucket_cursors[(ts >> TIME_BUCKET_SHIFT) as usize] += 1;
                     let person = dense_person(token, linked_count, &mut self.unlinked, &mut self.names)
                         .expect("partition row bound checked");
                     self.event_people.push(person);
@@ -1873,6 +1882,7 @@ impl PartitionState {
                     continue;
                 };
                 if self.ends[person as usize] != 0 {
+                    self.bucket_cursors[(click.ts >> TIME_BUCKET_SHIFT) as usize] += 1;
                     self.click_people_times.push((person, click.ts));
                     self.click_meta.push(ClickMeta { id: click.id, campaign: click.campaign });
                 }
@@ -1885,10 +1895,17 @@ impl PartitionState {
         for count in &mut self.ends {
             total += std::mem::replace(count, total);
         }
-        self.rows.resize(total, 0);
-        let mut emit = |person: u32, payload: u64| {
-            let next = &mut self.ends[person as usize];
-            self.rows[*next] = payload;
+        self.bucket_rows.resize(total, 0);
+        self.bucket_people.resize(total, 0);
+        let mut offset = 0;
+        for count in &mut self.bucket_cursors {
+            offset += std::mem::replace(count, offset);
+        }
+        debug_assert_eq!(offset, total);
+        let mut emit = |person: u32, ts: u32, event: bool, payload: u32| {
+            let next = &mut self.bucket_cursors[(ts >> TIME_BUCKET_SHIFT) as usize];
+            self.bucket_people[*next] = person;
+            self.bucket_rows[*next] = timeline_payload(ts, event, payload);
             *next += 1;
         };
         let mut people = self.event_people.iter().copied();
@@ -1896,12 +1913,21 @@ impl PartitionState {
             for event in &fold[partition] {
                 if let Some((_, payload)) = event.session_input() {
                     let ts = (payload >> 32) as u32 + LOOK as u32;
-                    emit(people.next().unwrap(), timeline_payload(ts, true, payload as u32));
+                    emit(people.next().unwrap(), ts, true, payload as u32);
                 }
             }
         }
         for (idx, &(person, ts)) in self.click_people_times.iter().enumerate() {
-            emit(person, timeline_payload(ts, false, idx as u32));
+            emit(person, ts, false, idx as u32);
+        }
+
+        // The stable person scatter preserves coarse time order inside each
+        // person. The exact fine ordering is finished before attribution.
+        self.rows.resize(total, 0);
+        for (&person, &payload) in self.bucket_people.iter().zip(&self.bucket_rows) {
+            let next = &mut self.ends[person as usize];
+            self.rows[*next] = payload;
+            *next += 1;
         }
     }
 
@@ -2030,18 +2056,52 @@ impl PartitionState {
     }
 }
 
+const TIME_BUCKET_SHIFT: u32 = 20;
+const TIME_BUCKETS: usize = 1 << (31 - TIME_BUCKET_SHIFT);
+const TIMELINE_BUCKET_SHIFT: u32 = 32 + 1 + TIME_BUCKET_SHIFT;
+
 fn sort_person(rows: &mut [u64], scratch: &mut Vec<u64>) {
-    if rows.len() <= 4096 || rows.len() > u32::MAX as usize {
+    if rows.len() <= 64 {
+        insertion_sort(rows);
+        return;
+    }
+    // Large people can have dense time buckets. Refine each bucket with
+    // bounded radix work to avoid a quadratic insertion pass on those runs.
+    for bucket in rows.chunk_by_mut(|a, b| {
+        *a >> TIMELINE_BUCKET_SHIFT == *b >> TIMELINE_BUCKET_SHIFT
+    }) {
+        if bucket.len() <= 64 {
+            insertion_sort(bucket);
+        } else {
+            sort_dense_bucket(bucket, scratch);
+        }
+    }
+}
+
+fn insertion_sort(rows: &mut [u64]) {
+    for i in 1..rows.len() {
+        let value = rows[i];
+        let mut pos = i;
+        while pos > 0 && rows[pos - 1] > value {
+            rows[pos] = rows[pos - 1];
+            pos -= 1;
+        }
+        rows[pos] = value;
+    }
+}
+
+fn sort_dense_bucket(rows: &mut [u64], scratch: &mut Vec<u64>) {
+    if rows.len() > u32::MAX as usize {
         rows.sort_unstable();
         return;
     }
-    // Only time/type needs sorting. Equal keys of the same type are
-    // interchangeable here, including tied clicks handled by their IDs.
-    const STEP: u32 = 11;
+    // The bucket already supplies the high timestamp bits. Sort only the
+    // lower timestamp bits and the click/event tie bit.
+    const STEP: u32 = 7;
     const BUCKETS: usize = 1 << STEP;
     scratch.resize(rows.len(), 0);
     let scatter = |input: &[u64], output: &mut [u64], shift: u32| {
-        let buckets = 1 << (64 - shift).min(STEP);
+        let buckets = 1 << STEP;
         let mask = buckets - 1;
         let mut counts = [0u32; BUCKETS];
         let digit = |key: u64| (key >> shift) as usize & mask;
@@ -2060,8 +2120,8 @@ fn sort_person(rows: &mut [u64], scratch: &mut Vec<u64>) {
         }
     };
     scatter(rows, scratch, 32);
-    scatter(scratch, rows, 43);
-    scatter(rows, scratch, 54);
+    scatter(scratch, rows, 39);
+    scatter(rows, scratch, 46);
     rows.copy_from_slice(scratch);
 }
 
