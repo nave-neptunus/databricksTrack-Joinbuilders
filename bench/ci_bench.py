@@ -46,9 +46,14 @@ def build(commit, tag):
 
 def clean(path):
     if path.exists():
-        shutil.rmtree(path)
+        subprocess.run(["sudo", "rm", "-rf", str(path)], check=True)
     path.mkdir(parents=True)
     path.chmod(0o777)
+
+
+def remove(path):
+    """Remove a known child of the CI-created work directory (may be UID 1000-owned)."""
+    subprocess.run(["sudo", "rm", "-rf", str(path)], check=True)
 
 
 def drop_caches():
@@ -123,8 +128,8 @@ def run(tag, name, *, cold=False, extra_env=None, preserve=False):
     metrics = {"container_seconds": container_seconds, "engine_ms": engine_ms,
                "peak_rss_kb": peak_rss_kb, "minflt": max_minflt}
     if not preserve:
-        shutil.rmtree(out)
-        shutil.rmtree(scratch)
+        remove(out)
+        remove(scratch)
     return out, metrics
 
 
@@ -152,8 +157,8 @@ def fixture_gate(tag, label, env):
         if result.returncode:
             raise SystemExit(f"fixture {label}/{fixture.name} failed: {result.stderr[-2000:]}")
         compare(out, fixture / "expected", f"fixture {label}/{fixture.name}")
-        shutil.rmtree(out)
-        shutil.rmtree(scratch)
+        remove(out)
+        remove(scratch)
 
 
 base_sha, cand_sha = ref(BASE), ref(CAND)
@@ -169,8 +174,8 @@ fixture_gate("g7-bench-candidate", "candidate", env)
 base_out, _ = run("g7-bench-baseline", "big20-reference", preserve=True)
 cand_out, _ = run("g7-bench-candidate", "big20-candidate-gate", extra_env=env, preserve=True)
 compare(cand_out, base_out, "big20 candidate vs baseline")
-shutil.rmtree(base_out)
-shutil.rmtree(cand_out)
+remove(base_out)
+remove(cand_out)
 _, baseline_profile = run("g7-bench-baseline", "baseline-profile", cold=True)
 print("BASELINE_METRICS " + json.dumps(baseline_profile, sort_keys=True), flush=True)
 
