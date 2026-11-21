@@ -600,24 +600,46 @@ fn clock_seconds(s: &[u8]) -> Option<i64> {
         .then_some(i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(seconds))
 }
 
+/// The hot ISO cache stores the complete (validated) calendar date in one
+/// word.  A `u64` compare avoids materializing/copying a ten-byte array on
+/// every event and keeps the cache entry to the two values actually needed by
+/// the decoder.  The cold path remains `parse_ts`, which is also the exact
+/// fallback for all non-ISO spellings.
+#[derive(Clone, Copy, Default)]
+struct Midnight {
+    date: u64,
+    seconds: i64,
+}
+
 #[derive(Default)]
-pub(super) struct Dates([([u8; 10], i64); 32]);
+pub(super) struct Dates([Midnight; 32]);
 
 impl Dates {
     #[inline]
     fn with_offset(&mut self, s: &[u8], adjustment: i64) -> Option<i64> {
-        if s[4] != b'-' || s[10] != b'T' {
+        if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' {
             return None;
         }
         let time = clock_seconds(s)?;
-        let date: [u8; 10] = s[..10].try_into().unwrap();
-        let index = (date[8] as usize * 10 + date[9] as usize) & 31;
+        // Keep all eight date digits, while the punctuation was checked
+        // above.  This is injective over every valid YYYY-MM-DD spelling.
+        let prefix = crate::rd8(s, 0);
+        let date = (prefix & 0x00ff_ff00_ffff_ffff)
+            | (u64::from(s[8]) << 32)
+            | (u64::from(s[9]) << 56);
+        let index = (s[8] as usize * 10 + s[9] as usize) & 31;
         let entry = &mut self.0[index];
-        if entry.0 == date {
-            return Some(entry.1 + time - adjustment);
+        if entry.date == date {
+            return Some(entry.seconds + time - adjustment);
         }
         let seconds = crate::parse_ts(s)? / 1000;
-        *entry = (date, seconds + adjustment - time);
+        *entry = Midnight {
+            date,
+            // Local midnight deliberately excludes the parsed offset.  That
+            // makes a cached date correct even when otherwise-valid rows for
+            // it use different numeric offsets.
+            seconds: seconds + adjustment - time,
+        };
         Some(seconds)
     }
 
@@ -1107,6 +1129,12 @@ mod tests {
         let mut cache = Dates::default();
         for value in [
             &b"2028-02-29T23:59:59Z"[..],
+            // Reuse one packed calendar slot across Z and both offset forms.
+            // A malformed separator after the valid cache fill must not hit.
+            b"2028-02-29T00:00:00+02:00",
+            b"2028-02-29T00:00:00-07:30",
+            b"2028x02-29T00:00:00Z",
+            b"2028-02x29T00:00:00Z",
             b"2027-02-29T23:59:59Z",
             b"2028-02-29T24:00:00Z",
             b"2028-02-29T18:14:09-05:45",
