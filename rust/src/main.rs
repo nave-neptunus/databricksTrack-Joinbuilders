@@ -2245,7 +2245,8 @@ fn fast(seed: u64, nova: bool) -> bool {
     };
     camp_job();
     lap("parquet written");
-    true
+    // The user parts and campaign table have flushed and closed their writers.
+    std::process::exit(0);
 }
 
 /// Like rayon's fold, but exactly one accumulator per worker thread (fold makes one per split,
