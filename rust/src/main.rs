@@ -6,7 +6,10 @@
 // partitions. A separate, compact event-ID stream identifies the copies to tombstone before
 // sessions. Any detected hash collision (same 64-bit key, different check) or unsupported input
 // sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
+mod kernel_bench;
 mod nova;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod scan64;
 mod slow;
 mod user_parquet;
 
@@ -1519,6 +1522,10 @@ fn unpack_ref(r: u64) -> &'static [u8] {
 }
 
 fn main() {
+    if let Some(path) = std::env::var_os("EVENT_KERNEL") {
+        kernel_bench::run(path.as_ref());
+        return;
+    }
     unsafe { T0 = Some(Instant::now()) };
     let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
     if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, nova) {

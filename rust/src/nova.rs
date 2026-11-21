@@ -15,7 +15,7 @@ const INVALID: u32 = u32::MAX;
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
 #[inline]
-fn short_key(id: &[u8], prefix: u8) -> Option<u64> {
+pub(super) fn short_key(id: &[u8], prefix: u8) -> Option<u64> {
     let (&first, tail) = id.split_first()?;
     if first | 32 != prefix {
         return None;
@@ -237,7 +237,7 @@ impl Pending {
     };
 }
 
-trait Fields<'a> {
+pub(super) trait Fields<'a> {
     fn field<const I: usize>(&self) -> &'a [u8];
 
     #[inline]
@@ -278,7 +278,7 @@ impl<'a> Fields<'a> for RowLayout<'a> {
     }
 }
 
-trait EventSink<'a> {
+pub(super) trait EventSink<'a> {
     fn row(&mut self, source: &'a [u8], fields: impl Fields<'a>);
 }
 
@@ -377,7 +377,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
 }
 
 #[inline]
-fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
+pub(super) fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if std::is_x86_feature_detected!("bmi2") {
         // AVX2 is required by this compilation and BMI2 was checked above.
@@ -422,7 +422,7 @@ fn clock_seconds(s: &[u8]) -> Option<i64> {
 }
 
 #[derive(Default)]
-struct Dates([([u8; 10], i64); 32]);
+pub(super) struct Dates([([u8; 10], i64); 32]);
 
 impl Dates {
     #[inline]
@@ -443,7 +443,7 @@ impl Dates {
     }
 
     #[inline]
-    fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
+    pub(super) fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
         if s.len() != 20 || s[19] != b'Z' {
             return None;
         }
@@ -451,7 +451,7 @@ impl Dates {
     }
 
     #[inline]
-    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+    pub(super) fn parse(&mut self, s: &[u8]) -> Option<i64> {
         if s.len() == 20 && s[19] == b'Z' {
             return self.utc_seconds(s).map(|t| t * 1000);
         }
