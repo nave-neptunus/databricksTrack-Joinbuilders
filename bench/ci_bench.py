@@ -101,7 +101,8 @@ def timing(stderr):
     stages = {}
     if stage_match:
         for key, value in re.findall(r"([^\s=]+)=([0-9.]+)", stage_match.group(1)):
-            stages[key] = float(value)
+            if key != "peak_rss_kb":
+                stages[key] = float(value)
     return float(exit_match.group(1)), int(rss_match.group(1)) if rss_match else None, stages
 
 
