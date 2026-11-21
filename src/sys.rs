@@ -377,6 +377,7 @@ pub fn pool_size() -> usize {
     POOL_N.load(Ordering::SeqCst)
 }
 
+#[cfg_attr(feature = "pgo", inline(never))]
 pub fn run_par<F: Fn(usize) + Sync>(nt: usize, f: F) {
     WORKERS.store(true, Ordering::SeqCst);
     let n = POOL_N.load(Ordering::SeqCst);

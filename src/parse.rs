@@ -639,7 +639,8 @@ struct EvP {
     lines: *const u8,
 }
 
-#[inline(always)]
+#[cfg_attr(feature = "pgo", inline(never))]
+#[cfg_attr(not(feature = "pgo"), inline(always))]
 unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool) {
     use std::arch::x86_64::*;
     let mut mk = [[0u8; 16]; 3];
@@ -2063,6 +2064,7 @@ unsafe fn chunk_rd(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, ou
     }
 }
 
+#[cfg_attr(feature = "pgo", inline(never))]
 pub fn stage1(g: &G, tid: usize) {
     #[cfg(feature = "pmu")]
     let pm = pmu::start();

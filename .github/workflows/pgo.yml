@@ -87,6 +87,9 @@ jobs:
           test -x "$LLVM_PROFDATA"
           "$LLVM_PROFDATA" merge --failure-mode=all -o pgo/fast.profdata "$PROFILE_DIR"/*.profraw
           "$LLVM_PROFDATA" show --all-functions --counts pgo/fast.profdata > pgo/fast.functions
+          test "$(grep -c 'ev_vec' pgo/fast.functions)" -gt 0
+          test "$(grep -c 'stage1' pgo/fast.functions)" -gt 0
+          test "$(grep -c 'run_par' pgo/fast.functions)" -gt 0
           grep -q 'pipeline.*k_free6cl_fix' pgo/fast.functions
           grep -q 'pipeline.*parse16init_tabs_shared' pgo/fast.functions
           ls -lh pgo/fast.profdata
