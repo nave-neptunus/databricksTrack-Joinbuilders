@@ -1307,10 +1307,9 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         if qw != *tr.pat.get_unchecked(qi) {
             return None;
         }
-        let i6 = 32 - r6;
+        let i6 = 32u64.wrapping_sub(r6);
         let i5 = i6.wrapping_sub(r5).wrapping_sub(1);
-        let qbit = |i: u64| if i == 0 { (*pb.wrapping_add(m as usize).wrapping_sub(33) == b'"') as usize } else { ((q32 >> (i as u32 - 1)) & 1) as usize };
-        let (qb, qb5) = (qbit(i6), qbit(i5));
+        let (qb, qb5) = (purchase_qbit(q32, i6), purchase_qbit(q32, i5));
         let (c0, c1, c2, r4, r5, r6) = (c0 as usize, c1 as usize, c2 as usize, r4 as usize, r5 as usize, r6 as usize);
         let rs4 = pb.wrapping_add(i4 as usize);
         let kr = &*((T.kind2.as_ptr() as *const u8).add((here((r4 * 2 + (*rs4.wrapping_add(3) & 1) as usize) as u64) as usize) << 6) as *const KindRow2);
@@ -1336,6 +1335,41 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ld(e2.wrapping_sub(16))), ld(rs4.wrapping_sub(17)));
         let bad = _mm256_or_si256(bad_i, _mm256_zextsi128_si256(_mm_or_si128(bad_k3, bad_kind)));
         Some(EvSt { jo, r5, r6, qb, qb5, x, days: _mm256_permute2x128_si256::<0x31>(y2, y3), bad2: _mm256_or_si256(bad, _mm256_zextsi128_si256(bad_k2)), bad })
+    }
+}
+
+#[inline(always)]
+fn purchase_qbit(q32: u32, i: u64) -> usize {
+    if i < 32 { ((q32 >> i as u32) & 1) as usize } else { 0 }
+}
+
+#[cfg(test)]
+mod purchase_tests {
+    use super::*;
+
+    #[test]
+    fn quoted_purchase_tail_uses_opening_quote_bits() {
+        for tail in [b",p123,4500\n".as_slice(), b",\"p123\",\"4500\"\n".as_slice(), b",\"p123\",\"\"\n".as_slice()] {
+            let mut row = [b'x'; 64];
+            row[64 - tail.len()..].copy_from_slice(tail);
+            let pe = unsafe { row.as_ptr().add(63) };
+            let pt = unsafe { pe.sub(32) };
+            let mut q32 = 0u32;
+            for i in 0..32 {
+                if unsafe { *pt.add(i) } == b'"' { q32 |= 1 << i; }
+            }
+            let base = 64 - tail.len();
+            let product_open = base + 1 - 32;
+            let price_open = base + tail.iter().rposition(|&b| b == b',').unwrap() + 1 - 32;
+            let quoted_product = tail[1] == b'"';
+            let quoted_price = tail[tail.iter().rposition(|&b| b == b',').unwrap() + 1] == b'"';
+            assert_eq!(purchase_qbit(q32, product_open as u64), quoted_product as usize);
+            assert_eq!(purchase_qbit(q32, price_open as u64), quoted_price as usize);
+            assert_eq!((q32 >> price_open) & 1, quoted_price as u32);
+            if quoted_price && tail.ends_with(b"4500\"\n") {
+                assert_eq!(unsafe { price(pe.sub(1), 4) }, Some(4500));
+            }
+        }
     }
 }
 
@@ -1391,8 +1425,8 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
         if core::ptr::read_volatile((s as *const u8).add(PP + 7)) & 2 != 0 {
             let pe = np.wrapping_sub(1);
             let pt = pe.wrapping_sub(32);
-            let Some(pr) = price(pe.wrapping_sub(st.qb), st.r6 - 2 * st.qb) else { cold!() };
-            let i6 = 32 - st.r6;
+            let Some(pr) = price(pe.wrapping_sub(st.qb), st.r6.wrapping_sub(2 * st.qb)) else { cold!() };
+            let i6 = 32usize.wrapping_sub(st.r6);
             let (prod, bad_p) = dec(ld(pt.wrapping_add(i6).wrapping_sub(17)), T.prod.get_unchecked(st.r5 * 2 + st.qb5));
             if nz(bad_p) {
                 cold!();
