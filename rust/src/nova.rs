@@ -1,6 +1,6 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
+use crate::{DAY, EvP, EventChunks, P, People, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
 use std::mem::size_of;
@@ -600,8 +600,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
 }
 
 fn events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+    work: &EventChunks<'_>,
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
@@ -625,8 +624,9 @@ fn events(
             if index >= work.len() {
                 break;
             }
-            read_ahead.wait(work.raw(index));
-            parser.parse_chunk(work.get(index));
+            if work.with_chunk(index, |chunk| parser.parse_chunk(chunk)).is_none() {
+                declined.store(true, Relaxed);
+            }
         }
         parser.flush();
         parser.streams
@@ -733,14 +733,13 @@ impl Router {
 }
 
 pub(super) fn run_events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+    work: &EventChunks<'_>,
     users: &Users<'_>,
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let folds = events(work, read_ahead, users, input, declined);
+    let folds = events(work, users, input, declined);
     if declined.load(Relaxed) {
         return None;
     }
