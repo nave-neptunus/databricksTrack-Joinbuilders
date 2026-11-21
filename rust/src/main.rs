@@ -23,7 +23,16 @@ fn lap(name: &str) {
     if std::env::var_os("TIMING").is_some() {
         #[allow(static_mut_refs)]
         let t = unsafe { T0.unwrap() };
-        eprintln!("{:8.1} ms  {}", t.elapsed().as_secs_f64() * 1000.0, name);
+        // Cumulative process CPU (user + sys, all threads) from /proc, in ms (10 ms ticks).
+        let cpu = std::fs::read_to_string("/proc/self/stat").ok().and_then(|st| {
+            let rest = &st[st.rfind(')')? + 2..];
+            let f: Vec<&str> = rest.split(' ').collect();
+            Some((f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?) * 10)
+        });
+        match cpu {
+            Some(c) => eprintln!("{:8.1} ms  cpu {:6} ms  {}", t.elapsed().as_secs_f64() * 1000.0, c, name),
+            None => eprintln!("{:8.1} ms  {}", t.elapsed().as_secs_f64() * 1000.0, name),
+        }
     }
 }
 
