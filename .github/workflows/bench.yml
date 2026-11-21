@@ -25,6 +25,7 @@ jobs:
           - { label: core-prefault, ref: 49449d5 }
           - { label: io-prefault2, ref: abe261c }
           - { label: stack1, ref: 96572eb }
+          - { label: stack1-lanes8, ref: ed40599, combined: "true" }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -32,9 +33,20 @@ jobs:
         env:
           REF: ${{ matrix.ref }}
           LABEL: ${{ matrix.label }}
+          COMBINED: ${{ matrix.combined }}
         run: |
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          SHA=$(git rev-parse "$REF^{commit}")
+          if [ "$COMBINED" = "true" ]; then
+            # Bench-only synthetic merge; neither implementation branch is pushed.
+            git config user.name bench-ci
+            git config user.email bench-ci@local.invalid
+            git switch -C g7/bench-stack1-lanes8 ed40599
+            git merge --no-edit 6fafb87
+            git merge --no-edit 96572eb
+            SHA=$(git rev-parse HEAD)
+          else
+            SHA=$(git rev-parse "$REF^{commit}")
+          fi
           echo "Building $SHA as g7-bench-$LABEL"
           git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
           docker save "g7-bench-$LABEL" | zstd -T0 -3 -o "$RUNNER_TEMP/g7-bench-$LABEL.tar.zst"
@@ -71,9 +83,11 @@ jobs:
           - { label: core-prefault, candidate_ref: 49449d5, image: core-prefault, setting: '' }
           - { label: io-prefault2, candidate_ref: abe261c, image: io-prefault2, setting: '' }
           - { label: stack1, candidate_ref: 96572eb, image: stack1, setting: '' }
+          - { label: stack1-lanes8, candidate_ref: 96572eb, candidate_label: 'synthetic merge ed40599 + 6fafb87 + 96572eb', image: stack1-lanes8, setting: '' }
     env:
       BASELINE_REF: ed40599
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
+      CANDIDATE_LABEL: ${{ matrix.candidate_label }}
       CANDIDATE_ENV: ${{ matrix.setting }}
       BASELINE_IMAGE: g7-bench-baseline
       CANDIDATE_IMAGE: g7-bench-${{ matrix.image }}
@@ -138,4 +152,71 @@ jobs:
             ~/g7-bench/summary.md
             ~/g7-bench/observations.json
             ~/g7-bench/logs/**
+          retention-days: 7
+
+  profile-baseline:
+    needs: build-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Intel AVX-512 capability and thread count
+        run: |
+          lscpu
+          if ! grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || ! grep -qw avx512f /proc/cpuinfo; then
+            echo 'Intel AVX512F=no; refusing non-representative profile' >&2
+            exit 1
+          fi
+          echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
+          printf 'THP: '; cat /sys/kernel/mm/transparent_hugepage/enabled
+      - name: Fetch pinned benchmark support
+        id: generator
+        run: |
+          git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
+          echo "tree=$(git rev-parse origin/ci-bench:generator)" >> "$GITHUB_OUTPUT"
+          git checkout origin/ci-bench -- generator fixtures scripts
+      - name: Restore 20M corpus cache
+        id: corpus
+        uses: actions/cache@v4
+        with:
+          path: ~/big20
+          key: big20-${{ runner.os }}-seed${{ env.DATA_SEED }}-${{ steps.generator.outputs.tree }}
+      - run: python3 -m pip install --quiet polars
+      - name: Generate 20M corpus on a cache miss
+        if: steps.corpus.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-baseline
+          path: ${{ runner.temp }}/perf-image
+      - name: Extract the static fast-path binary from the image
+        run: |
+          zstd -dc "$RUNNER_TEMP"/perf-image/*.tar.zst | docker load
+          docker create --name g7-perf-source g7-bench-baseline
+          docker cp g7-perf-source:/pipeline "$RUNNER_TEMP/pipeline"
+          docker rm g7-perf-source
+          chmod 0755 "$RUNNER_TEMP/pipeline"
+      - name: Perf stat and call-graph profile of a warm direct run
+        run: |
+          set -o pipefail
+          sudo apt-get update
+          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          mkdir -p "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch" "$RUNNER_TEMP/perf-results"
+          find "$HOME/big20" -type f -exec cat {} + >/dev/null
+          export NCPU DATA_DIR="$HOME/big20" OUTPUT_DIR="$RUNNER_TEMP/perf-output" SCRATCH_DIR="$RUNNER_TEMP/perf-scratch" XL_TIMING=1
+          perf stat -e cycles,instructions,branch-misses,cache-misses,LLC-load-misses,dTLB-load-misses -o "$RUNNER_TEMP/perf-results/perf-stat.txt" "$RUNNER_TEMP/pipeline" 2>"$RUNNER_TEMP/perf-results/pipeline-stat.stderr"
+          find "$HOME/big20" -type f -exec cat {} + >/dev/null
+          sudo rm -rf "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch"
+          mkdir -p "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch"
+          perf record -g --call-graph=fp -o "$RUNNER_TEMP/perf-results/perf.data" "$RUNNER_TEMP/pipeline" 2>"$RUNNER_TEMP/perf-results/pipeline-record.stderr"
+          perf report --no-children --percent-limit 1 --stdio -i "$RUNNER_TEMP/perf-results/perf.data" > "$RUNNER_TEMP/perf-results/perf-report.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/perf-results/**
           retention-days: 7

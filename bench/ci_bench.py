@@ -21,6 +21,7 @@ CAND = os.environ.get("CANDIDATE_REF", "6fafb87")
 PAIRS = int(os.environ.get("PAIRS", "10"))
 NCPU = int(os.environ["NCPU"])
 CANDIDATE_ENV = os.environ.get("CANDIDATE_ENV", "")
+CANDIDATE_LABEL = os.environ.get("CANDIDATE_LABEL", "")
 BASE_IMAGE = os.environ.get("BASELINE_IMAGE", "")
 CAND_IMAGE = os.environ.get("CANDIDATE_IMAGE", "")
 WORK.mkdir(parents=True, exist_ok=True)
@@ -185,7 +186,8 @@ def fixture_gate(tag, label, env):
         remove(scratch)
 
 
-base_sha, cand_sha = ref(BASE), ref(CAND)
+base_sha = ref(BASE)
+cand_sha = CANDIDATE_LABEL or ref(CAND)
 print(f"BASELINE={base_sha} CANDIDATE={cand_sha} NCPU={NCPU} CANDIDATE_ENV={CANDIDATE_ENV or '<none>'}", flush=True)
 if BASE_IMAGE:
     call(["docker", "tag", BASE_IMAGE, "g7-bench-baseline"])
