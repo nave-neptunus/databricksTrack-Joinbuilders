@@ -2567,15 +2567,19 @@ struct EventBucket {
     first: u32,
     last: u32,
     count: i64,
-    /// One-based index of the most recent purchase in the bucket.
-    purchase: usize,
+    /// The purchases for this time bucket occupy one contiguous range.  The
+    /// old representation threaded purchases through a reverse linked list;
+    /// events arrive in input order, so following one of those lists jumped
+    /// through the whole person's allocation during aggregation.
+    purchase_start: usize,
+    purchase_len: usize,
 }
 
 #[derive(Default)]
 struct EventBuckets {
     by_time: Vec<EventBucket>,
     used: Vec<usize>,
-    purchases: Vec<(u32, usize)>,
+    purchases: Vec<u32>,
 }
 
 impl EventBuckets {
@@ -2585,6 +2589,9 @@ impl EventBuckets {
         }
         self.by_time.resize_with(MAX_EVENT_BUCKETS, EventBucket::default);
         self.purchases.clear();
+        // First count the time buckets and their purchases.  That lets the
+        // second pass scatter every purchase into a sequential, per-bucket
+        // range instead of building a pointer chain in input order.
         for &event in events {
             let time = (event >> 32) as u32;
             // A half-hour bucket is connected for every input distribution.
@@ -2600,23 +2607,40 @@ impl EventBuckets {
                 bucket.last = bucket.last.max(time);
             }
             bucket.count += 1;
-            let payload = event as u32;
-            if payload != 0 {
-                self.purchases.push((payload, bucket.purchase));
-                bucket.purchase = self.purchases.len();
+            if event as u32 != 0 {
+                bucket.purchase_len += 1;
             }
         }
         self.used.sort_unstable();
+        let mut purchases = 0;
+        for &index in &self.used {
+            let bucket = &mut self.by_time[index];
+            bucket.purchase_start = purchases;
+            purchases += bucket.purchase_len;
+        }
+        self.purchases.resize(purchases, 0);
+        for &event in events {
+            let payload = event as u32;
+            if payload == 0 {
+                continue;
+            }
+            let index = ((event >> 32) as u32 / GAP as u32) as usize;
+            let bucket = &mut self.by_time[index];
+            self.purchases[bucket.purchase_start] = payload;
+            bucket.purchase_start += 1;
+        }
+        // Restore the range starts after using them as scatter cursors.
+        for &index in &self.used {
+            let bucket = &mut self.by_time[index];
+            bucket.purchase_start -= bucket.purchase_len;
+        }
     }
 
     fn aggregate(&self, index: usize, sums: &mut [i64], touched: &mut Vec<u32>) -> (i64, i64) {
         let bucket = &self.by_time[index];
-        let mut node = bucket.purchase;
         let mut revenue = 0;
-        while node != 0 {
-            let (payload, previous) = self.purchases[node - 1];
+        for &payload in &self.purchases[bucket.purchase_start..bucket.purchase_start + bucket.purchase_len] {
             revenue += add_purchase(payload, sums, touched);
-            node = previous;
         }
         (bucket.count, revenue)
     }
