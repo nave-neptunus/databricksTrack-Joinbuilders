@@ -1,4 +1,4 @@
-//! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
+//! Nova's event pipeline. The scanner emits compact dedup records and session payloads.
 
 use crate::{
     DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, hs, lap, pack_ref, parse_price,
@@ -156,35 +156,52 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     }
 }
 
+const ROW_BITS: u32 = 31 - P.trailing_zeros();
+const ROW_LIMIT: usize = 1 << ROW_BITS;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Event {
+struct CopyRecord {
     key: u64,
     ingest: i32,
-    person: u32,
-    ts: u32,
-    price: u32,
+    output: u32,
 }
-const _: () = assert!(size_of::<Event>() == 24);
+const _: () = assert!(size_of::<CopyRecord>() == 16);
+
+impl CopyRecord {
+    #[inline]
+    fn tombstone(self, people: &People) {
+        if self.output != INVALID {
+            let partition = (self.output >> ROW_BITS) as usize;
+            let row = self.output as usize & (ROW_LIMIT - 1);
+            people.get(partition, row).ts.store(INVALID, Relaxed);
+        }
+    }
+}
+
+struct EventParts {
+    copies: Streams<CopyRecord, SHARDS>,
+    people: People,
+}
 
 #[derive(Clone, Copy)]
 struct Pending {
-    row: Event,
+    key: u64,
     uid: u64,
     name: u64,
+    ingest: i32,
+    ts: u32,
+    price: u32,
 }
 
 impl Pending {
     const EMPTY: Self = Self {
-        row: Event {
-            key: 0,
-            ingest: 0,
-            person: 0,
-            ts: INVALID,
-            price: 0,
-        },
+        key: 0,
         uid: 0,
         name: 0,
+        ingest: 0,
+        ts: INVALID,
+        price: 0,
     };
 }
 
@@ -388,22 +405,49 @@ fn events(
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
-) -> Vec<Streams<Event, SHARDS>> {
+) -> Vec<EventParts> {
     let next = AtomicUsize::new(0);
     let window_seconds = input.start.div_euclid(1000);
+    let reservation = (work.total() / 72)
+        .div_ceil(P * rayon::current_num_threads())
+        .min(32_768);
     rayon::broadcast(|_| {
-        let mut streams = Streams::new();
+        let mut parts = EventParts {
+            copies: Streams::new(),
+            people: People::new(reservation),
+        };
         let mut dates = Dates::default();
         let mut ids = (0, 0);
         let mut batch = [Pending::EMPTY; 16];
         let mut len = 0;
         let mut flush = |rows: &[Pending]| {
             for pending in rows {
-                let mut row = pending.row;
-                if row.ts != INVALID {
-                    row.person = users.person(pending.uid, 0, pending.name, &mut ids, declined);
+                let mut record = CopyRecord {
+                    key: pending.key,
+                    ingest: pending.ingest,
+                    output: INVALID,
+                };
+                if pending.ts != INVALID {
+                    let person = users.person(pending.uid, 0, pending.name, &mut ids, declined);
+                    let partition = person as usize & (P - 1);
+                    let index = parts.people.len(partition);
+                    if index >= ROW_LIMIT {
+                        declined.store(true, Relaxed);
+                        continue;
+                    }
+                    parts.people.push(
+                        partition,
+                        EvP {
+                            person,
+                            ts: AtomicU32::new(pending.ts),
+                            price: pending.price,
+                        },
+                    );
+                    record.output = (partition as u32) << ROW_BITS | index as u32;
                 }
-                streams.push((event_hash(row.key) >> 55) as u8 as usize, row);
+                parts
+                    .copies
+                    .push((event_hash(record.key) >> 55) as u8 as usize, record);
             }
         };
         loop {
@@ -436,8 +480,8 @@ fn events(
                     return;
                 };
                 let mut pending = Pending::EMPTY;
-                pending.row.key = key;
-                pending.row.ingest = order;
+                pending.key = key;
+                pending.ingest = order;
                 'valid: {
                     if user.is_empty() || product.is_empty() {
                         break 'valid;
@@ -458,14 +502,14 @@ fn events(
                             break 'valid;
                         };
                         let category = *input.products.get(product).unwrap_or(&input.unknown);
-                        pending.row.price = value | (category << 24);
+                        pending.price = value | (category << 24);
                     }
                     let (Some(uid), Some(name)) = (user_key(user), pack_ref(user)) else {
                         declined.store(true, Relaxed);
                         break 'valid;
                     };
                     users.prefetch(uid);
-                    pending.row.ts = (time - input.start) as u32;
+                    pending.ts = (time - input.start) as u32;
                     pending.uid = uid;
                     pending.name = name;
                 }
@@ -478,41 +522,26 @@ fn events(
             });
         }
         flush(&batch[..len]);
-        streams
+        parts
     })
 }
 
-type EventStream = Streams<Event, SHARDS>;
-
-// Tag bits avoid an indirect load for almost every occupied cell with a
-// different key. The location refers to a record in an immutable stream.
+// The upper bits filter unrelated cells. Remaining bits hold the position
+// of the winner in an immutable dedup stream.
 const LOCATION_BITS: u32 = 26;
 const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
 
-struct Router {
-    people: People,
+#[derive(Default)]
+struct Dedup {
     winners: Vec<u32>,
-    losers: Vec<u8>,
-    bases: Vec<usize>,
 }
 
-impl Router {
-    fn new(reservation: usize) -> Self {
-        Self {
-            people: People::new(reservation),
-            winners: Vec::new(),
-            losers: Vec::new(),
-            bases: Vec::new(),
-        }
-    }
-
-    fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
+impl Dedup {
+    fn shard(&mut self, folds: &[EventParts], shard: usize) -> Option<()> {
         let mut count = 0;
         let mut longest = 1;
-        self.bases.clear();
         for fold in folds {
-            self.bases.push(count);
-            let rows = fold.len(shard);
+            let rows = fold.copies.len(shard);
             count += rows;
             longest = longest.max(rows);
         }
@@ -527,11 +556,9 @@ impl Router {
         let mask = (count * 2).next_power_of_two() - 1;
         self.winners.clear();
         self.winners.resize(mask + 1, 0);
-        self.losers.clear();
-        self.losers.resize(count, 0);
 
         for (file, fold) in folds.iter().enumerate() {
-            for (index, row) in fold.records(shard).enumerate() {
+            for (index, row) in fold.copies.records(shard).enumerate() {
                 let hash = event_hash(row.key);
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
                 let location = ((file << shift) + index + 1) as u32;
@@ -544,36 +571,20 @@ impl Router {
                     }
                     if winner & !LOCATION_MASK == tag {
                         let previous = ((winner & LOCATION_MASK) - 1) as usize;
-                        let prior_file = previous >> shift;
-                        let prior_index = previous & (stride - 1);
-                        let prior = folds[prior_file].get(shard, prior_index);
+                        let prior_fold = &folds[previous >> shift];
+                        let prior = prior_fold.copies.get(shard, previous & (stride - 1));
                         if same_event(prior.key, row.key) {
-                            // Invalid copies still compete for earliest ingest.
+                            // All copies participate, including those without a payload.
                             if row.ingest < prior.ingest {
-                                self.losers[self.bases[prior_file] + prior_index] = 1;
+                                prior.tombstone(&prior_fold.people);
                                 self.winners[slot] = tag | location;
                             } else {
-                                self.losers[self.bases[file] + index] = 1;
+                                row.tombstone(&fold.people);
                             }
                             break;
                         }
                     }
                     slot = (slot + 1) & mask;
-                }
-            }
-        }
-        for (file, fold) in folds.iter().enumerate() {
-            let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
-                if row.ts != INVALID && self.losers[base + index] == 0 {
-                    self.people.push(
-                        row.person as usize & (P - 1),
-                        EvP {
-                            person: row.person,
-                            ts: AtomicU32::new(row.ts),
-                            price: row.price,
-                        },
-                    );
                 }
             }
         }
@@ -604,28 +615,16 @@ pub(super) fn run_events(
     if declined.load(Relaxed) {
         return None;
     }
-    let rows: usize = folds
-        .iter()
-        .map(|f| (0..SHARDS).map(|shard| f.len(shard)).sum::<usize>())
-        .sum();
-    let reservation = rows.div_ceil(P * rayon::current_num_threads()).min(32_768);
-    let people = crate::pt_ordered(
-        SHARDS,
-        || Router::new(reservation),
-        |mut router, shard| {
-            if router.route(&folds, shard).is_none() {
-                declined.store(true, Relaxed);
-            }
-            router
-        },
-    )
-    .into_iter()
-    .map(|router| router.people)
-    .collect();
+    crate::pt_ordered(SHARDS, Dedup::default, |mut table, shard| {
+        if table.shard(&folds, shard).is_none() {
+            declined.store(true, Relaxed);
+        }
+        table
+    });
     if declined.load(Relaxed) {
         return None;
     }
-    drop(folds);
+    let people = folds.into_iter().map(|fold| fold.people).collect();
     lap("events dedup + validate");
     Some((local_count, names, people))
 }
