@@ -1,4 +1,4 @@
-//! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
+//! Nova's event pipeline. Parse emits compact dedup records and sequential payloads.
 
 use crate::{DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
@@ -121,11 +121,13 @@ unsafe impl<T: Send, const N: usize> Send for Streams<T, N> {}
 // Shared readers can access only initialized records. They never write the tails.
 unsafe impl<T: Sync, const N: usize> Sync for Streams<T, N> {}
 
-impl<T: Copy, const N: usize> Streams<T, N> {
+impl<T, const N: usize> Streams<T, N> {
     const ROWS: usize = BLOCK_BYTES / size_of::<T>();
     const SLAB_BLOCKS: usize = SLAB_BYTES / BLOCK_BYTES;
 
     fn new() -> Self {
+        // Mapping teardown has no per-record destructor.
+        assert!(!std::mem::needs_drop::<T>());
         Self {
             slabs: Vec::new(),
             blocks: std::array::from_fn(|_| Vec::new()),
@@ -498,6 +500,32 @@ pub(super) struct EventInput<'a> {
     pub(super) end: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DedupRecord {
+    key: u64,
+    ingest: i32,
+    payload: u32,
+}
+const _: () = assert!(size_of::<DedupRecord>() == 16);
+
+struct Fold {
+    copies: Streams<DedupRecord, SHARDS>,
+    payloads: Streams<EvP, 1>,
+}
+
+impl Fold {
+    #[inline]
+    fn discard(&self, record: &DedupRecord) {
+        if record.payload != INVALID {
+            self.payloads
+                .get(0, record.payload as usize)
+                .ts
+                .store(INVALID, Relaxed);
+        }
+    }
+}
+
 struct Parser<'a, 'catalog, 'table> {
     input: &'a EventInput<'catalog>,
     users: &'a Users<'table>,
@@ -508,7 +536,7 @@ struct Parser<'a, 'catalog, 'table> {
     ids: (u32, u32),
     batch: [Pending; 16],
     count: usize,
-    streams: Streams<Event, SHARDS>,
+    fold: Fold,
 }
 
 impl Parser<'_, '_, '_> {
@@ -519,13 +547,38 @@ impl Parser<'_, '_, '_> {
     #[inline]
     fn flush(&mut self) {
         for pending in &self.batch[..self.count] {
-            let mut row = pending.row;
+            let row = pending.row;
+            let mut payload = INVALID;
             if row.ts != INVALID {
-                row.person =
+                let person =
                     self.users
                         .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                let Ok(index) = u32::try_from(self.fold.payloads.len(0)) else {
+                    self.declined.store(true, Relaxed);
+                    continue;
+                };
+                if index == INVALID {
+                    self.declined.store(true, Relaxed);
+                    continue;
+                }
+                self.fold.payloads.push(
+                    0,
+                    EvP {
+                        person,
+                        ts: AtomicU32::new(row.ts),
+                        price: row.price,
+                    },
+                );
+                payload = index;
             }
-            self.streams.push((row.key >> 55) as u8 as usize, row);
+            self.fold.copies.push(
+                (row.key >> 55) as u8 as usize,
+                DedupRecord {
+                    key: row.key,
+                    ingest: row.ingest,
+                    payload,
+                },
+            );
         }
         self.count = 0;
     }
@@ -605,7 +658,7 @@ fn events(
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
-) -> Vec<Streams<Event, SHARDS>> {
+) -> Vec<Fold> {
     let next = AtomicUsize::new(0);
     rayon::broadcast(|_| {
         let mut parser = Parser {
@@ -618,7 +671,10 @@ fn events(
             ids: (0, 0),
             batch: [Pending::EMPTY; 16],
             count: 0,
-            streams: Streams::new(),
+            fold: Fold {
+                copies: Streams::new(),
+                payloads: Streams::new(),
+            },
         };
         loop {
             let index = next.fetch_add(1, Relaxed);
@@ -629,41 +685,25 @@ fn events(
             parser.parse_chunk(work.get(index));
         }
         parser.flush();
-        parser.streams
+        parser.fold
     })
 }
 
-type EventStream = Streams<Event, SHARDS>;
-
-// Tag bits avoid an indirect load for almost every occupied cell with a
-// different key. The location refers to a record in an immutable stream.
+// A small tag avoids loading a record for most nonmatching occupied slots.
 const LOCATION_BITS: u32 = 26;
 const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
 
-struct Router {
-    people: People,
+#[derive(Default)]
+struct Dedup {
     winners: Vec<u32>,
-    losers: Vec<u8>,
-    bases: Vec<usize>,
 }
 
-impl Router {
-    fn new(reservation: usize) -> Self {
-        Self {
-            people: People::new(reservation),
-            winners: Vec::new(),
-            losers: Vec::new(),
-            bases: Vec::new(),
-        }
-    }
-
-    fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
+impl Dedup {
+    fn shard(&mut self, folds: &[Fold], shard: usize) -> Option<()> {
         let mut count = 0;
         let mut longest = 1;
-        self.bases.clear();
         for fold in folds {
-            self.bases.push(count);
-            let rows = fold.len(shard);
+            let rows = fold.copies.len(shard);
             count += rows;
             longest = longest.max(rows);
         }
@@ -678,15 +718,12 @@ impl Router {
         let mask = (count * 2).next_power_of_two() - 1;
         self.winners.clear();
         self.winners.resize(mask + 1, 0);
-        self.losers.clear();
-        self.losers.resize(count, 0);
 
-        for (file, fold) in folds.iter().enumerate() {
-            for (index, row) in fold.records(shard).enumerate() {
-                let hash = row.key;
-                let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
-                let location = ((file << shift) + index + 1) as u32;
-                let mut slot = hash as usize & mask;
+        for (worker, fold) in folds.iter().enumerate() {
+            for (index, row) in fold.copies.records(shard).enumerate() {
+                let tag = ((row.key >> 23) as u32) & !LOCATION_MASK;
+                let location = ((worker << shift) + index + 1) as u32;
+                let mut slot = row.key as usize & mask;
                 loop {
                     let winner = self.winners[slot];
                     if winner == 0 {
@@ -695,36 +732,20 @@ impl Router {
                     }
                     if winner & !LOCATION_MASK == tag {
                         let previous = ((winner & LOCATION_MASK) - 1) as usize;
-                        let prior_file = previous >> shift;
-                        let prior_index = previous & (stride - 1);
-                        let prior = folds[prior_file].get(shard, prior_index);
+                        let prior_fold = &folds[previous >> shift];
+                        let prior = prior_fold.copies.get(shard, previous & (stride - 1));
                         if prior.key == row.key {
-                            // Invalid copies still compete for earliest ingest.
+                            // Invalid copies still win if their ingest timestamp is earlier.
                             if row.ingest < prior.ingest {
-                                self.losers[self.bases[prior_file] + prior_index] = 1;
+                                prior_fold.discard(prior);
                                 self.winners[slot] = tag | location;
                             } else {
-                                self.losers[self.bases[file] + index] = 1;
+                                fold.discard(row);
                             }
                             break;
                         }
                     }
                     slot = (slot + 1) & mask;
-                }
-            }
-        }
-        for (file, fold) in folds.iter().enumerate() {
-            let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
-                if row.ts != INVALID && self.losers[base + index] == 0 {
-                    self.people.push(
-                        row.person as usize & (P - 1),
-                        EvP {
-                            person: row.person,
-                            ts: AtomicU32::new(row.ts),
-                            price: row.price,
-                        },
-                    );
                 }
             }
         }
@@ -753,28 +774,38 @@ pub(super) fn run_events(
     if declined.load(Relaxed) {
         return None;
     }
-    let rows: usize = folds
-        .iter()
-        .map(|f| (0..SHARDS).map(|shard| f.len(shard)).sum::<usize>())
-        .sum();
-    let reservation = rows.div_ceil(P * rayon::current_num_threads()).min(32_768);
-    let people = crate::pt_ordered(
-        SHARDS,
-        || Router::new(reservation),
-        |mut router, shard| {
-            if router.route(&folds, shard).is_none() {
-                declined.store(true, Relaxed);
-            }
-            router
-        },
-    )
-    .into_iter()
-    .map(|router| router.people)
-    .collect();
+    crate::pt_ordered(SHARDS, Dedup::default, |mut table, shard| {
+        if table.shard(&folds, shard).is_none() {
+            declined.store(true, Relaxed);
+        }
+        table
+    });
     if declined.load(Relaxed) {
         return None;
     }
-    drop(folds);
+    lap("  duplicate winners marked");
+    let payloads: Vec<_> = folds.into_par_iter().map(|fold| fold.payloads).collect();
+    let people = payloads
+        .into_par_iter()
+        .map(|tape| {
+            let reservation = tape.len(0).div_ceil(P).min(32_768);
+            let mut partitions = People::new(reservation);
+            for event in tape.records(0) {
+                let ts = event.ts.load(Relaxed);
+                if ts != INVALID {
+                    partitions.push(
+                        event.person as usize & (P - 1),
+                        EvP {
+                            person: event.person,
+                            ts: AtomicU32::new(ts),
+                            price: event.price,
+                        },
+                    );
+                }
+            }
+            partitions
+        })
+        .collect();
     lap("events dedup + validate");
     Some((local_count, names, people))
 }
