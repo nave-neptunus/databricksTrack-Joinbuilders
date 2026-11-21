@@ -17,6 +17,7 @@ jobs:
       matrix:
         include:
           - { label: baseline, ref: ed40599 }
+          - { label: baseline-pmu, ref: ed40599, fast_features: "--features pmu" }
           - { label: lanes8, ref: 6fafb87 }
           - { label: io-popread-a, ref: 2005c71 }
           - { label: io-popread-b, ref: d937261 }
@@ -26,6 +27,8 @@ jobs:
           - { label: io-prefault2, ref: abe261c }
           - { label: stack1, ref: 96572eb }
           - { label: stack1-lanes8, ref: ed40599, combined: "true" }
+          - { label: core-pgo, ref: d61d19c }
+          - { label: stack1-pgo, ref: 7760829 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -34,6 +37,7 @@ jobs:
           REF: ${{ matrix.ref }}
           LABEL: ${{ matrix.label }}
           COMBINED: ${{ matrix.combined }}
+          FAST_FEATURES: ${{ matrix.fast_features }}
         run: |
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
           if [ "$COMBINED" = "true" ]; then
@@ -48,7 +52,15 @@ jobs:
             SHA=$(git rev-parse "$REF^{commit}")
           fi
           echo "Building $SHA as g7-bench-$LABEL"
-          git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
+          if [ -n "$FAST_FEATURES" ]; then
+            work=$(mktemp -d)
+            git archive --format=tar "$SHA" | tar -x -C "$work"
+            sed -i '/^WORKDIR \/src$/a ARG FAST_FEATURES=""' "$work/Dockerfile"
+            sed -i 's/cargo build --release --target x86_64-unknown-linux-musl/cargo build --release --target x86_64-unknown-linux-musl $FAST_FEATURES/' "$work/Dockerfile"
+            docker build --platform linux/amd64 --build-arg FAST_FEATURES="$FAST_FEATURES" --load --tag "g7-bench-$LABEL" "$work"
+          else
+            git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
+          fi
           docker save "g7-bench-$LABEL" | zstd -T0 -3 -o "$RUNNER_TEMP/g7-bench-$LABEL.tar.zst"
       - uses: actions/upload-artifact@v4
         with:
@@ -84,6 +96,8 @@ jobs:
           - { label: io-prefault2, candidate_ref: abe261c, image: io-prefault2, setting: '' }
           - { label: stack1, candidate_ref: 96572eb, image: stack1, setting: '' }
           - { label: stack1-lanes8, candidate_ref: 96572eb, candidate_label: 'synthetic merge ed40599 + 6fafb87 + 96572eb', image: stack1-lanes8, setting: '' }
+          - { label: core-pgo, candidate_ref: d61d19c, image: core-pgo, setting: '' }
+          - { label: stack1-pgo, candidate_ref: 7760829, image: stack1-pgo, setting: '' }
     env:
       BASELINE_REF: ed40599
       CANDIDATE_REF: ${{ matrix.candidate_ref }}
