@@ -704,7 +704,7 @@ const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
 struct Router {
     people: People,
     winners: Vec<u32>,
-    destinations: Vec<u32>,
+    losers: Vec<u8>,
     bases: Vec<usize>,
 }
 
@@ -713,7 +713,7 @@ impl Router {
         Self {
             people: People::new(reservation),
             winners: Vec::new(),
-            destinations: Vec::new(),
+            losers: Vec::new(),
             bases: Vec::new(),
         }
     }
@@ -739,8 +739,8 @@ impl Router {
         let mask = (count * 2).next_power_of_two() - 1;
         self.winners.clear();
         self.winners.resize(mask + 1, 0);
-        self.destinations.clear();
-        self.destinations.resize(count, 0);
+        self.losers.clear();
+        self.losers.resize(count, 0);
 
         for (file, fold) in folds.iter().enumerate() {
             for (index, row) in fold.records(shard).enumerate() {
@@ -748,7 +748,6 @@ impl Router {
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
                 let location = ((file << shift) + index + 1) as u32;
                 let mut slot = hash as usize & mask;
-                let mut keep = true;
                 loop {
                     let winner = self.winners[slot];
                     if winner == 0 {
@@ -763,29 +762,30 @@ impl Router {
                         if prior.key == row.key {
                             // Invalid copies still compete for earliest ingest.
                             if row.ingest < prior.ingest {
-                                if prior.ts != INVALID {
-                                    let dest = self.destinations[self.bases[prior_file] + prior_index];
-                                    self.people.get(prior.person as usize & (P - 1), dest as usize)
-                                        .ts.store(INVALID, Relaxed);
-                                }
+                                self.losers[self.bases[prior_file] + prior_index] = 1;
                                 self.winners[slot] = tag | location;
                             } else {
-                                keep = false;
+                                self.losers[self.bases[file] + index] = 1;
                             }
                             break;
                         }
                     }
                     slot = (slot + 1) & mask;
                 }
-                if keep && row.ts != INVALID {
-                    let partition = row.person as usize & (P - 1);
-                    self.destinations[self.bases[file] + index] =
-                        u32::try_from(self.people.len(partition)).ok()?;
-                    self.people.push(partition, EvP {
-                        person: row.person,
-                        ts: AtomicU32::new(row.ts),
-                        price: row.price,
-                    });
+            }
+        }
+        for (file, fold) in folds.iter().enumerate() {
+            let base = self.bases[file];
+            for (index, row) in fold.records(shard).enumerate() {
+                if row.ts != INVALID && self.losers[base + index] == 0 {
+                    self.people.push(
+                        row.person as usize & (P - 1),
+                        EvP {
+                            person: row.person,
+                            ts: AtomicU32::new(row.ts),
+                            price: row.price,
+                        },
+                    );
                 }
             }
         }
@@ -835,7 +835,12 @@ pub(super) fn run_events(
     if declined.load(Relaxed) {
         return None;
     }
-    drop(folds);
+    lap("  dedup routed");
+    if std::env::var_os("BREAKER_KEEP_STREAMS").is_some() {
+        std::mem::forget(folds);
+    } else {
+        drop(folds);
+    }
     lap("events dedup + validate");
     Some((local_count, names, people))
 }
@@ -845,7 +850,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fused_router_keeps_earliest_invalid_and_changed_person_copies() {
+    fn router_keeps_earliest_invalid_and_changed_person_copies() {
         let mut folds = vec![Streams::new(), Streams::new()];
         // Force overflow in the person output and cross a source block boundary.
         for i in 0..300u64 {
