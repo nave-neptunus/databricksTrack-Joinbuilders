@@ -389,26 +389,26 @@ mod dio {
                 freed: (0..RING).map(|_| AtomicUsize::new(0)).collect(),
                 next: AtomicUsize::new(0), cancel: AtomicBool::new(false), failed: AtomicBool::new(false),
             });
-            let threads = (0..nthreads)
-                .map(|t| {
-                    let s = shared.clone();
-                    std::thread::spawn(move || {
-                        // Fault this thread's share of the ring before the first read.
-                        let per = RING.div_ceil(nthreads);
-                        let lo = (t * per).min(RING) * SLOT;
-                        let hi = ((t + 1) * per).min(RING) * SLOT;
-                        if hi > lo {
-                            unsafe {
-                                libc::madvise((s.ring + lo) as *mut libc::c_void, hi - lo, 23 /* MADV_POPULATE_WRITE */);
-                            }
+            // Own the mappings before spawning threads so a spawn failure cancels and joins
+            // the workers that already started before it releases their destination memory.
+            let mut input = Input { _region: region, _ring: ring, shared, threads: Vec::new(), slices };
+            for t in 0..nthreads {
+                let s = input.shared.clone();
+                let handle = std::thread::Builder::new().spawn(move || {
+                    // Fault this thread's share of the ring before the first read.
+                    let per = RING.div_ceil(nthreads);
+                    let lo = (t * per).min(RING) * SLOT;
+                    let hi = ((t + 1) * per).min(RING) * SLOT;
+                    if hi > lo {
+                        unsafe {
+                            libc::madvise((s.ring + lo) as *mut libc::c_void, hi - lo, libc::MADV_POPULATE_WRITE);
                         }
-                        worker(s)
-                    })
-                })
-                .collect();
-            Some(Input {
-                _region: region, _ring: ring, shared, threads, slices,
-            })
+                    }
+                    worker(s)
+                }).ok()?;
+                input.threads.push(handle);
+            }
+            Some(input)
         }
     }
 }
