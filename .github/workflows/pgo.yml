@@ -87,6 +87,7 @@ jobs:
           test -x "$LLVM_PROFDATA"
           "$LLVM_PROFDATA" merge --failure-mode=all -o pgo/fast.profdata "$PROFILE_DIR"/*.profraw
           "$LLVM_PROFDATA" show --all-functions pgo/fast.profdata > pgo/fast.functions
+          grep -E 'ev_vec|stage1' pgo/fast.functions || true
           grep -q 'ev_vec' pgo/fast.functions
           grep -q 'stage1' pgo/fast.functions
           ls -lh pgo/fast.profdata
