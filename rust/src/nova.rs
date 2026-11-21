@@ -4,13 +4,14 @@ use crate::{DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, 
 use ahash::AHashMap;
 use rayon::prelude::*;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
 const BLOCK_BYTES: usize = 4096;
 const SLAB_BYTES: usize = 16 << 20;
 const SHORT_KEY: u64 = 1 << 63;
 const INVALID: u32 = u32::MAX;
+static EVENT_DIGEST: AtomicU64 = AtomicU64::new(0);
 
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
@@ -288,6 +289,24 @@ fn profile_mode() -> String {
     std::env::var("EV_ABL").unwrap_or_else(|_| "base".to_string())
 }
 
+/// Env gate for the field-decode prototype. A/B runs use the same binary and
+/// flip only this variable, so all other code and the compiler are identical.
+fn fast_fields() -> bool {
+    std::env::var("NOVA_FF").ok().as_deref() == Some("1")
+}
+
+fn digest_enabled() -> bool {
+    std::env::var_os("NOVA_DIGEST").is_some()
+}
+
+#[inline]
+fn mix_digest(digest: &mut u64, key: u64, ingest: i32, ts: u32, price: u32) {
+    let word = key ^ ((ingest as u64) << 32) ^ (u64::from(ts) << 16) ^ u64::from(price);
+    *digest = digest
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(word.rotate_left(17));
+}
+
 #[derive(Default)]
 struct ScanOnly {
     sum: u64,
@@ -431,6 +450,37 @@ fn swar_value(word: u64) -> u64 {
     low.wrapping_add(high) >> 32
 }
 
+/// Classify an already-unquoted event type from one or two u32 loads. Any
+/// spelling that is not exactly `view`, `cart`, or `purchase` is invalid, so
+/// the caller's fallback is the shipped exact comparison.
+#[inline]
+fn event_kind(s: &[u8]) -> u8 {
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    const PURC: u32 = u32::from_le_bytes(*b"purc");
+    const HASE: u32 = u32::from_le_bytes(*b"hase");
+    match s.len() {
+        4 => {
+            let word = u32::from_le_bytes(s[..4].try_into().unwrap());
+            if word == VIEW {
+                1
+            } else if word == CART {
+                2
+            } else {
+                0
+            }
+        }
+        8 => {
+            if crate::rd4(s, 0) as u32 == PURC && crate::rd4(s, 4) as u32 == HASE {
+                3
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
 /// Decode six ASCII digits and two colons with a single eight-byte load.
 #[inline]
 fn clock_seconds(s: &[u8]) -> Option<i64> {
@@ -520,6 +570,114 @@ impl Dates {
     }
 }
 
+/// Inverse of `days_from_civil`, used only once per worker to seed the fixed
+/// window's date table from the manifest bounds.
+#[inline]
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    (year + if month <= 2 { 1 } else { 0 }, month, day)
+}
+
+/// A fixed-window ISO fast path. The manifest window is only a few days, so
+/// one month-prefix compare plus a 16-entry day table resolves the date; the
+/// clock is decoded by the existing SWAR helper. Any other shape, month, or
+/// date goes straight back to `Dates`, which remains the exact authority.
+struct FastDates {
+    exact: Dates,
+    midnight: [Option<u32>; 32],
+    prefix: [[u8; 10]; 32],
+    months: [u64; 8],
+    nmonths: usize,
+    enabled: bool,
+}
+
+impl FastDates {
+    fn new(start: i64, end: i64) -> Self {
+        let mut out = Self {
+            exact: Dates::default(),
+            midnight: [None; 32],
+            prefix: [[0; 10]; 32],
+            months: [0; 8],
+            nmonths: 0,
+            enabled: true,
+        };
+        let first = start.div_euclid(86_400_000);
+        let last = (end - 1).div_euclid(86_400_000);
+        if last < first || last - first >= 32 {
+            out.enabled = false;
+            return out;
+        }
+        for days in first..=last {
+            let (year, month, day) = civil_from_days(days);
+            let text = format!("{year:04}-{month:02}-{day:02}T00:00:00Z");
+            let bytes = text.as_bytes();
+            let Some(ms) = crate::parse_ts(bytes) else {
+                out.enabled = false;
+                return out;
+            };
+            let index = day as usize;
+            out.midnight[index] = Some((ms.div_euclid(1000)) as u32);
+            out.prefix[index].copy_from_slice(&bytes[..10]);
+            let month_prefix = crate::rd8(bytes, 0);
+            if !out.months[..out.nmonths].contains(&month_prefix) {
+                if out.nmonths == out.months.len() {
+                    out.enabled = false;
+                    return out;
+                }
+                out.months[out.nmonths] = month_prefix;
+                out.nmonths += 1;
+            }
+        }
+        out
+    }
+
+    #[inline]
+    fn fast_iso(&self, s: &[u8]) -> Option<i64> {
+        if !self.enabled || s.len() != 20 || s[19] != b'Z' || s[10] != b'T' {
+            return None;
+        }
+        let month = crate::rd8(s, 0);
+        if !self.months[..self.nmonths].contains(&month) {
+            return None;
+        }
+        let tens = s[8].wrapping_sub(b'0');
+        let ones = s[9].wrapping_sub(b'0');
+        if tens > 9 || ones > 9 {
+            return None;
+        }
+        let index = tens as usize * 10 + ones as usize;
+        let midnight = self.midnight[index]?;
+        if &s[..10] != &self.prefix[index] {
+            return None;
+        }
+        Some(i64::from(midnight) + clock_seconds(s)?)
+    }
+
+    #[inline]
+    fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
+        if let Some(seconds) = self.fast_iso(s) {
+            return Some(seconds);
+        }
+        self.exact.utc_seconds(s)
+    }
+
+    #[inline]
+    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        if let Some(seconds) = self.fast_iso(s) {
+            return Some(seconds * 1000);
+        }
+        self.exact.parse(s)
+    }
+}
+
 pub(super) struct EventInput<'a> {
     pub(super) products: &'a AHashMap<&'a [u8], u32>,
     pub(super) unknown: u32,
@@ -534,17 +692,39 @@ struct Parser<'a, 'catalog, 'table> {
     window_seconds: i64,
     window_ms: u64,
     dates: Dates,
+    fast_dates: Option<FastDates>,
+    fast_fields: bool,
     ids: (u32, u32),
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Event, SHARDS>,
     skip_probe: bool,
     skip_store: bool,
+    digest: u64,
+    digest_on: bool,
 }
 
 impl Parser<'_, '_, '_> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
         scan_event_rows(bytes, self);
+    }
+
+    #[inline]
+    fn ingest_seconds(&mut self, s: &[u8]) -> Option<i64> {
+        if self.fast_fields {
+            self.fast_dates.as_mut().unwrap().utc_seconds(s)
+        } else {
+            self.dates.utc_seconds(s)
+        }
+    }
+
+    #[inline]
+    fn event_time(&mut self, s: &[u8]) -> Option<i64> {
+        if self.fast_fields {
+            self.fast_dates.as_mut().unwrap().parse(s)
+        } else {
+            self.dates.parse(s)
+        }
     }
 
     #[inline]
@@ -555,9 +735,13 @@ impl Parser<'_, '_, '_> {
                 if self.skip_probe {
                     row.person = 0;
                 } else {
-                    row.person =
-                        self.users
-                            .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                    row.person = self.users.person(
+                        pending.uid,
+                        0,
+                        pending.uid,
+                        &mut self.ids,
+                        self.declined,
+                    );
                 }
             }
             if !self.skip_store {
@@ -581,7 +765,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.declined.store(true, Relaxed);
             return;
         };
-        let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
+        let Some(seconds) = self.ingest_seconds(fields.field::<3>()) else {
             self.declined.store(true, Relaxed);
             return;
         };
@@ -597,12 +781,20 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             if user.is_empty() || fields.empty::<5>() {
                 break 'valid;
             }
-            let purchase = match fields.field::<4>() {
-                b"purchase" => true,
-                b"view" | b"cart" => false,
-                _ => break 'valid,
+            let purchase = if self.fast_fields {
+                match event_kind(fields.field::<4>()) {
+                    1 | 2 => false,
+                    3 => true,
+                    _ => break 'valid,
+                }
+            } else {
+                match fields.field::<4>() {
+                    b"purchase" => true,
+                    b"view" | b"cart" => false,
+                    _ => break 'valid,
+                }
             };
-            let Some(time) = self.dates.parse(fields.field::<2>()) else {
+            let Some(time) = self.event_time(fields.field::<2>()) else {
                 break 'valid;
             };
             let relative = time.wrapping_sub(self.input.start) as u64;
@@ -628,6 +820,15 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             pending.row.ts = relative as u32;
             pending.uid = uid;
         }
+        if self.digest_on {
+            mix_digest(
+                &mut self.digest,
+                pending.row.key,
+                pending.row.ingest,
+                pending.row.ts,
+                pending.row.price,
+            );
+        }
         self.batch[self.count] = pending;
         self.count += 1;
         if self.count == self.batch.len() {
@@ -645,6 +846,8 @@ fn events(
     mode: &str,
 ) -> Vec<Streams<Event, SHARDS>> {
     let next = AtomicUsize::new(0);
+    let ff = fast_fields();
+    let dig = digest_enabled();
     rayon::broadcast(|_| {
         if mode == "scan" {
             let mut sink = ScanOnly::default();
@@ -666,12 +869,20 @@ fn events(
             window_seconds: input.start.div_euclid(1000),
             window_ms: (input.end - input.start) as u64,
             dates: Dates::default(),
+            fast_dates: if ff {
+                Some(FastDates::new(input.start, input.end))
+            } else {
+                None
+            },
+            fast_fields: ff,
             ids: (0, 0),
             batch: [Pending::EMPTY; 16],
             count: 0,
             streams: Streams::new(),
             skip_probe: mode == "fields",
             skip_store: mode != "base",
+            digest: 0,
+            digest_on: dig,
         };
         loop {
             let index = next.fetch_add(1, Relaxed);
@@ -682,6 +893,9 @@ fn events(
             parser.parse_chunk(work.get(index));
         }
         parser.flush();
+        if dig {
+            EVENT_DIGEST.fetch_add(parser.digest, Relaxed);
+        }
         parser.streams
     })
 }
@@ -796,6 +1010,9 @@ pub(super) fn run_events(
     let mode = profile_mode();
     let parse_clock = std::time::Instant::now();
     let (user0, sys0) = crate::cpu_ticks();
+    if digest_enabled() {
+        EVENT_DIGEST.store(0, Relaxed);
+    }
     let folds = events(work, read_ahead, users, input, declined, &mode);
     let (user1, sys1) = crate::cpu_ticks();
     if declined.load(Relaxed) {
@@ -821,6 +1038,9 @@ pub(super) fn run_events(
         .map(|f| (0..SHARDS).map(|shard| f.len(shard)).sum::<usize>())
         .sum();
     eprintln!("EVENT_ROWS {}", rows);
+    if digest_enabled() {
+        eprintln!("EVENT_DIGEST {:016x}", EVENT_DIGEST.load(Relaxed));
+    }
     if mode != "base" {
         return Some((local_count, names, Vec::new()));
     }
@@ -967,5 +1187,61 @@ mod tests {
         let mut actual = Collect(Vec::new());
         scan_event_rows(&input, &mut actual);
         assert_eq!(actual.0, expected);
+    }
+
+    #[test]
+    fn civil_from_days_round_trips() {
+        for days in [-100_000, -1, 0, 1, 20_000, 21_100, 100_000] {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(crate::days_from_civil(year, month, day), days);
+        }
+    }
+
+    #[test]
+    fn fast_window_dates_match_exact_parser() {
+        let start = crate::parse_ts(b"2027-12-11T00:00:00Z").unwrap();
+        let end = crate::parse_ts(b"2027-12-26T00:00:00Z").unwrap();
+        let mut fast = FastDates::new(start, end);
+        let mut exact = Dates::default();
+        for day in 11..=25 {
+            for (hour, minute, second) in [(0, 0, 0), (11, 22, 33), (23, 59, 59)] {
+                let text = format!("2027-12-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
+                let bytes = text.as_bytes();
+                assert_eq!(fast.utc_seconds(bytes), exact.utc_seconds(bytes), "{text}");
+                assert_eq!(fast.parse(bytes), exact.parse(bytes), "{text}");
+            }
+        }
+        for value in [
+            &b"2027-11-11T00:00:00Z"[..],
+            b"2027-12-26T00:00:00Z",
+            b"2027-12-11T00:00:00+01:00",
+            b"2027-12-11T24:00:00Z",
+            b"2027-12-11T00:60:00Z",
+            b"2027-12-11T00:00:60Z",
+            b"1791071890000",
+            b"0000000000000",
+            b"123",
+            b"bad",
+        ] {
+            assert_eq!(fast.parse(value), exact.parse(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn event_kind_is_exact() {
+        assert_eq!(event_kind(b"view"), 1);
+        assert_eq!(event_kind(b"cart"), 2);
+        assert_eq!(event_kind(b"purchase"), 3);
+        for value in [
+            &b""[..],
+            b"vie",
+            b"viewx",
+            b"V iew",
+            b"purchas",
+            b"purchasex",
+            b"refund",
+        ] {
+            assert_eq!(event_kind(value), 0, "{value:?}");
+        }
     }
 }
