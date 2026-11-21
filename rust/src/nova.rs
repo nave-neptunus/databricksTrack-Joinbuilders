@@ -5,7 +5,7 @@ use crate::{
     unpack_ref,
 };
 use ahash::AHashMap;
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
@@ -55,31 +55,48 @@ pub(super) fn user_key(uid: &[u8]) -> Option<u64> {
     short_key(uid, b'u').map(permute_short)
 }
 
-/// A producer owns disjoint blocks within demand-paged slabs. Stream order is
-/// described by its block IDs. No initialized record moves when a stream grows.
-struct Streams<T, const N: usize> {
+const ROWS: usize = BLOCK_BYTES / 24;
+const SLAB_BLOCKS: usize = SLAB_BYTES / BLOCK_BYTES;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Payload {
+    ingest: i32,
+    person: u32,
+    ts: u32,
+    price: u32,
+}
+
+#[repr(C)]
+struct Block {
+    keys: [MaybeUninit<u64>; ROWS],
+    payloads: [MaybeUninit<Payload>; ROWS],
+}
+const _: () = assert!(size_of::<Block>() <= BLOCK_BYTES);
+
+/// Each shard advances two columns in the same block. Dedup scans only
+/// identities and touches a payload when two exact IDs match. Routing scans
+/// only the payload column and does not reread event IDs.
+struct Streams {
     slabs: Vec<memmap2::MmapMut>,
-    blocks: [Vec<u32>; N],
-    tails: [*mut T; N],
-    used: [usize; N],
+    blocks: [Vec<u32>; SHARDS],
+    tails: [*mut Block; SHARDS],
+    used: [usize; SHARDS],
     next: usize,
 }
 
-// Pointers address the owned mappings, which remain stable when moved.
-unsafe impl<T: Send, const N: usize> Send for Streams<T, N> {}
-// Shared readers can access only initialized records. They never write the tails.
-unsafe impl<T: Sync, const N: usize> Sync for Streams<T, N> {}
+// The producer exclusively writes through pointers into its stable mappings.
+unsafe impl Send for Streams {}
+// Readers can access initialized column prefixes after the producers join.
+unsafe impl Sync for Streams {}
 
-impl<T: Copy, const N: usize> Streams<T, N> {
-    const ROWS: usize = BLOCK_BYTES / size_of::<T>();
-    const SLAB_BLOCKS: usize = SLAB_BYTES / BLOCK_BYTES;
-
+impl Streams {
     fn new() -> Self {
         Self {
             slabs: Vec::new(),
             blocks: std::array::from_fn(|_| Vec::new()),
-            tails: [std::ptr::null_mut(); N],
-            used: [Self::ROWS; N],
+            tails: [std::ptr::null_mut(); SHARDS],
+            used: [ROWS; SHARDS],
             next: 0,
         }
     }
@@ -87,7 +104,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     #[cold]
     fn extend(&mut self, stream: usize) {
         let next = self.next;
-        let slab = next / Self::SLAB_BLOCKS;
+        let slab = next / SLAB_BLOCKS;
         if slab == self.slabs.len() {
             let map = memmap2::MmapMut::map_anon(SLAB_BYTES).expect("Nova stream allocation");
             #[cfg(target_os = "linux")]
@@ -95,54 +112,75 @@ impl<T: Copy, const N: usize> Streams<T, N> {
             self.slabs.push(map);
         }
         let base = self.slabs[slab].as_mut_ptr();
-        self.tails[stream] = base
-            .wrapping_add(next % Self::SLAB_BLOCKS * BLOCK_BYTES)
-            .cast();
+        self.tails[stream] = base.wrapping_add(next % SLAB_BLOCKS * BLOCK_BYTES).cast();
         self.blocks[stream].push(u32::try_from(next).expect("Nova block index"));
         self.used[stream] = 0;
         self.next += 1;
     }
 
     #[inline]
-    fn push(&mut self, stream: usize, row: T) {
-        if self.used[stream] == Self::ROWS {
+    fn push(&mut self, stream: usize, row: Event) {
+        if self.used[stream] == ROWS {
             self.extend(stream);
         }
         let slot = self.used[stream];
-        // The cursor always points within this producer's current block.
-        unsafe { self.tails[stream].add(slot).write(row) };
+        // The cursor always points within the producer's current block.
+        let block = unsafe { &mut *self.tails[stream] };
+        block.keys[slot].write(row.key);
+        block.payloads[slot].write(Payload {
+            ingest: row.ingest,
+            person: row.person,
+            ts: row.ts,
+            price: row.price,
+        });
         self.used[stream] = slot + 1;
     }
 
     #[inline]
-    fn get(&self, stream: usize, index: usize) -> &T {
-        let id = self.blocks[stream][index / Self::ROWS] as usize;
-        let slab = &self.slabs[id / Self::SLAB_BLOCKS];
-        let offset = id % Self::SLAB_BLOCKS * BLOCK_BYTES;
-        // Dedup indices refer only to rows returned by `records`.
+    fn block(&self, id: u32) -> &Block {
+        let id = id as usize;
+        let slab = &self.slabs[id / SLAB_BLOCKS];
+        let offset = id % SLAB_BLOCKS * BLOCK_BYTES;
+        // Block IDs refer to owned, aligned mapping ranges. Both columns are MaybeUninit.
+        unsafe { &*slab.as_ptr().add(offset).cast::<Block>() }
+    }
+
+    #[inline]
+    fn get(&self, stream: usize, index: usize) -> (&u64, &Payload) {
+        let block = self.block(self.blocks[stream][index / ROWS]);
+        let slot = index % ROWS;
+        // The winner table publishes only indexes from initialized rows.
         unsafe {
-            &*slab
-                .as_ptr()
-                .add(offset)
-                .cast::<T>()
-                .add(index % Self::ROWS)
+            (
+                block.keys[slot].assume_init_ref(),
+                block.payloads[slot].assume_init_ref(),
+            )
         }
     }
 
-    fn records(&self, stream: usize) -> impl Iterator<Item = &T> {
-        let block_ids = &self.blocks[stream];
-        block_ids.iter().enumerate().flat_map(move |(i, &id)| {
-            let id = id as usize;
-            let slab = &self.slabs[id / Self::SLAB_BLOCKS];
-            let offset = id % Self::SLAB_BLOCKS * BLOCK_BYTES;
-            let len = if i + 1 == block_ids.len() {
+    fn live_blocks(&self, stream: usize) -> impl Iterator<Item = (&Block, usize)> {
+        let blocks = &self.blocks[stream];
+        blocks.iter().enumerate().map(move |(i, &id)| {
+            let len = if i + 1 == blocks.len() {
                 self.used[stream]
             } else {
-                Self::ROWS
+                ROWS
             };
-            // These block IDs belong to the stream. All preceding blocks
-            // are full and only the initialized tail prefix is exposed.
-            unsafe { std::slice::from_raw_parts(slab.as_ptr().add(offset).cast::<T>(), len) }
+            (self.block(id), len)
+        })
+    }
+
+    fn keys(&self, stream: usize) -> impl Iterator<Item = &u64> {
+        self.live_blocks(stream).flat_map(|(block, len)| {
+            // Every slot before the recorded length has both columns filled.
+            unsafe { std::slice::from_raw_parts(block.keys.as_ptr().cast::<u64>(), len) }
+        })
+    }
+
+    fn payloads(&self, stream: usize) -> impl Iterator<Item = &Payload> {
+        self.live_blocks(stream).flat_map(|(block, len)| {
+            // Every slot before the recorded length has both columns filled.
+            unsafe { std::slice::from_raw_parts(block.payloads.as_ptr().cast::<Payload>(), len) }
         })
     }
 
@@ -151,7 +189,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         if blocks == 0 {
             0
         } else {
-            (blocks - 1) * Self::ROWS + self.used[stream]
+            (blocks - 1) * ROWS + self.used[stream]
         }
     }
 }
@@ -388,7 +426,7 @@ fn events(
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
-) -> Vec<Streams<Event, SHARDS>> {
+) -> Vec<Streams> {
     let next = AtomicUsize::new(0);
     let window_seconds = input.start.div_euclid(1000);
     rayon::broadcast(|_| {
@@ -482,8 +520,6 @@ fn events(
     })
 }
 
-type EventStream = Streams<Event, SHARDS>;
-
 // Tag bits avoid an indirect load for almost every occupied cell with a
 // different key. The location refers to a record in an immutable stream.
 const LOCATION_BITS: u32 = 26;
@@ -506,7 +542,7 @@ impl Router {
         }
     }
 
-    fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
+    fn route(&mut self, folds: &[Streams], shard: usize) -> Option<()> {
         let mut count = 0;
         let mut longest = 1;
         self.bases.clear();
@@ -531,8 +567,8 @@ impl Router {
         self.losers.resize(count, 0);
 
         for (file, fold) in folds.iter().enumerate() {
-            for (index, row) in fold.records(shard).enumerate() {
-                let hash = event_hash(row.key);
+            for (index, &key) in fold.keys(shard).enumerate() {
+                let hash = event_hash(key);
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
                 let location = ((file << shift) + index + 1) as u32;
                 let mut slot = hash as usize & mask;
@@ -546,9 +582,10 @@ impl Router {
                         let previous = ((winner & LOCATION_MASK) - 1) as usize;
                         let prior_file = previous >> shift;
                         let prior_index = previous & (stride - 1);
-                        let prior = folds[prior_file].get(shard, prior_index);
-                        if same_event(prior.key, row.key) {
+                        let (&prior_key, prior) = folds[prior_file].get(shard, prior_index);
+                        if same_event(prior_key, key) {
                             // Invalid copies still compete for earliest ingest.
+                            let (_, row) = fold.get(shard, index);
                             if row.ingest < prior.ingest {
                                 self.losers[self.bases[prior_file] + prior_index] = 1;
                                 self.winners[slot] = tag | location;
@@ -564,7 +601,7 @@ impl Router {
         }
         for (file, fold) in folds.iter().enumerate() {
             let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
+            for (index, row) in fold.payloads(shard).enumerate() {
                 if row.ts != INVALID && self.losers[base + index] == 0 {
                     self.people.push(
                         row.person as usize & (P - 1),
