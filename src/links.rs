@@ -1836,13 +1836,17 @@ pub fn stage2(g: &mut G) {
         run_par(g.nt, |tid| {
             let t = gr.t(tid);
             let mut sc = Scratch::default();
+            let mut idle = 0usize;
             loop {
                 if job(gr, t, &mut sc) {
+                    idle = 0;
                     continue;
                 }
                 if done(gr) {
                     break;
                 }
+                idle += 1;
+                if idle >= 256 && idle & 255 == 0 { std::thread::yield_now(); }
                 std::hint::spin_loop();
             }
         });
