@@ -222,6 +222,7 @@ const LOC_INDEX_BITS: u32 = 18;
 const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
 const LOC_WORKER_SHIFT: u32 = LOC_PART_SHIFT + 10;
 const INDEX_MASK: u32 = (1 << LOC_INDEX_BITS) - 1;
+const NO_LOC: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct Pending {
@@ -588,23 +589,22 @@ impl Parser<'_, '_, '_> {
     fn flush(&mut self) {
         let mut writer = self.people.writer();
         for pending in &self.batch[..self.count] {
-            let (person, ts) = if pending.ts != INVALID {
+            let loc = if pending.ts != INVALID {
                 let person = self
                     .users
                     .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
-                (person, pending.ts)
+                let Some(index) = writer.push(person, pending.ts, pending.price) else {
+                    self.declined.store(true, Relaxed);
+                    continue;
+                };
+                (self.worker << LOC_WORKER_SHIFT)
+                    | ((person as u32 & ((P - 1) as u32)) << LOC_PART_SHIFT)
+                    | (index & INDEX_MASK)
             } else {
-                // Invalid copies still compete for the earliest ingest; their
-                // payload is already permanently dead.
-                (0, INVALID)
+                // Invalid copies still compete for the earliest ingest, but
+                // they have no payload to keep or tombstone.
+                NO_LOC
             };
-            let Some(index) = writer.push(person, ts, pending.price) else {
-                self.declined.store(true, Relaxed);
-                continue;
-            };
-            let loc = (self.worker << LOC_WORKER_SHIFT)
-                | ((person as u32 & ((P - 1) as u32)) << LOC_PART_SHIFT)
-                | (index & INDEX_MASK);
             self.streams.push(
                 (pending.key >> 55) as u8 as usize,
                 Claim { key: pending.key, ingest: pending.ingest, loc },
@@ -770,6 +770,9 @@ impl Router {
 
     #[inline]
     fn tombstone(people: &[People], loc: u32) {
+        if loc == NO_LOC {
+            return;
+        }
         let worker = (loc >> LOC_WORKER_SHIFT) as usize;
         let part = ((loc >> LOC_PART_SHIFT) as usize) & (P - 1);
         let index = (loc & INDEX_MASK) as usize;
