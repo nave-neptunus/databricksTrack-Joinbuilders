@@ -4,52 +4,104 @@ on:
   push:
     branches: [g7/bench-ci]
 
+env:
+  DATA_SEED: "3"
+
 jobs:
-  benchmark:
+  lanes8:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
       BASELINE_REF: ed40599
       CANDIDATE_REF: 6fafb87
-      PAIRS: "6"
-      NCPU: "8"
-      DATA_SEED: "3"
+      PAIRS: "10"
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Runner capabilities
+        with: { fetch-depth: 0 }
+      - name: Runner capabilities and thread count
         run: |
           lscpu
           free -h
           df -h /
-          if grep -qw avx512f /proc/cpuinfo; then
-            echo 'AVX512F=yes'
-          else
-            echo 'AVX512F=no; refusing a non-representative run' >&2
-            exit 1
-          fi
-          printf 'baseline=%s candidate=%s pairs=%s ncpu=%s\n' "$BASELINE_REF" "$CANDIDATE_REF" "$PAIRS" "$NCPU"
+          if ! grep -qw avx512f /proc/cpuinfo; then echo 'AVX512F=no; refusing non-representative run' >&2; exit 1; fi
+          echo 'AVX512F=yes'
+          echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
+          cat /sys/kernel/mm/transparent_hugepage/enabled
       - name: Fetch pinned benchmark support
         run: |
           git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
           git checkout origin/ci-bench -- generator fixtures scripts
-      - name: Install checker dependency
-        run: python3 -m pip install --quiet polars
+      - run: python3 -m pip install --quiet polars
       - name: Generate 20M corpus
         run: |
           cargo build --release --locked --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
-          du -sh "$HOME/big20"
-      - name: Build, gate, stage profile, and cold A/B timing
+      - name: Gate, profile, and 10 cold pairs
         run: python3 bench/ci_bench.py "$HOME/big20" "$HOME/g7-bench" 2>&1 | tee "$HOME/g7-bench.log"
-      - name: Publish summary
-        if: always()
+      - if: always()
         run: cat "$HOME/g7-bench/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: g7-benchmark-${{ github.run_id }}
-          path: |
+          name: lanes8-${{ github.run_id }}
+          path: |-
             ~/g7-bench.log
-            ~/g7-bench/**
+            ~/g7-bench/summary.md
+            ~/g7-bench/observations.json
+            ~/g7-bench/logs/**
+
+  knob-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: pinstart-1, setting: XL_PINSTART=1 }
+          - { label: rel-0, setting: XL_REL=0 }
+          - { label: spin-50, setting: XL_SPIN=50 }
+          - { label: spin-100, setting: XL_SPIN=100 }
+          - { label: spin-1000, setting: XL_SPIN=1000 }
+          # XL_ENDREL=1 is the default conditional behavior; 2 actually forces release.
+          - { label: endrel-2, setting: XL_ENDREL=2 }
+          - { label: rd-0, setting: XL_RD=0 }
+          - { label: rd-512, setting: XL_RD=512 }
+          - { label: ch-2048, setting: XL_CH=2048 }
+          - { label: ch-4096, setting: XL_CH=4096 }
+    env:
+      BASELINE_REF: ed40599
+      CANDIDATE_REF: ed40599
+      CANDIDATE_ENV: ${{ matrix.setting }}
+      PAIRS: "10"
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Runner capabilities and thread count
+        run: |
+          lscpu
+          if ! grep -qw avx512f /proc/cpuinfo; then echo 'AVX512F=no; refusing non-representative run' >&2; exit 1; fi
+          echo 'AVX512F=yes'
+          echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
+          cat /sys/kernel/mm/transparent_hugepage/enabled
+      - name: Fetch pinned benchmark support
+        run: |
+          git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
+          git checkout origin/ci-bench -- generator fixtures scripts
+      - run: python3 -m pip install --quiet polars
+      - name: Generate 20M corpus
+        run: |
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+          generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
+      - name: Gate and 10 cold pairs (${{ matrix.label }})
+        run: python3 bench/ci_bench.py "$HOME/big20" "$HOME/g7-bench" 2>&1 | tee "$HOME/g7-bench.log"
+      - if: always()
+        run: cat "$HOME/g7-bench/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: knob-${{ matrix.label }}-${{ github.run_id }}
+          path: |-
+            ~/g7-bench.log
+            ~/g7-bench/summary.md
+            ~/g7-bench/observations.json
+            ~/g7-bench/logs/**
