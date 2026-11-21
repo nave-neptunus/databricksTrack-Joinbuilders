@@ -9,6 +9,7 @@ arrow-array = "60.1.0"
 arrow-schema = "60.1.0"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
+mimalloc = { version = "0.1", default-features = false }
 parquet = { version = "60.1.0", default-features = false, features = ["arrow"] }
 rayon = "1.12.0"
 

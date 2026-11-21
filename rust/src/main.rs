@@ -6,6 +6,9 @@
 // partitions. A separate, compact event-ID stream identifies the copies to tombstone before
 // sessions. Any detected hash collision (same 64-bit key, different check) or unsupported input
 // sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod slow;
 
 use ahash::AHashMap as HashMap;
