@@ -1,10 +1,10 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
+use crate::{DAY, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
 const BLOCK_BYTES: usize = 4096;
@@ -170,7 +170,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         let id = self.blocks[stream][index / Self::ROWS] as usize;
         let slab = &self.slabs[id / Self::SLAB_BLOCKS];
         let offset = id % Self::SLAB_BLOCKS * BLOCK_BYTES;
-        // Dedup indices refer only to rows returned by `records`.
+        // Dedup indices refer only to initialized rows returned by `chunks`.
         unsafe {
             &*slab
                 .as_ptr()
@@ -180,9 +180,9 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         }
     }
 
-    fn records(&self, stream: usize) -> impl Iterator<Item = &T> {
+    fn chunks(&self, stream: usize) -> impl Iterator<Item = &[T]> {
         let block_ids = &self.blocks[stream];
-        block_ids.iter().enumerate().flat_map(move |(i, &id)| {
+        block_ids.iter().enumerate().map(move |(i, &id)| {
             let id = id as usize;
             let slab = &self.slabs[id / Self::SLAB_BLOCKS];
             let offset = id % Self::SLAB_BLOCKS * BLOCK_BYTES;
@@ -706,6 +706,8 @@ struct Router {
     winners: Vec<u32>,
     losers: Vec<u8>,
     bases: Vec<usize>,
+    hash_ns: u64,
+    scatter_ns: u64,
 }
 
 impl Router {
@@ -715,10 +717,13 @@ impl Router {
             winners: Vec::new(),
             losers: Vec::new(),
             bases: Vec::new(),
+            hash_ns: 0,
+            scatter_ns: 0,
         }
     }
 
     fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
+        let begin = std::time::Instant::now();
         let mut count = 0;
         let mut longest = 1;
         self.bases.clear();
@@ -743,52 +748,64 @@ impl Router {
         self.losers.resize(count, 0);
 
         for (file, fold) in folds.iter().enumerate() {
-            for (index, row) in fold.records(shard).enumerate() {
-                let hash = row.key;
-                let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
-                let location = ((file << shift) + index + 1) as u32;
-                let mut slot = hash as usize & mask;
-                loop {
-                    let winner = self.winners[slot];
-                    if winner == 0 {
-                        self.winners[slot] = tag | location;
-                        break;
+            let mut block_base = 0;
+            for block in fold.chunks(shard) {
+                for (offset, row) in block.iter().enumerate() {
+                    let index = block_base + offset;
+                    if let Some(next) = block.get(offset + 16) {
+                        crate::prefetch_read(self.winners.as_ptr().wrapping_add(next.key as usize & mask).cast());
                     }
-                    if winner & !LOCATION_MASK == tag {
-                        let previous = ((winner & LOCATION_MASK) - 1) as usize;
-                        let prior_file = previous >> shift;
-                        let prior_index = previous & (stride - 1);
-                        let prior = folds[prior_file].get(shard, prior_index);
-                        if prior.key == row.key {
-                            // Invalid copies still compete for earliest ingest.
-                            if row.ingest < prior.ingest {
-                                self.losers[self.bases[prior_file] + prior_index] = 1;
-                                self.winners[slot] = tag | location;
-                            } else {
-                                self.losers[self.bases[file] + index] = 1;
-                            }
+                    let hash = row.key;
+                    let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
+                    let location = ((file << shift) + index + 1) as u32;
+                    let mut slot = hash as usize & mask;
+                    loop {
+                        let winner = self.winners[slot];
+                        if winner == 0 {
+                            self.winners[slot] = tag | location;
                             break;
                         }
+                        if winner & !LOCATION_MASK == tag {
+                            let previous = ((winner & LOCATION_MASK) - 1) as usize;
+                            let prior_file = previous >> shift;
+                            let prior_index = previous & (stride - 1);
+                            let prior = folds[prior_file].get(shard, prior_index);
+                            if prior.key == row.key {
+                                // Invalid copies still compete for earliest ingest.
+                                if row.ingest < prior.ingest {
+                                    self.losers[self.bases[prior_file] + prior_index] = 1;
+                                    self.winners[slot] = tag | location;
+                                } else {
+                                    self.losers[self.bases[file] + index] = 1;
+                                }
+                                break;
+                            }
+                        }
+                        slot = (slot + 1) & mask;
                     }
-                    slot = (slot + 1) & mask;
                 }
+                block_base += block.len();
             }
         }
+        self.hash_ns += begin.elapsed().as_nanos() as u64;
+        let begin = std::time::Instant::now();
+        let mut writer = self.people.writer();
         for (file, fold) in folds.iter().enumerate() {
             let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
-                if row.ts != INVALID && self.losers[base + index] == 0 {
-                    self.people.push(
-                        row.person as usize & (P - 1),
-                        EvP {
-                            person: row.person,
-                            ts: AtomicU32::new(row.ts),
-                            price: row.price,
-                        },
-                    );
+            let mut block_base = base;
+            for block in fold.chunks(shard) {
+                for (offset, row) in block.iter().enumerate() {
+                    if let Some(next) = block.get(offset + 16) {
+                        writer.prefetch(next.person);
+                    }
+                    if row.ts != INVALID && self.losers[block_base + offset] == 0 {
+                        writer.push(row.person, row.ts, row.price);
+                    }
                 }
+                block_base += block.len();
             }
         }
+        self.scatter_ns += begin.elapsed().as_nanos() as u64;
         Some(())
     }
 }
@@ -830,17 +847,18 @@ pub(super) fn run_events(
         },
     )
     .into_iter()
-    .map(|router| router.people)
+    .map(|router| {
+        if std::env::var_os("TIMING").is_some() {
+            eprintln!("ROUTER hash={:.1} scatter={:.1}", router.hash_ns as f64 / 1e6, router.scatter_ns as f64 / 1e6);
+        }
+        router.people
+    })
     .collect();
     if declined.load(Relaxed) {
         return None;
     }
     lap("  dedup routed");
-    if std::env::var_os("BREAKER_KEEP_STREAMS").is_some() {
-        std::mem::forget(folds);
-    } else {
-        drop(folds);
-    }
+    drop(folds);
     lap("events dedup + validate");
     Some((local_count, names, people))
 }

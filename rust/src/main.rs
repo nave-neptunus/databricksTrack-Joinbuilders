@@ -1134,8 +1134,8 @@ impl<'a> Users<'a> {
 struct People {
     storage: Option<memmap2::MmapMut>,
     stride: usize,
-    lengths: Vec<usize>,
-    overflow: Vec<Vec<EvP>>,
+    lengths: Box<[usize; P]>,
+    overflow: Box<[Vec<EvP>; P]>,
 }
 
 // The mapping is only written through &mut self; shared access reads initialized prefixes.
@@ -1154,8 +1154,13 @@ impl People {
             let _ = mapping.advise(memmap2::Advice::HugePage);
         }
         let stride = if storage.is_some() { reservation } else { 0 };
-        let overflow = (0..P).map(|_| if stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }).collect();
-        Self { storage, stride, lengths: vec![0; P], overflow }
+        let overflow = Box::new(std::array::from_fn(|_| if stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }));
+        Self { storage, stride, lengths: Box::new([0; P]), overflow }
+    }
+
+    fn writer(&mut self) -> PeopleWriter<'_> {
+        let base = self.storage.as_mut().map_or(std::ptr::null_mut(), |m| m.as_mut_ptr().cast());
+        PeopleWriter { base, stride: self.stride, lengths: &mut self.lengths, overflow: &mut self.overflow }
     }
 
     #[inline]
@@ -1189,6 +1194,51 @@ impl People {
     fn get(&self, part: usize, index: usize) -> &EvP {
         let [prefix, overflow] = self.records(part);
         prefix.get(index).unwrap_or_else(|| &overflow[index - prefix.len()])
+    }
+}
+
+/// Borrow the mapping once for a whole scatter pass. The masked person ID
+/// indexes fixed-size arrays and the common write needs no optional-map lookup.
+struct PeopleWriter<'a> {
+    base: *mut EvP,
+    stride: usize,
+    lengths: &'a mut [usize; P],
+    overflow: &'a mut [Vec<EvP>; P],
+}
+
+#[inline]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast()); }
+    #[cfg(target_arch = "aarch64")]
+    unsafe { std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags)); }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
+
+impl PeopleWriter<'_> {
+    #[inline]
+    fn prefetch(&self, person: u32) {
+        let part = person as usize & (P - 1);
+        let len = self.lengths[part];
+        if len < self.stride {
+            prefetch_read(self.base.wrapping_add(part * self.stride + len).cast());
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, person: u32, ts: u32, price: u32) {
+        let part = person as usize & (P - 1);
+        let len = self.lengths[part];
+        let row = EvP { person, ts: AtomicU32::new(ts), price };
+        if len < self.stride {
+            // Nonzero stride requires an owned mapping; this partition's
+            // initialized prefix is extended by exactly one exclusive write.
+            unsafe { self.base.add(part * self.stride + len).write(row) };
+            self.lengths[part] = len + 1;
+        } else {
+            self.overflow[part].push(row);
+        }
     }
 }
 
