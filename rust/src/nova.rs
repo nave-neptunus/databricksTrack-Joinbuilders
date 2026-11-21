@@ -1,12 +1,9 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{
-    DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, hs, lap, pack_ref, parse_price,
-    unpack_ref,
-};
+use crate::{DAY, EvP, P, People, Users, event_rows, hs, lap, pack_ref, parse_price, unpack_ref};
 use ahash::AHashMap;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
 const BLOCK_BYTES: usize = 4096;
@@ -160,33 +157,12 @@ impl<T: Copy, const N: usize> Streams<T, N> {
 #[derive(Clone, Copy)]
 struct Event {
     key: u64,
+    name: u64,
     ingest: i32,
-    person: u32,
     ts: u32,
     price: u32,
 }
-const _: () = assert!(size_of::<Event>() == 24);
-
-#[derive(Clone, Copy)]
-struct Pending {
-    row: Event,
-    uid: u64,
-    name: u64,
-}
-
-impl Pending {
-    const EMPTY: Self = Self {
-        row: Event {
-            key: 0,
-            ingest: 0,
-            person: 0,
-            ts: INVALID,
-            price: 0,
-        },
-        uid: 0,
-        name: 0,
-    };
-}
+const _: () = assert!(size_of::<Event>() == 32);
 
 // The common event row spans three AVX2 vectors. Read each vector once for
 // newlines, commas, and quote syntax. Every load stays inside the mapped chunk.
@@ -382,107 +358,93 @@ fn event_hash(key: u64) -> u64 {
     }
 }
 
-fn events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
-    users: &Users<'_>,
+pub(super) fn scan_events<'a>(
+    chunks: usize,
+    load: impl Fn(usize) -> &'a [u8] + Sync,
     input: &EventInput<'_>,
     declined: &AtomicBool,
-) -> Vec<Streams<Event, SHARDS>> {
-    let next = AtomicUsize::new(0);
+) -> Events {
     let window_seconds = input.start.div_euclid(1000);
-    rayon::broadcast(|_| {
-        let mut streams = Streams::new();
-        let mut dates = Dates::default();
-        let mut ids = (0, 0);
-        let mut batch = [Pending::EMPTY; 16];
-        let mut len = 0;
-        let mut flush = |rows: &[Pending]| {
-            for pending in rows {
-                let mut row = pending.row;
-                if row.ts != INVALID {
-                    row.person = users.person(pending.uid, 0, pending.name, &mut ids, declined);
-                }
-                streams.push((event_hash(row.key) >> 55) as u8 as usize, row);
-            }
-        };
-        loop {
-            let index = next.fetch_add(1, Relaxed);
-            if index >= work.len() {
-                break;
-            }
-            read_ahead.wait(work.raw(index));
-            let chunk = work.get(index);
-            scan_event_rows::<true>(chunk, |_, [id, user, ts, ingest, kind, product, price]| {
-                if id.is_empty() {
-                    return;
-                }
-                let key = match short_key(id, b'e') {
-                    Some(key) => permute_short(key),
-                    None => {
-                        let Some(name) = pack_ref(id).filter(|name| name & SHORT_KEY == 0) else {
-                            declined.store(true, Relaxed);
-                            return;
+    let folds = crate::pt_ordered(
+        chunks,
+        || (Streams::new(), Dates::default()),
+        |(mut streams, mut dates), index| {
+            scan_event_rows::<true>(
+                load(index),
+                |_, [id, user, ts, ingest, kind, product, price]| {
+                    if id.is_empty() {
+                        return;
+                    }
+                    let key = match short_key(id, b'e') {
+                        Some(key) => permute_short(key),
+                        None => {
+                            let Some(name) = pack_ref(id).filter(|name| name & SHORT_KEY == 0)
+                            else {
+                                declined.store(true, Relaxed);
+                                return;
+                            };
+                            name
+                        }
+                    };
+                    let Some(seconds) = dates.utc_seconds(ingest) else {
+                        declined.store(true, Relaxed);
+                        return;
+                    };
+                    let Ok(order) = i32::try_from(seconds - window_seconds) else {
+                        declined.store(true, Relaxed);
+                        return;
+                    };
+                    let mut row = Event {
+                        key,
+                        name: 0,
+                        ingest: order,
+                        ts: INVALID,
+                        price: 0,
+                    };
+                    'valid: {
+                        if user.is_empty() || product.is_empty() {
+                            break 'valid;
+                        }
+                        let purchase = match kind {
+                            b"purchase" => true,
+                            b"view" | b"cart" => false,
+                            _ => break 'valid,
                         };
-                        name
-                    }
-                };
-                let Some(seconds) = dates.utc_seconds(ingest) else {
-                    declined.store(true, Relaxed);
-                    return;
-                };
-                let Ok(order) = i32::try_from(seconds - window_seconds) else {
-                    declined.store(true, Relaxed);
-                    return;
-                };
-                let mut pending = Pending::EMPTY;
-                pending.row.key = key;
-                pending.row.ingest = order;
-                'valid: {
-                    if user.is_empty() || product.is_empty() {
-                        break 'valid;
-                    }
-                    let purchase = match kind {
-                        b"purchase" => true,
-                        b"view" | b"cart" => false,
-                        _ => break 'valid,
-                    };
-                    let Some(time) = dates.parse(ts) else {
-                        break 'valid;
-                    };
-                    if time < input.start || time >= input.end || seconds * 1000 - time > DAY {
-                        break 'valid;
-                    }
-                    if purchase {
-                        let Some(value) = parse_price(price) else {
+                        let Some(time) = dates.parse(ts) else {
                             break 'valid;
                         };
-                        let category = *input.products.get(product).unwrap_or(&input.unknown);
-                        pending.row.price = value | (category << 24);
+                        if time < input.start || time >= input.end || seconds * 1000 - time > DAY {
+                            break 'valid;
+                        }
+                        if purchase {
+                            let Some(value) = parse_price(price) else {
+                                break 'valid;
+                            };
+                            let category = *input.products.get(product).unwrap_or(&input.unknown);
+                            row.price = value | (category << 24);
+                        }
+                        let Some(name) = pack_ref(user) else {
+                            declined.store(true, Relaxed);
+                            break 'valid;
+                        };
+                        row.ts = (time - input.start) as u32;
+                        row.name = name;
                     }
-                    let (Some(uid), Some(name)) = (user_key(user), pack_ref(user)) else {
-                        declined.store(true, Relaxed);
-                        break 'valid;
-                    };
-                    users.prefetch(uid);
-                    pending.row.ts = (time - input.start) as u32;
-                    pending.uid = uid;
-                    pending.name = name;
-                }
-                batch[len] = pending;
-                len += 1;
-                if len == batch.len() {
-                    flush(&batch);
-                    len = 0;
-                }
-            });
-        }
-        flush(&batch[..len]);
-        streams
-    })
+                    streams.push((event_hash(key) >> 55) as u8 as usize, row);
+                },
+            );
+            (streams, dates)
+        },
+    )
+    .into_iter()
+    .map(|(streams, _)| streams)
+    .collect::<Vec<_>>();
+    lap(&format!("events scanned (nova, {} folds)", folds.len()));
+    Events(folds)
 }
 
 type EventStream = Streams<Event, SHARDS>;
+pub(super) struct Events(Vec<EventStream>);
 
 // Tag bits avoid an indirect load for almost every occupied cell with a
 // different key. The location refers to a record in an immutable stream.
@@ -491,6 +453,7 @@ const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
 
 struct Router {
     people: People,
+    ids: (u32, u32),
     winners: Vec<u32>,
     losers: Vec<u8>,
     bases: Vec<usize>,
@@ -500,13 +463,20 @@ impl Router {
     fn new(reservation: usize) -> Self {
         Self {
             people: People::new(reservation),
+            ids: (0, 0),
             winners: Vec::new(),
             losers: Vec::new(),
             bases: Vec::new(),
         }
     }
 
-    fn route(&mut self, folds: &[EventStream], shard: usize) -> Option<()> {
+    fn route(
+        &mut self,
+        folds: &[EventStream],
+        shard: usize,
+        users: &Users<'_>,
+        declined: &AtomicBool,
+    ) -> Option<()> {
         let mut count = 0;
         let mut longest = 1;
         self.bases.clear();
@@ -562,21 +532,34 @@ impl Router {
                 }
             }
         }
+        let mut batch = Vec::with_capacity(16);
+        let mut flush = |batch: &mut Vec<(u64, &Event)>| {
+            for (uid, row) in batch.drain(..) {
+                let person = users.person(uid, 0, row.name, &mut self.ids, declined);
+                self.people.push(
+                    person as usize & (P - 1),
+                    EvP {
+                        person,
+                        ts: AtomicU32::new(row.ts),
+                        price: row.price,
+                    },
+                );
+            }
+        };
         for (file, fold) in folds.iter().enumerate() {
             let base = self.bases[file];
             for (index, row) in fold.records(shard).enumerate() {
                 if row.ts != INVALID && self.losers[base + index] == 0 {
-                    self.people.push(
-                        row.person as usize & (P - 1),
-                        EvP {
-                            person: row.person,
-                            ts: AtomicU32::new(row.ts),
-                            price: row.price,
-                        },
-                    );
+                    let uid = user_key(unpack_ref(row.name))?;
+                    users.prefetch(uid);
+                    batch.push((uid, row));
+                    if batch.len() == 16 {
+                        flush(&mut batch);
+                    }
                 }
             }
         }
+        flush(&mut batch);
         Some(())
     }
 }
@@ -586,21 +569,12 @@ fn same_event(a: u64, b: u64) -> bool {
     a == b || ((a | b) & SHORT_KEY == 0 && unpack_ref(a) == unpack_ref(b))
 }
 
-pub(super) fn run_events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+pub(super) fn route_events(
+    Events(folds): Events,
     users: &Users<'_>,
-    input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let folds = events(work, read_ahead, users, input, declined);
-    let (local_count, names) = users.names(linked_names, declined);
-    lap(&format!(
-        "events parsed (nova, {} folds, {} persons)",
-        folds.len(),
-        names.len()
-    ));
     if declined.load(Relaxed) {
         return None;
     }
@@ -613,7 +587,7 @@ pub(super) fn run_events(
         SHARDS,
         || Router::new(reservation),
         |mut router, shard| {
-            if router.route(&folds, shard).is_none() {
+            if router.route(&folds, shard, users, declined).is_none() {
                 declined.store(true, Relaxed);
             }
             router
@@ -626,8 +600,9 @@ pub(super) fn run_events(
         return None;
     }
     drop(folds);
+    let (local_count, names) = users.names(linked_names, declined);
     lap("events dedup + validate");
-    Some((local_count, names, people))
+    (!declined.load(Relaxed)).then_some((local_count, names, people))
 }
 
 #[cfg(test)]

@@ -1922,22 +1922,51 @@ fn fast(seed: u64, nova: bool) -> bool {
         let total: usize = evb.iter().map(|b| b.len()).sum();
         total / ((1 << 16) / rows).max(1) / 12
     });
-    for b in &lkb {
-        ra.wait(b);
-    }
-    lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, nova) else {
+    let coll = AtomicBool::new(false);
+    let ech = LazyChunks::new(&evb, 1 << 20);
+    let links = || {
+        for b in &lkb {
+            ra.wait(b);
+        }
+        lap("  links read");
+        let result = build_links(&lkb, est_users, seed, nova);
+        if let Some((_, edges, ids, names)) = &result {
+            lap(&format!("links: {edges} edges, {ids} ids, {} persons", names.len()));
+        }
+        result
+    };
+    let (links, scanned) = if nova {
+        let links_done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            // Wait for links outside Rayon. Both parsers can use its workers.
+            let link_job = scope.spawn(|| {
+                let result = links();
+                links_done.store(true, Relaxed);
+                result
+            });
+            let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
+            let scanned = nova::scan_events(ech.len(), |index| {
+                ra.wait(ech.raw(index));
+                if !links_done.load(Relaxed) {
+                    // The event broadcast holds all workers. Let queued link
+                    // jobs run between chunks while link construction is active.
+                    rayon::yield_now();
+                }
+                ech.get(index)
+            }, &input, &coll);
+            (link_job.join().unwrap(), Some(scanned))
+        })
+    } else {
+        (links(), None)
+    };
+    let Some((mut ltab, _, nids, pname)) = links else {
         return false;
     };
-    let coll = AtomicBool::new(false);
     let users = Users::new(&mut ltab, nids, pname.len());
-    lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Produce person partitions with exactly the retained, valid events.
-    let ech = LazyChunks::new(&evb, 1 << 20);
-    let (linked_count, pname, paccs) = if nova {
-        let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
+    let (linked_count, pname, paccs) = if let Some(scanned) = scanned {
+        let Some(result) = nova::route_events(scanned, &users, &pname, &coll) else {
             return false;
         };
         result
@@ -2246,7 +2275,8 @@ fn fast(seed: u64, nova: bool) -> bool {
     };
     camp_job();
     lap("parquet written");
-    true
+    // All Parquet writers have closed. Skip teardown of the in-memory engine.
+    std::process::exit(0);
 }
 
 /// Like rayon's fold, but exactly one accumulator per worker thread (fold makes one per split,
