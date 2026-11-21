@@ -1981,14 +1981,11 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                     let mut pm = (pkm.add(8 * wd) as *const u64).read_unaligned();
                     let n = pm.count_ones() as usize;
                     let base = (64 * wd) as u32;
-                    *pl.add(np) = (base + pm.trailing_zeros()) as u16;
-                    pm &= pm.wrapping_sub(1);
-                    *pl.add(np + 1) = (base + pm.trailing_zeros()) as u16;
-                    pm &= pm.wrapping_sub(1);
-                    *pl.add(np + 2) = (base + pm.trailing_zeros()) as u16;
-                    pm &= pm.wrapping_sub(1);
-                    *pl.add(np + 3) = (base + pm.trailing_zeros()) as u16;
-                    pm &= pm.wrapping_sub(1);
+                    if n == 0 { continue; }
+                    for j in 0..n.min(4) {
+                        *pl.add(np + j) = (base + pm.trailing_zeros()) as u16;
+                        pm &= pm.wrapping_sub(1);
+                    }
                     if n > 4 {
                         let mut j = np + 4;
                         while pm != 0 {
