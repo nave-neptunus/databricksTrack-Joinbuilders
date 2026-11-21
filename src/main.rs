@@ -380,7 +380,7 @@ fn main() {
         eprintln!("[memtest] {}", if sys::mem_test() { "OK" } else { "FAILED" });
         unsafe { sys::_exit(0) };
     }
-    let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, nt, check)));
+    let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, &outdir, nt, check)));
     lap("setup");
     if std::env::var("XL_SORTBENCH").is_ok() {
         links::sort_bench(g);

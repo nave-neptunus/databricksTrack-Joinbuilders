@@ -221,11 +221,12 @@ fn lookups(data: &Path) -> Lookups {
     Lookups { prod, cats, camp, channels, nc }
 }
 
-pub fn setup(data: &str, nt: usize, check: bool) -> G {
+pub fn setup(data: &str, outdir: &str, nt: usize, check: bool) -> G {
     let psetup = std::env::var("XL_PSETUP").map_or(PSETUP_DEF, |v| v == "1");
     if nt >= 2 && crate::sys::pool_size() + 1 >= nt && psetup {
-        return setup_par(data, nt, check);
+        return setup_par(data, outdir, nt, check);
     }
+    crate::out::prepare(outdir);
     let data = Path::new(data);
     let rd = |name: &str| std::fs::read(data.join(name)).unwrap_or_else(|_| fallback("cannot read a lookup file"));
     let man = rd("manifest.json");
@@ -701,7 +702,7 @@ fn sample_bytes(all: &[u8]) -> &[u8] {
     &bytes[..cut]
 }
 
-pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
+pub fn setup_par(data: &str, outdir: &str, nt: usize, check: bool) -> G {
     let data = Path::new(data);
     let rd = |name: &str| std::fs::read(data.join(name)).unwrap_or_else(|_| fallback("cannot read a lookup file"));
     let man = rd("manifest.json");
@@ -753,14 +754,16 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     };
     let upart = crate::sys::SETUP_PARTS.load(Ordering::Relaxed);
     let npt = if upart { 1 } else { 0 };
-    let (q_p, q_ord, q_merge, q_part) = (2, 2 + kp, 3 + kp, 4 + kp);
+    let (q_out, q_p, q_ord, q_merge, q_part) = (2, 3, 3 + kp, 4 + kp, 5 + kp);
     let q_core = q_part + npt;
     let nq = q_core + nt;
     let nbs: Slot<(usize, usize)> = Slot::new();
     let parts: Vec<Slot<(crate::parse::Part, crate::parse::Part)>> = (0..if upart { nt } else { 0 }).map(|_| Slot::new()).collect();
     let qnext = AtomicUsize::new(0);
     let task_inner = |i: usize| {
-        if i == 1 {
+        if i == q_out {
+            crate::out::prepare(outdir);
+        } else if i == 1 {
             camps.set(campaigns(data));
         } else if i == 0 {
             ptxt.set(map_file(&data.join("products.csv")));
