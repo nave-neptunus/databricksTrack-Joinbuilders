@@ -6,6 +6,7 @@
 // partitions. A separate, compact event-ID stream identifies the copies to tombstone before
 // sessions. Any detected hash collision (same 64-bit key, different check) or unsupported input
 // sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
+mod clicks;
 mod nova;
 mod slow;
 mod user_parquet;
@@ -2090,23 +2091,25 @@ fn fast(seed: u64, nova: bool) -> bool {
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
     let cch = LazyChunks::new(&ckb, 1 << 20);
-    let caccs: Vec<Vec<Vec<Click>>> = pt_ordered(
+    let rows_per_partition = cch.total() / 32 / rayon::current_num_threads() / P;
+    let reserve = if rows_per_partition >= 128 { rows_per_partition.next_multiple_of(128).min(32_768) } else { 0 };
+    let caccs = pt_ordered(
         cch.len(),
-        || (0..P).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
+        || clicks::Partitions::new(reserve),
         |mut acc, ci| {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
-            let mut dates = Dates::default();
+            let mut dates = nova::Dates::default();
             let mut batch = Vec::with_capacity(16);
             let mut flush = |batch: &mut Vec<PendingClick>| {
                 for PendingClick { mut click, key, check } in batch.drain(..) {
                     // A user id not in the table has no valid event, so no session to credit.
                     let Some(person) = users.find(key, check, &coll) else { continue };
                     click.person = person;
-                    acc[person as usize & (P - 1)].push(click);
+                    acc.push(click);
                 }
             };
-            mask_rows::<4>(chunk, |_, [cid, user, cmp, ts]| {
+            clicks::rows(chunk, |[cid, user, cmp, ts]| {
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }
@@ -2173,7 +2176,7 @@ fn fast(seed: u64, nova: bool) -> bool {
     let mut order = Vec::with_capacity(P);
     for partition in 0..P {
         let events: usize = paccs.iter().map(|fold| fold.len(partition)).sum();
-        let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
+        let clicks: usize = caccs.iter().map(|fold| fold.len(partition)).sum();
         order.push((std::cmp::Reverse(events + clicks), partition));
     }
     std::fs::create_dir_all(format!("{out}/user_daily")).unwrap();
@@ -2306,7 +2309,7 @@ impl PartitionState {
         partition: usize,
         people: u32,
         event_folds: &[People],
-        click_folds: &[Vec<Vec<Click>>],
+        click_folds: &[clicks::Partitions],
     ) {
         let Self { event_ends, click_ends, events, clicks, .. } = self;
         event_ends.clear();
@@ -2317,7 +2320,7 @@ impl PartitionState {
             .flat_map(|fold| fold.records(partition))
             .flatten()
             .filter_map(EvP::session_input);
-        let click_rows = || click_folds.iter().flat_map(|fold| &fold[partition]);
+        let click_rows = || click_folds.iter().flat_map(|fold| fold.records(partition)).flatten();
         for (person, _) in event_rows() {
             event_ends[(person >> PB) as usize] += 1;
         }
