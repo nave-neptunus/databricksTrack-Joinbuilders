@@ -2320,7 +2320,6 @@ struct PartitionState {
     click_ends: Vec<usize>,
     events: Vec<u64>,
     clicks: Vec<Click>,
-    event_scratch: Vec<u64>,
     click_scratch: Vec<Click>,
     buckets: EventBuckets,
     user: user_parquet::UserParquet,
@@ -2340,7 +2339,6 @@ impl PartitionState {
             click_ends: Vec::new(),
             events: Vec::new(),
             clicks: Vec::new(),
-            event_scratch: Vec::new(),
             click_scratch: Vec::new(),
             buckets: EventBuckets::default(),
             user,
@@ -2405,7 +2403,7 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
-            event_ends, click_ends, events, clicks, event_scratch, click_scratch, buckets,
+            event_ends, click_ends, events, clicks, click_scratch, buckets,
             user, user_rows,
         } = self;
         let (mut event_start, mut click_start) = (0, 0);
@@ -2469,29 +2467,19 @@ impl PartitionState {
                 total[2] += revenue;
             };
 
-            if events.len() < BUCKET_MIN_LEN {
-                sort_timeline(events, event_scratch, |event| (event >> 32) as u32);
-                aggregate_sessions(
-                    events, origin, catsum, touched_categories,
-                    |event| {
-                        let time = (event >> 32) as u32;
-                        (time, time)
-                    },
-                    |event, sums, touched| (1, add_purchase(event as u32, sums, touched)),
-                    write_day, &mut attribute,
-                );
-            } else {
-                buckets.build(events);
-                aggregate_sessions(
-                    &buckets.used, origin, catsum, touched_categories,
-                    |index| {
-                        let b = &buckets.by_time[index];
-                        (b.first, b.last)
-                    },
-                    |index, sums, touched| buckets.aggregate(index, sums, touched),
-                    write_day, &mut attribute,
-                );
-            }
+            // Every event run, including the common ~30-event person, is
+            // ordered by timestamp through the same half-hour counting pass.
+            // No per-person comparison sort remains on the sessions path.
+            buckets.build(events);
+            aggregate_sessions(
+                &buckets.used, origin, catsum, touched_categories,
+                |index| {
+                    let b = &buckets.by_time[index];
+                    (b.first, b.last)
+                },
+                |index, sums, touched| buckets.aggregate(index, sums, touched),
+                write_day, &mut attribute,
+            );
             for campaign in active.drain(..) {
                 counts[campaign as usize] = 0;
                 in_active[campaign as usize] = false;
@@ -2558,7 +2546,6 @@ fn add_purchase(payload: u32, sums: &mut [i64], touched: &mut Vec<u32>) -> i64 {
     price
 }
 
-const BUCKET_MIN_LEN: usize = 128;
 const MAX_EVENT_BUCKETS: usize = ((1u32 << 31) / GAP as u32) as usize + 1;
 
 #[derive(Default)]
