@@ -643,7 +643,7 @@ const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
 struct Router {
     people: People,
     winners: Vec<u32>,
-    losers: Vec<u8>,
+    destinations: Vec<u32>,
     bases: Vec<usize>,
 }
 
@@ -652,7 +652,7 @@ impl Router {
         Self {
             people: People::new(reservation),
             winners: Vec::new(),
-            losers: Vec::new(),
+            destinations: Vec::new(),
             bases: Vec::new(),
         }
     }
@@ -678,8 +678,8 @@ impl Router {
         let mask = (count * 2).next_power_of_two() - 1;
         self.winners.clear();
         self.winners.resize(mask + 1, 0);
-        self.losers.clear();
-        self.losers.resize(count, 0);
+        self.destinations.clear();
+        self.destinations.resize(count, 0);
 
         for (file, fold) in folds.iter().enumerate() {
             for (index, row) in fold.records(shard).enumerate() {
@@ -687,6 +687,7 @@ impl Router {
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
                 let location = ((file << shift) + index + 1) as u32;
                 let mut slot = hash as usize & mask;
+                let mut keep = true;
                 loop {
                     let winner = self.winners[slot];
                     if winner == 0 {
@@ -701,30 +702,29 @@ impl Router {
                         if prior.key == row.key {
                             // Invalid copies still compete for earliest ingest.
                             if row.ingest < prior.ingest {
-                                self.losers[self.bases[prior_file] + prior_index] = 1;
+                                if prior.ts != INVALID {
+                                    let dest = self.destinations[self.bases[prior_file] + prior_index];
+                                    self.people.get(prior.person as usize & (P - 1), dest as usize)
+                                        .ts.store(INVALID, Relaxed);
+                                }
                                 self.winners[slot] = tag | location;
                             } else {
-                                self.losers[self.bases[file] + index] = 1;
+                                keep = false;
                             }
                             break;
                         }
                     }
                     slot = (slot + 1) & mask;
                 }
-            }
-        }
-        for (file, fold) in folds.iter().enumerate() {
-            let base = self.bases[file];
-            for (index, row) in fold.records(shard).enumerate() {
-                if row.ts != INVALID && self.losers[base + index] == 0 {
-                    self.people.push(
-                        row.person as usize & (P - 1),
-                        EvP {
-                            person: row.person,
-                            ts: AtomicU32::new(row.ts),
-                            price: row.price,
-                        },
-                    );
+                if keep && row.ts != INVALID {
+                    let partition = row.person as usize & (P - 1);
+                    self.destinations[self.bases[file] + index] =
+                        u32::try_from(self.people.len(partition)).ok()?;
+                    self.people.push(partition, EvP {
+                        person: row.person,
+                        ts: AtomicU32::new(row.ts),
+                        price: row.price,
+                    });
                 }
             }
         }
