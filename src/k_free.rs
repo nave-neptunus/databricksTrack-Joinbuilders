@@ -1347,6 +1347,30 @@ fn purchase_qbit(q32: u32, i: u64) -> usize {
 mod purchase_tests {
     use super::*;
 
+    struct Sink {
+        batch: Box<EvBatch>,
+        rows: Vec<EvRow>,
+    }
+
+    impl Sink {
+        fn new() -> Self {
+            Self { batch: EvBatch::new(), rows: Vec::new() }
+        }
+    }
+
+    impl EventSink for Sink {
+        fn ev(&mut self) -> *mut EvBatch {
+            &mut *self.batch
+        }
+
+        fn ev_flush(&mut self) {
+            for i in 0..self.batch.n {
+                self.rows.push(self.batch.row(i));
+            }
+            self.batch.n = 0;
+        }
+    }
+
     #[test]
     fn quoted_purchase_tail_uses_opening_quote_bits() {
         for tail in [b",p123,4500\n".as_slice(), b",\"p123\",\"4500\"\n".as_slice(), b",\"p123\",\"\"\n".as_slice()] {
@@ -1359,8 +1383,8 @@ mod purchase_tests {
                 if unsafe { *pt.add(i) } == b'"' { q32 |= 1 << i; }
             }
             let base = 64 - tail.len();
-            let product_open = base + 1 - 32;
-            let price_open = base + tail.iter().rposition(|&b| b == b',').unwrap() + 1 - 32;
+            let product_open = base + 1 - 31;
+            let price_open = base + tail.iter().rposition(|&b| b == b',').unwrap() + 1 - 31;
             let quoted_product = tail[1] == b'"';
             let quoted_price = tail[tail.iter().rposition(|&b| b == b',').unwrap() + 1] == b'"';
             assert_eq!(purchase_qbit(q32, product_open as u64), quoted_product as usize);
@@ -1370,6 +1394,28 @@ mod purchase_tests {
                 assert_eq!(unsafe { price(pe.sub(1), 4) }, Some(4500));
             }
         }
+    }
+
+    #[test]
+    fn kernel_decodes_quoted_purchase_product_and_price() {
+        let line = b"e1,u1,1700000000000,2024-01-01T00:00:00Z,purchase,\"p123\",\"4500\"\n";
+        let mut input = Vec::new();
+        for _ in 0..4 { input.extend_from_slice(line); }
+        let mut fast = Sink::new();
+        Free::events(&input, &mut fast);
+        let mut scalar = Sink::new();
+        let mut at = 0;
+        while at < input.len() {
+            let end = at + line.len() - 1;
+            slow::event(&input, at, end, &mut scalar);
+            at = end + 1;
+        }
+        scalar.ev_flush();
+        assert_eq!(fast.rows, scalar.rows);
+        assert_eq!(fast.rows.len(), 4);
+        assert_eq!(fast.rows[0].kind, KIND_PURCHASE);
+        assert_eq!(fast.rows[0].product, 123);
+        assert_eq!(fast.rows[0].price, 4500);
     }
 }
 
