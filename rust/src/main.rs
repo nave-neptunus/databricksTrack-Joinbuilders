@@ -1831,6 +1831,33 @@ fn build_links(
 }
 
 /// Runs the fast engine. Returns false (having written nothing) if it cannot guarantee exactness.
+fn build_user_table<'a>(
+    input: &[&'static [u8]],
+    readahead: &ReadAhead,
+    est_users: usize,
+    seed: u64,
+    nova: bool,
+    threads: Option<usize>,
+    table: &'a mut Option<Tab>,
+    users: &std::sync::OnceLock<Users<'a>>,
+) -> Option<Vec<&'static [u8]>> {
+    for bytes in input {
+        readahead.wait(bytes);
+    }
+    lap("  links read");
+    let (data, edges, ids, names) = if let Some(threads) = threads {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok()?;
+        pool.install(|| build_links(input, est_users, seed, nova))?
+    } else {
+        build_links(input, est_users, seed, nova)?
+    };
+    if users.set(Users::new(table.insert(data), ids, names.len())).is_err() {
+        return None;
+    }
+    lap(&format!("links: {} edges, {} ids, {} persons", edges, ids, names.len()));
+    Some(names)
+}
+
 fn fast(seed: u64, nova: bool) -> bool {
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or("/output".into());
@@ -1936,26 +1963,41 @@ fn fast(seed: u64, nova: bool) -> bool {
         let total: usize = evb.iter().map(|b| b.len()).sum();
         total / ((1 << 16) / rows).max(1) / 12
     });
-    for b in &lkb {
-        ra.wait(b);
-    }
-    lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, nova) else {
-        return false;
-    };
+    let mut link_table = None;
+    let link_users = std::sync::OnceLock::new();
     let coll = AtomicBool::new(false);
-    let users = Users::new(&mut ltab, nids, pname.len());
-    lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Produce person partitions with exactly the retained, valid events.
     let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs) = if nova {
         let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
+        let links = &link_users;
+        let links_declined = &coll;
+        let built = std::thread::scope(|scope| {
+            let link_job = scope.spawn(|| {
+                let threads = std::env::var("BLUE2_LINK_THREADS").ok()
+                    .and_then(|value| value.parse().ok()).unwrap_or(ncpu);
+                let result = build_user_table(&lkb, ra, est_users, seed, true, Some(threads), &mut link_table, links);
+                if result.is_none() {
+                    links_declined.store(true, Relaxed);
+                }
+                result
+            });
+            let parsed = nova::parse_events(&ech, ra, links, &input, &coll);
+            Some((parsed, link_job.join().ok().flatten()?))
+        });
+        let Some((parsed, names)) = built else {
+            return false;
+        };
+        let Some(result) = nova::finish_events(parsed, link_users.get().unwrap(), &names, &coll) else {
             return false;
         };
         result
     } else {
+        let Some(pname) = build_user_table(&lkb, ra, est_users, seed, false, None, &mut link_table, &link_users) else {
+            return false;
+        };
+        let users = link_users.get().unwrap();
         let shard_capacity = evb.iter().find(|b| b.len() >= 1 << 17).map_or(0, |b| {
             let sample = &b[1 << 16..1 << 17];
             let rows = memchr::memchr_iter(b'\n', sample).count();
@@ -2086,6 +2128,8 @@ fn fast(seed: u64, nova: bool) -> bool {
         lap("events dedup + validate");
         (linked_count, pname, paccs)
     };
+
+    let users = link_users.get().unwrap();
 
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
@@ -2245,6 +2289,9 @@ fn fast(seed: u64, nova: bool) -> bool {
     };
     camp_job();
     lap("parquet written");
+    if std::env::var_os("BLUE2_NO_EXIT").is_none() {
+        std::process::exit(0);
+    }
     true
 }
 

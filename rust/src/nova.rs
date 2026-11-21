@@ -500,7 +500,7 @@ pub(super) struct EventInput<'a> {
 
 struct Parser<'a, 'catalog, 'table> {
     input: &'a EventInput<'catalog>,
-    users: &'a Users<'table>,
+    users: Option<&'a Users<'table>>,
     declined: &'a AtomicBool,
     window_seconds: i64,
     window_ms: u64,
@@ -509,25 +509,33 @@ struct Parser<'a, 'catalog, 'table> {
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Event, SHARDS>,
+    pending_links: Vec<Pending>,
 }
 
-impl Parser<'_, '_, '_> {
+impl<'a, 'table> Parser<'a, '_, 'table> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
         scan_event_rows(bytes, self);
     }
 
     #[inline]
     fn flush(&mut self) {
-        for pending in &self.batch[..self.count] {
+        for &pending in &self.batch[..self.count] {
             let mut row = pending.row;
             if row.ts != INVALID {
-                row.person =
-                    self.users
-                        .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                let Some(users) = self.users else {
+                    self.pending_links.push(pending);
+                    continue;
+                };
+                row.person = users.person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
             }
             self.streams.push((row.key >> 55) as u8 as usize, row);
         }
         self.count = 0;
+    }
+
+    fn publish_links(&mut self, users: &'a Users<'table>) {
+        self.users = Some(users);
+        route_pending(&mut self.streams, self.pending_links.drain(..), users, &mut self.ids, self.declined);
     }
 }
 
@@ -587,7 +595,9 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
-            self.users.prefetch(uid);
+            if let Some(users) = self.users {
+                users.prefetch(uid);
+            }
             pending.row.ts = relative as u32;
             pending.uid = uid;
         }
@@ -599,18 +609,37 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
     }
 }
 
-fn events(
+pub(super) struct ParsedFold {
+    streams: EventStream,
+    pending_links: Vec<Pending>,
+    ids: (u32, u32),
+}
+
+fn route_pending(
+    streams: &mut EventStream,
+    pending: impl Iterator<Item = Pending>,
+    users: &Users<'_>,
+    ids: &mut (u32, u32),
+    declined: &AtomicBool,
+) {
+    for Pending { uid, mut row } in pending {
+        row.person = users.person(uid, 0, uid, ids, declined);
+        streams.push((row.key >> 55) as u8 as usize, row);
+    }
+}
+
+pub(super) fn parse_events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
-    users: &Users<'_>,
+    users: &std::sync::OnceLock<Users<'_>>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
-) -> Vec<Streams<Event, SHARDS>> {
+) -> Vec<ParsedFold> {
     let next = AtomicUsize::new(0);
     rayon::broadcast(|_| {
         let mut parser = Parser {
             input,
-            users,
+            users: users.get(),
             declined,
             window_seconds: input.start.div_euclid(1000),
             window_ms: (input.end - input.start) as u64,
@@ -619,17 +648,23 @@ fn events(
             batch: [Pending::EMPTY; 16],
             count: 0,
             streams: Streams::new(),
+            pending_links: Vec::new(),
         };
         loop {
             let index = next.fetch_add(1, Relaxed);
-            if index >= work.len() {
+            if index >= work.len() || declined.load(Relaxed) {
                 break;
             }
             read_ahead.wait(work.raw(index));
+            if parser.users.is_none() {
+                if let Some(users) = users.get() {
+                    parser.publish_links(users);
+                }
+            }
             parser.parse_chunk(work.get(index));
         }
         parser.flush();
-        parser.streams
+        ParsedFold { streams: parser.streams, pending_links: parser.pending_links, ids: parser.ids }
     })
 }
 
@@ -732,18 +767,20 @@ impl Router {
     }
 }
 
-pub(super) fn run_events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+pub(super) fn finish_events(
+    parsed: Vec<ParsedFold>,
     users: &Users<'_>,
-    input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let folds = events(work, read_ahead, users, input, declined);
     if declined.load(Relaxed) {
         return None;
     }
+    use rayon::prelude::*;
+    let folds: Vec<_> = parsed.into_par_iter().map(|mut fold| {
+        route_pending(&mut fold.streams, fold.pending_links.into_iter(), users, &mut fold.ids, declined);
+        fold.streams
+    }).collect();
     let (local_count, names) = person_names(users, linked_names)?;
     lap(&format!(
         "events parsed (nova, {} folds, {} persons)",
