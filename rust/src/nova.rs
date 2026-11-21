@@ -54,13 +54,13 @@ pub(super) fn user_key(uid: &[u8]) -> Option<u64> {
 }
 
 #[derive(Default)]
-struct PersonName {
+pub(super) struct PersonName {
     bytes: [u8; 9],
     len: u8,
 }
 
 impl PersonName {
-    fn decode(key: u64) -> Self {
+    pub(super) fn decode(key: u64) -> Self {
         if key == 0 {
             return Self::default();
         }
@@ -82,6 +82,38 @@ impl PersonName {
             len: tail as u8 + 1,
         }
     }
+
+    #[inline]
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+/// This turns Nova's reversible `u`/`U` key back into a byte-wise ordering key
+/// without touching the mapped CSV again.  Zero-padding is safe: IDs do not
+/// contain NUL, so it preserves the ordering of a shorter prefix.
+#[inline]
+pub(super) fn user_order(key: u64) -> Option<u64> {
+    if key & SHORT_KEY == 0 {
+        return None;
+    }
+    const INVERSE: u64 = 0x71de_83e1_9937_733d;
+    let value = key & (SHORT_KEY - 1);
+    let mixed = value ^ (value >> 31) ^ (value >> 62);
+    let shifted = mixed.wrapping_mul(INVERSE) & (SHORT_KEY - 1);
+    let raw = shifted ^ (shifted >> 27) ^ (shifted >> 54);
+    // The first tail byte is ASCII, leaving its top bit free to order `U`
+    // before `u`.  Length markers occupy otherwise-unused high bits of the
+    // payload and are stripped before ordering.
+    let lower = ((raw >> 55) & 1) ^ 1;
+    let tail = if raw & (1 << 31) != 0 {
+        8
+    } else {
+        ((raw >> 7) & 1 | (raw >> 14) & 2 | (raw >> 21) & 4) as usize
+    };
+    let mut bytes = (raw & 0x7f7f_7f7f_7f7f_7f7f).to_le_bytes();
+    bytes[tail..].fill(0);
+    Some(u64::from_be_bytes(bytes) | (lower << 63))
 }
 
 fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec<&'static [u8]>)> {

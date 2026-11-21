@@ -1572,6 +1572,46 @@ enum LinkSlot {
     Spill,
 }
 
+/// Nova's generated user IDs are reversible packed keys.  Keeping just that
+/// key plus the original endpoint position avoids a mapped-string reference,
+/// a cached prefix, and the second endpoint transposition in the common case.
+#[derive(Clone, Copy)]
+struct ShortLinkEnd {
+    key: u64,
+    endpoint: u32,
+}
+
+enum ShortLinkSlot {
+    Inserted(usize),
+    Duplicate(u32),
+    Spill,
+}
+
+#[inline]
+fn short_link_slot(
+    slots: &mut [(u64, u64)],
+    mut i: usize,
+    mask: usize,
+    e: ShortLinkEnd,
+    node: u32,
+    orders: *mut std::mem::MaybeUninit<u64>,
+) -> ShortLinkSlot {
+    while let Some(slot) = slots.get_mut(i) {
+        if slot.0 == 0 {
+            // user_order is pre-validated while parsing.  This raw write is
+            // exclusive to this freshly assigned dense node.
+            unsafe { orders.add(node as usize).write(std::mem::MaybeUninit::new(nova::user_order(e.key).unwrap())) };
+            *slot = (e.key, u64::from(node));
+            return ShortLinkSlot::Inserted(i);
+        }
+        if slot.0 == e.key {
+            return ShortLinkSlot::Duplicate(slot.1 as u32);
+        }
+        i = (i + 1) & mask;
+    }
+    ShortLinkSlot::Spill
+}
+
 #[inline]
 fn link_slot(
     slots: &mut [(u64, u64)],
@@ -1620,7 +1660,229 @@ fn link_root(parent: &[AtomicU32], mut node: u32) -> u32 {
     }
 }
 
-fn build_links(
+fn build_links_short(
+    input: &[&[u8]],
+    _estimated_users: usize,
+) -> Option<(Tab, usize, usize, Vec<&'static [u8]>)> {
+    let chunks = chunks(input, 1 << 18);
+    let rows: usize = chunks.par_iter().map(|chunk| {
+        memchr::memchr_iter(b'\n', chunk).count() + usize::from(chunk.last() != Some(&b'\n'))
+    }).sum();
+    let endpoint_bound = rows.checked_mul(2)?;
+    if endpoint_bound >= PERSON_SET as usize {
+        return None;
+    }
+    // The parsed links contain roughly one third duplicate endpoints.  A 57%
+    // table load is still comfortably below the 75% Users guard, but keeps
+    // the cold random-write footprint to half of the old row-count bound.
+    // If an unusual input exceeds the later Users guard, fast() declines and
+    // the exact fallback handles it.
+    let capacity_hint = endpoint_bound.div_ceil(2).max(LINK_SHARDS / 2) + 16;
+    if capacity_hint > 1 << 31 {
+        return None;
+    }
+    let mut table = Tab::new(capacity_hint);
+    let range_len = (table.mask + 1) / LINK_SHARDS;
+    let shift = range_len.trailing_zeros();
+    let invalid = AtomicBool::new(false);
+
+    let batches: Vec<_> = chunks.par_iter().map(|chunk| {
+        let estimate = (chunk.len() / (12 * LINK_SHARDS)).min(1024);
+        let mut ends: [Vec<ShortLinkEnd>; LINK_SHARDS] =
+            std::array::from_fn(|_| Vec::with_capacity(estimate));
+        let mut count = 0;
+        csv_rows(chunk, |_, [a, b]| {
+            if a.is_empty() || b.is_empty() {
+                return;
+            }
+            for s in [a, b] {
+                let Some(key) = nova::user_key(s).filter(|&key| nova::user_order(key).is_some()) else {
+                    invalid.store(true, Relaxed);
+                    return;
+                };
+                let key = if key == 0 { 1 } else { key };
+                let shard = ((key as usize) & table.mask) >> shift;
+                ends[shard].push(ShortLinkEnd { key, endpoint: count });
+                count += 1;
+            }
+        });
+        (ends, count)
+    }).collect();
+    if invalid.load(Relaxed) {
+        return None;
+    }
+    lap("  links parsed+hashed");
+
+    let sizes: Vec<_> = batches.iter().map(|(_, count)| *count).collect();
+    let nend: u32 = sizes.iter().sum();
+    let mut bases = Vec::with_capacity(sizes.len());
+    let mut base = 0usize;
+    for &size in &sizes {
+        bases.push(base);
+        base += size as usize;
+    }
+    let mut buckets: [Vec<Vec<ShortLinkEnd>>; LINK_SHARDS] =
+        std::array::from_fn(|_| Vec::with_capacity(batches.len()));
+    for (ends, _) in batches {
+        for (bucket, batch) in buckets.iter_mut().zip(ends) {
+            bucket.push(batch);
+        }
+    }
+    let mut node_start = 0u32;
+    let starts: Vec<_> = buckets.iter().map(|bucket| {
+        let start = node_start;
+        node_start += bucket.iter().map(|batch| batch.len() as u32).sum::<u32>();
+        start
+    }).collect();
+    // Every allocated entry below is initialized exactly once before it is
+    // read.  Avoiding the 30+ MiB zero fill is material during a cold run.
+    let mut orders: Vec<std::mem::MaybeUninit<u64>> = Vec::with_capacity(nend as usize);
+    let mut edges: Vec<std::mem::MaybeUninit<u32>> = Vec::with_capacity(nend as usize);
+    unsafe {
+        orders.set_len(nend as usize);
+        edges.set_len(nend as usize);
+    }
+    let order_ptr = orders.as_mut_ptr() as usize;
+    let edge_ptr = edges.as_mut_ptr() as usize;
+    let range_mask = range_len - 1;
+    let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).zip(&mut buckets)
+        .enumerate().map(|(shard, (slots, bucket))| {
+            let mut nodes = Vec::new();
+            let mut spill = Vec::new();
+            for (batch_id, batch) in bucket.iter_mut().enumerate() {
+                for (end_id, e) in batch.iter_mut().enumerate() {
+                    let node = starts[shard] + nodes.len() as u32;
+                    let i = e.key as usize & range_mask;
+                    match short_link_slot(slots, i, usize::MAX, *e, node, order_ptr as *mut _) {
+                        ShortLinkSlot::Inserted(local) => {
+                            nodes.push(((shard * range_len + local) as u32, node));
+                            e.key = u64::from(node);
+                        }
+                        ShortLinkSlot::Duplicate(other) => e.key = u64::from(other),
+                        ShortLinkSlot::Spill => spill.push((batch_id, end_id)),
+                    }
+                    // The per-batch endpoint indexes are disjoint, including
+                    // while their containing shard buckets are processed in parallel.
+                    unsafe {
+                        (edge_ptr as *mut std::mem::MaybeUninit<u32>)
+                            .add(bases[batch_id] + e.endpoint as usize)
+                            .write(std::mem::MaybeUninit::new(e.key as u32));
+                    }
+                }
+            }
+            (nodes, spill)
+        }).collect();
+    let mut next: Vec<_> = starts.iter().zip(&ranges)
+        .map(|(start, (nodes, _))| start + nodes.len() as u32)
+        .collect();
+    for (shard, bucket) in buckets.iter_mut().enumerate() {
+        for (batch_id, end_id) in std::mem::take(&mut ranges[shard].1) {
+            let e = &mut bucket[batch_id][end_id];
+            let node = next[shard];
+            let i = e.key as usize & table.mask;
+            match short_link_slot(&mut table.slots, i, table.mask, *e, node, order_ptr as *mut _) {
+                ShortLinkSlot::Inserted(slot) => {
+                    ranges[slot >> shift].0.push((slot as u32, node));
+                    next[shard] += 1;
+                    e.key = u64::from(node);
+                }
+                ShortLinkSlot::Duplicate(other) => e.key = u64::from(other),
+                ShortLinkSlot::Spill => unreachable!("all-uid table has spare slots"),
+            }
+            unsafe {
+                (edge_ptr as *mut std::mem::MaybeUninit<u32>)
+                    .add(bases[batch_id] + e.endpoint as usize)
+                    .write(std::mem::MaybeUninit::new(e.key as u32));
+            }
+        }
+    }
+    lap("  links inserted");
+
+    let edges = unsafe {
+        let ptr = edges.as_mut_ptr().cast::<u32>();
+        let len = edges.len();
+        let cap = edges.capacity();
+        std::mem::forget(edges);
+        Vec::from_raw_parts(ptr, len, cap)
+    };
+    let parent: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
+    edges.par_chunks(8192).for_each(|ends| {
+        for edge in ends.chunks_exact(2) {
+            let mut a = link_root(&parent, edge[0]);
+            let mut b = link_root(&parent, edge[1]);
+            while a != b {
+                let ao = unsafe { *orders.get_unchecked(a as usize).assume_init_ref() };
+                let bo = unsafe { *orders.get_unchecked(b as usize).assume_init_ref() };
+                let (lo, hi) = if ao < bo { (a, b) } else { (b, a) };
+                if parent[hi as usize].compare_exchange(0, lo + 1, Relaxed, Relaxed).is_ok() {
+                    break;
+                }
+                a = link_root(&parent, lo);
+                b = link_root(&parent, hi);
+            }
+        }
+    });
+    lap("  links union-find");
+
+    let roots: Vec<Vec<(u32, u32)>> = ranges.par_iter().map(|(nodes, _)| {
+        let mut roots = Vec::new();
+        for &(slot, node) in nodes {
+            let r = link_root(&parent, node);
+            if r == node {
+                roots.push((slot, r));
+            } else {
+                parent[node as usize].store(r + 1, Relaxed);
+            }
+        }
+        roots
+    }).collect();
+    lap("  links rooted");
+
+    let mut npersons = 0u32;
+    let offsets: Vec<_> = roots.iter().map(|roots| {
+        let start = npersons;
+        npersons += roots.len() as u32;
+        start
+    }).collect();
+    let name_groups: Vec<Vec<nova::PersonName>> = roots
+        .par_iter()
+        .zip(offsets.par_iter())
+        .map(|(roots, &start)| {
+            roots
+                .iter()
+                .enumerate()
+                .map(|(i, &(slot, root))| {
+                    parent[root as usize].store((PERSON_SET as u32) | (start + i as u32), Relaxed);
+                    nova::PersonName::decode(table.slots[slot as usize].0)
+                })
+                .collect()
+        })
+        .collect();
+    let link_names: &'static [nova::PersonName] = Box::leak(
+        name_groups
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let pname = link_names.iter().map(nova::PersonName::bytes).collect();
+    lap("  links numbered");
+
+    let nids = ranges.iter().map(|(nodes, _)| nodes.len()).sum();
+    table.slots.par_chunks_mut(range_len).zip(&ranges).for_each(|(slots, (nodes, _))| {
+        for &(slot, node) in nodes {
+            let p = parent[node as usize].load(Relaxed);
+            let root = if p & (PERSON_SET as u32) != 0 { node } else { p - 1 };
+            let person = parent[root as usize].load(Relaxed) & !(PERSON_SET as u32);
+            let value = &mut slots[slot as usize & range_mask].1;
+            *value = (*value & !0xffff_ffff) | PERSON_SET | u64::from(person);
+        }
+    });
+    lap("  links repointed");
+    Some((table, nend as usize / 2, nids, pname))
+}
+
+fn build_links_hash(
     input: &[&[u8]],
     estimated_users: usize,
     seed: u64,
@@ -1940,7 +2202,12 @@ fn fast(seed: u64, nova: bool) -> bool {
         ra.wait(b);
     }
     lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, nova) else {
+    let links = if nova {
+        build_links_short(&lkb, est_users)
+    } else {
+        build_links_hash(&lkb, est_users, seed, false)
+    };
+    let Some((mut ltab, nedges, nids, pname)) = links else {
         return false;
     };
     let coll = AtomicBool::new(false);
