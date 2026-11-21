@@ -118,13 +118,107 @@ fn ingest(dates: &mut Dates, field: &[u8]) -> i64 {
     }
 }
 
-struct Decode<'a> {
+trait Times {
+    fn event(&mut self, field: &[u8]) -> i64;
+    fn ingest(&mut self, field: &[u8]) -> i64;
+}
+
+impl Times for Dates {
+    #[inline]
+    fn event(&mut self, field: &[u8]) -> i64 {
+        self.parse(field).unwrap_or(i64::MAX)
+    }
+
+    #[inline]
+    fn ingest(&mut self, field: &[u8]) -> i64 {
+        ingest(self, field)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Midnight {
+    date: u64,
+    seconds: i64,
+}
+
+#[derive(Default)]
+struct PackedDates {
+    days: [Midnight; 32],
+    exact: Dates,
+}
+
+impl PackedDates {
+    #[inline]
+    fn iso_seconds(&mut self, s: &[u8]) -> Option<i64> {
+        if s.len() != 20 || s[10] != b'T' || s[19] != b'Z' {
+            return None;
+        }
+        const HYPHENS: u64 = 0xff00_00ff_0000_0000;
+        let prefix = crate::rd8(s, 0);
+        if prefix & HYPHENS != 0x2d00_002d_0000_0000 {
+            return None;
+        }
+        let date = (prefix & !HYPHENS) | (u64::from(s[8]) << 32) | (u64::from(s[9]) << 56);
+        let index = (usize::from(s[8]) * 10 + usize::from(s[9])) & 31;
+        let clock = packed_clock(crate::rd8(s, 11))?;
+        let entry = &mut self.days[index];
+        if entry.date == date && date != 0 {
+            return Some(entry.seconds + clock);
+        }
+        let seconds = crate::parse_ts(s)? / 1000;
+        *entry = Midnight {
+            date,
+            seconds: seconds - clock,
+        };
+        Some(seconds)
+    }
+}
+
+impl Times for PackedDates {
+    #[inline]
+    fn event(&mut self, field: &[u8]) -> i64 {
+        self.iso_seconds(field)
+            .map_or_else(|| self.exact.event(field), |seconds| seconds * 1000)
+    }
+
+    #[inline]
+    fn ingest(&mut self, field: &[u8]) -> i64 {
+        self.iso_seconds(field)
+            .unwrap_or_else(|| self.exact.ingest(field))
+    }
+}
+
+#[inline]
+fn packed_clock(word: u64) -> Option<i64> {
+    const CLOCK: u64 = u64::from_le_bytes(*b"00:00:00");
+    const DIGIT_MASK: u64 = 0x0f0f_000f_0f00_0f0f;
+    const ADD_SIX: u64 = 0x0606_0006_0600_0606;
+    let digits = word ^ CLOCK;
+    if (digits | digits.wrapping_add(ADD_SIX)) & !DIGIT_MASK != 0 {
+        return None;
+    }
+    // Tens and ones occupy adjacent bytes. Each selected byte remains below
+    // 100, so an addition can check all three permitted bounds in parallel.
+    const PAIRS: u64 = 0x00ff_0000_ff00_00ff;
+    const BIAS: u64 = 0x0044_0000_4400_0068;
+    const HIGH: u64 = 0x0080_0000_8000_0080;
+    let pairs = (digits.wrapping_mul(10).wrapping_add(digits >> 8)) & PAIRS;
+    if (pairs + BIAS) & HIGH != 0 {
+        return None;
+    }
+    let hours = pairs as u8;
+    let minutes = (pairs >> 24) as u8;
+    let seconds = (pairs >> 48) as u8;
+    Some(i64::from(hours) * 3600 + i64::from(minutes) * 60 + i64::from(seconds))
+}
+
+struct Decode<'a, T> {
     base: usize,
-    dates: Dates,
+    dates: T,
     records: &'a mut Vec<Compact>,
 }
 
-impl<'a> EventSink<'a> for Decode<'_> {
+impl<'a, T: Times> EventSink<'a> for Decode<'_, T> {
     #[inline]
     fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
         let kind = event_kind(fields.field::<4>());
@@ -139,8 +233,8 @@ impl<'a> EventSink<'a> for Decode<'_> {
         self.records.push(Compact {
             id: packed(fields.field::<0>(), b'e', self.base),
             user: packed(fields.field::<1>(), b'u', self.base),
-            ts: self.dates.parse(fields.field::<2>()).unwrap_or(i64::MAX),
-            ingest: ingest(&mut self.dates, fields.field::<3>()),
+            ts: self.dates.event(fields.field::<2>()),
+            ingest: self.dates.ingest(fields.field::<3>()),
             kind,
             product,
             price,
@@ -300,6 +394,31 @@ pub(super) fn run(path: &Path) {
         );
         println!("KERNEL block64 compact records MATCH");
     }
+    let mut packed_output = Vec::with_capacity(valid);
+    measure("packed_dates_full", runs, rows, bytes, || {
+        packed_output.clear();
+        let mut sink = Decode {
+            base,
+            dates: PackedDates::default(),
+            records: &mut packed_output,
+        };
+        scan_event_rows(input, &mut sink);
+        black_box(packed_output.as_slice());
+        packed_output.len()
+    });
+    assert!(
+        output == packed_output,
+        "packed timestamp decoder changed records"
+    );
+    println!("KERNEL packed dates compact records MATCH");
+    measure("packed_field_ts", runs, rows, bytes, || {
+        let mut dates = PackedDates::default();
+        field_work(input, ts, |x| dates.event(x) as u64)
+    });
+    measure("packed_field_ingest", runs, rows, bytes, || {
+        let mut dates = PackedDates::default();
+        field_work(input, order, |x| dates.ingest(x) as u64)
+    });
     let mut stores = Vec::with_capacity(valid);
     measure("record_store_48b", runs, rows, bytes, || {
         stores.clear();
