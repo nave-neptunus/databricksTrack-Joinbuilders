@@ -444,6 +444,32 @@ struct Slot<T> {
     v: UnsafeCell<Option<T>>,
     done: AtomicBool,
 }
+
+struct SetupMem {
+    ev_arena: Arena,
+    us_arena: Arena,
+    utab: *mut u16,
+    utab_len: usize,
+    csr: *mut [u64; 2],
+    csr_cap: usize,
+}
+
+const MADV_POPULATE_WRITE: i32 = 23;
+const PREFLT_BYTES: usize = 2 << 20;
+
+fn prefault_setup(p: *mut u8, len: usize, tid: usize, nt: usize) {
+    let n = len.min(PREFLT_BYTES) & !4095;
+    let nw = nt.saturating_sub(1);
+    if n == 0 || nw == 0 {
+        return;
+    }
+    let i = tid - 1;
+    let a = n * i / nw & !4095;
+    let b = if i + 1 == nw { n } else { n * (i + 1) / nw & !4095 };
+    if b > a {
+        unsafe { let _ = madvise(p.add(a), b - a, MADV_POPULATE_WRITE); }
+    }
+}
 unsafe impl<T> Sync for Slot<T> {}
 impl<T> Slot<T> {
     fn new() -> Slot<T> {
@@ -823,12 +849,20 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     };
     let chain: Slot<(std::ptr::NonNull<u8>, Vec<FileInfo>, Vec<Chunk>, [usize; 3], u64, u64)> = Slot::new();
     let keys: Slot<(u64, u64, u64, u64)> = Slot::new();
+    let mem: Slot<SetupMem> = Slot::new();
     run_par(nt, |tid| {
         if tid != 0 {
             while help() {}
             while !(sbytes.done.load(Ordering::Acquire) && cbytes.done.load(Ordering::Acquire)) && !keys.done.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
+            let m = mem.get();
+            let (ev, ev_len) = m.ev_arena.span();
+            let (us, us_len) = m.us_arena.span();
+            prefault_setup(ev, ev_len, tid, nt);
+            prefault_setup(us, us_len, tid, nt);
+            prefault_setup(m.utab as *mut u8, m.utab_len, tid, nt);
+            prefault_setup(m.csr as *mut u8, m.csr_cap * 16, tid, nt);
             while help() {}
             return;
         }
@@ -928,6 +962,18 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             Some(x) => ckey = x,
             None => ccap = 0,
         }
+        let ecap = ((bytes[Kind::Ev as usize] / 64 + 4096 + BSIZE - 1) & !(BSIZE - 1)) as u64;
+        let ucap = (((ecap as usize / 16 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)) as u64).min(1 << 26);
+        let nub = (ucap as usize) >> UB;
+        let csr_cap = csr_cap(ccap, bytes[Kind::Ck as usize], bytes[Kind::Lk as usize]);
+        mem.set(SetupMem {
+            ev_arena: Arena::new(bytes[Kind::Ev as usize] / 28 * 16 + nt * ((ecap as usize) >> BB) * 4096 + nt * (2 << 20) + (16 << 20)),
+            us_arena: Arena::new((bytes[Kind::Ck as usize] / 10 + bytes[Kind::Lk as usize] / 6) * 16 + nt * nub * 4096 + nt * (2 << 20) + (16 << 20)),
+            utab: anon(ucap as usize * 2) as *mut u16,
+            utab_len: ucap as usize * 2,
+            csr: anon(csr_cap * 16) as *mut [u64; 2],
+            csr_cap,
+        });
         keys.set((k.0, k.1, ckey, ccap));
         lap("maps+keys");
         let total_bytes = bytes[0] + bytes[1] + bytes[2];
@@ -951,8 +997,9 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     lap("lookups");
     let (region, files, queue, bytes, _, _) = chain.take();
     let region = region.as_ptr() as *const u8;
-    let [ev_bytes, ck_bytes, lk_bytes] = bytes;
+    let [ev_bytes, _, _] = bytes;
     let (ukey, ekey, ckey, ccap) = keys.take();
+    let SetupMem { ev_arena, us_arena, utab, utab_len: _, csr, csr_cap } = mem.take();
     if check {
         eprintln!("[v2b] keys: XL_UKEY={ukey:x} XL_EKEY={ekey:x}");
         eprintln!("[v2b] click key: XL_CKEY={ckey:x} ccap={ccap}");
@@ -964,9 +1011,6 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     let ucap = (((ecap as usize / 16 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)) as u64).min(1 << 26);
     let nb = (ecap as usize) >> BB;
     let nub = (ucap as usize) >> UB;
-    let blk = 2usize << 20;
-    let ev_arena = Arena::new(ev_bytes / 28 * 16 + nt * nb * 4096 + nt * blk + (16 << 20));
-    let us_arena = Arena::new((ck_bytes / 10 + lk_bytes / 6) * 16 + nt * nub * 4096 + nt * blk + (16 << 20));
     let mut t = Vec::with_capacity(nt);
     for c in &cores {
         t.push(UnsafeCell::new(tstate(c.take())));
@@ -1015,11 +1059,11 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         ev_arena,
         us_arena,
         t,
-        utab: anon(ucap as usize * 2) as *mut u16,
+        utab,
         claim: anon(ucap as usize / 8 + 64) as *const AtomicU64,
         csr_off: anon((ucap as usize + nub + 8) * 4) as *mut u32,
-        csr: anon(csr_cap(ccap, ck_bytes, lk_bytes) * 16) as *mut [u64; 2],
-        csr_cap: csr_cap(ccap, ck_bytes, lk_bytes),
+        csr,
+        csr_cap,
         csr_base: Vec::new(),
         ncsr: 0,
         uf: links::Uf::new(),
