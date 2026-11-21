@@ -15,6 +15,7 @@ fn popw() -> bool {
     *POPW.get_or_init(|| !std::env::var("XL_POPW").is_ok_and(|v| v == "0"))
 }
 const MADV_POPULATE_WRITE: i32 = 23;
+const MADV_POPULATE_READ: i32 = 22;
 #[cfg(feature = "knobs")]
 pub static mut NOSINK: bool = false;
 #[cfg(feature = "knobs")]
@@ -2158,6 +2159,24 @@ pub fn stage1(g: &G, tid: usize) {
             continue;
         }
         let buf = &data[s..e];
+        // Batch-install the next queue chunk's file PTEs while this chunk is parsed.
+        // MADV_POPULATE_READ is unavailable on older kernels; its error is only a
+        // performance miss, so it is intentionally ignored.
+        if unsafe { SKIP } & 512 == 0 {
+            if let Some(next) = q.get(i + 1) {
+                let next_file = &g.files[next.file as usize];
+                let next_data = unsafe { std::slice::from_raw_parts(g.region.add(next_file.off), next_file.len) };
+                let next_start = if next.a == next_file.hdr { next.a } else { next_line_start(next_data, next.a - 1) };
+                let next_end = if next.b >= next_file.len { next_file.len } else { next_line_start(next_data, next.b - 1) };
+                if next_start < next_end {
+                    let a = (next_file.off + next_start) & !4095;
+                    let b = (next_file.off + next_end + 4095) & !4095;
+                    unsafe {
+                        let _ = madvise(g.region.add(a) as *mut u8, b - a, MADV_POPULATE_READ);
+                    }
+                }
+            }
+        }
         if unsafe { SKIP } & 512 != 0 {
             let mut x = 0u64;
             let mut i = 0;
