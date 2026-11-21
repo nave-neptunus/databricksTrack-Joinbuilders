@@ -20,6 +20,8 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const LOOK: i64 = 7 * DAY;
 
+// Opt-in coarse diagnostics only: one pair of clocks per completed partition.
+static COARSE_PROFILE: AtomicBool = AtomicBool::new(false);
 static mut T0: Option<Instant> = None;
 fn lap(name: &str) {
     if std::env::var_os("TIMING").is_some() {
@@ -1529,6 +1531,7 @@ fn unpack_ref(r: u64) -> &'static [u8] {
 
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
+    COARSE_PROFILE.store(std::env::var_os("COARSE_PROFILE").is_some(), Relaxed);
     let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
     if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, nova) {
         if std::env::var_os("TIMING").is_some() {
@@ -2192,16 +2195,23 @@ fn fast(seed: u64, nova: bool) -> bool {
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each existing Rayon worker handles whole partitions and flushes its
     // own Parquet file as soon as it runs out of work.
+    let coarse = COARSE_PROFILE.load(Relaxed);
+    let sessions_wall = Instant::now();
     let states = rayon::broadcast(|worker| {
         let path = format!("{out}/user_daily/part-{}.parquet", worker.index());
         let user = user_parquet::UserParquet::new(path, user_schema.clone());
-        let mut state = PartitionState::new(ncs, ndays, cat_names.len(), user);
+        let mut state = PartitionState::new(ncs, ndays, cat_names.len(), w1 - w0, user);
+        let mut samples = Vec::with_capacity(P / rayon::current_num_threads().max(1));
         while let Some(&(_, partition)) = order.get(next.fetch_add(1, Relaxed)) {
+            let t = Instant::now();
             state.group(partition, linked_count, &paccs, &caccs);
+            let group = t.elapsed();
+            let t = Instant::now();
             state.aggregate(partition, &pname, &cat_names, w0, day0, ndays, ncamp);
+            if coarse { samples.push((partition, group, t.elapsed())); }
         }
         state.user.close();
-        (state.user_rows, state.cd)
+        (state.user_rows, state.cd, samples)
     });
     std::mem::forget(paccs);
     std::mem::forget(caccs);
@@ -2209,13 +2219,24 @@ fn fast(seed: u64, nova: bool) -> bool {
 
     let mut cd = vec![[0i64; 4]; ncs * ndays];
     let mut nrows = 0;
-    for (count, totals) in states {
+    let mut coarse_samples = Vec::new();
+    for (count, totals, samples) in states {
         nrows += count;
         for (a, b) in cd.iter_mut().zip(totals) {
             for k in 0..4 {
                 a[k] += b[k];
             }
         }
+        coarse_samples.extend(samples);
+    }
+    if coarse {
+        coarse_samples.sort_unstable_by_key(|sample| sample.1 + sample.2);
+        let elapsed = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let sum_group: std::time::Duration = coarse_samples.iter().map(|s| s.1).sum();
+        let sum_aggregate: std::time::Duration = coarse_samples.iter().map(|s| s.2).sum();
+        let at = |percent: usize| coarse_samples[(coarse_samples.len() - 1) * percent / 100];
+        let p50 = at(50); let p95 = at(95); let worst = *coarse_samples.last().unwrap();
+        eprintln!("COARSEPROF sessions_wall_ms={:.3} partitions={} summed_partition_elapsed_ms group={:.3} aggregate={:.3} combined={:.3} p50_combined_ms={:.3} p95_combined_ms={:.3} worst_partition={} worst_group_ms={:.3} worst_aggregate_ms={:.3}", elapsed(sessions_wall.elapsed()), coarse_samples.len(), elapsed(sum_group), elapsed(sum_aggregate), elapsed(sum_group + sum_aggregate), elapsed(p50.1 + p50.2), elapsed(p95.1 + p95.2), worst.0, elapsed(worst.1), elapsed(worst.2));
     }
     lap(&format!("merged: user_daily {}", nrows));
 
@@ -2296,7 +2317,7 @@ struct PartitionState {
 }
 
 impl PartitionState {
-    fn new(campaigns: usize, days: usize, categories: usize, user: user_parquet::UserParquet) -> Self {
+    fn new(campaigns: usize, days: usize, categories: usize, event_window: i64, user: user_parquet::UserParquet) -> Self {
         Self {
             cd: vec![[0; 4]; campaigns * days],
             counts: vec![0; campaigns],
@@ -2311,7 +2332,7 @@ impl PartitionState {
             gather: Vec::new(),
             event_scratch: Vec::new(),
             click_scratch: Vec::new(),
-            buckets: EventBuckets::default(),
+            buckets: EventBuckets::for_window(event_window),
             user,
             user_rows: 0,
         }
@@ -2535,7 +2556,6 @@ fn add_purchase(payload: u32, sums: &mut [i64], touched: &mut Vec<u32>) -> i64 {
 }
 
 const BUCKET_MIN_LEN: usize = 128;
-const MAX_EVENT_BUCKETS: usize = ((1u32 << 31) / GAP as u32) as usize + 1;
 
 #[derive(Default)]
 struct EventBucket {
@@ -2546,25 +2566,35 @@ struct EventBucket {
     purchase: usize,
 }
 
-#[derive(Default)]
 struct EventBuckets {
+    /// Events are stored relative to manifest start, so this exact manifest
+    /// bound replaces the former 1.19M-entry u32-fast-path table.  The vector
+    /// is still allocated lazily in `build`, once a large history needs it.
+    limit: usize,
     by_time: Vec<EventBucket>,
     used: Vec<usize>,
     purchases: Vec<(u32, usize)>,
 }
 
 impl EventBuckets {
+    fn for_window(window: i64) -> Self {
+        debug_assert!(window > 0);
+        let limit = (window as u64).div_ceil(GAP as u64) as usize;
+        Self { limit, by_time: Vec::new(), used: Vec::new(), purchases: Vec::new() }
+    }
+
     fn build(&mut self, events: &[u64]) {
         for index in self.used.drain(..) {
             self.by_time[index] = EventBucket::default();
         }
-        self.by_time.resize_with(MAX_EVENT_BUCKETS, EventBucket::default);
+        self.by_time.resize_with(self.limit, EventBucket::default);
         self.purchases.clear();
         for &event in events {
             let time = (event >> 32) as u32;
             // A half-hour bucket is connected for every input distribution.
             // Only its endpoints matter when joining adjacent occupied buckets.
             let index = (time / GAP as u32) as usize;
+            debug_assert!(index < self.limit);
             let bucket = &mut self.by_time[index];
             if bucket.count == 0 {
                 bucket.first = time;
@@ -2695,6 +2725,40 @@ fn top_cat(catsum: &mut [i64], touched: &mut Vec<u32>, names: &[&[u8]]) -> u32 {
     }
     touched.clear();
     top
+}
+
+#[cfg(test)]
+#[test]
+fn event_buckets_use_the_exact_manifest_window_bound() {
+    let pack = |time: u32, payload: u32| (u64::from(time) << 32) | u64::from(payload);
+    let width = GAP as u32;
+    for (window, want_limit, want_index) in [(1i64, 1usize, 0usize), (GAP, 1, 0), (GAP + 1, 2, 1)] {
+        let mut edge = EventBuckets::for_window(window);
+        edge.build(&[pack(window as u32 - 1, 0)]);
+        assert_eq!(edge.limit, want_limit);
+        assert_eq!(edge.used, [want_index]);
+    }
+    let payload = (3 << 24) | 17;
+    let mut buckets = EventBuckets::for_window(i64::from(1_002 * width));
+    buckets.build(&[
+        pack(1_000 * width + 9, payload),
+        pack(1_001 * width + 11, 0),
+        pack(1_000 * width + 7, 0),
+    ]);
+    assert_eq!(buckets.limit, 1_002);
+    assert_eq!(buckets.by_time.len(), 1_002);
+    assert_eq!(buckets.used, [1_000, 1_001]);
+    assert_eq!((buckets.by_time[1_000].first, buckets.by_time[1_000].last), (1_000 * width + 7, 1_000 * width + 9));
+    let mut sums = vec![0; 4];
+    let mut touched = Vec::new();
+    assert_eq!(buckets.aggregate(1_000, &mut sums, &mut touched), (2, 17));
+    assert_eq!(sums[3], 17);
+    assert_eq!(touched.as_slice(), &[3u32]);
+
+    // A later timeline must not reuse stale endpoints or purchases.
+    buckets.build(&[pack(4 * width + 1, 0)]);
+    assert_eq!(buckets.used, [4]);
+    assert_eq!(buckets.aggregate(4, &mut sums, &mut touched), (1, 0));
 }
 
 #[cfg(test)]
