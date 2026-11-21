@@ -2188,13 +2188,6 @@ pub fn stage1(g: &G, tid: usize) {
         } else {
             parse_buf(g, &mut *t, &mut eb, &mut cb, &mut out, tb, tid, f, buf, s);
         }
-        if unsafe { RELEASE } {
-            let a = (f.off + s + 4095) & !4095;
-            let b = (f.off + e) & !4095;
-            if b > a {
-                unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
-            }
-        }
     }
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 4);
