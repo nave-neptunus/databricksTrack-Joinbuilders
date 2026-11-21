@@ -14,6 +14,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::time::Instant;
 
+// Linux defaults to THP=madvise on the scorer.  These large, dense tables are
+// long-lived enough to benefit, but failure must never affect correctness.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn madvise(addr: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn advise_huge<T>(v: &mut Vec<T>) {
+    const MIN_BYTES: usize = 2 << 20;
+    const PAGE: usize = 4096;
+    const MADV_HUGEPAGE: i32 = 14;
+    let bytes = v.capacity().saturating_mul(std::mem::size_of::<T>());
+    if bytes < MIN_BYTES || bytes == 0 {
+        return;
+    }
+    let start = (v.as_mut_ptr() as usize) & !(PAGE - 1);
+    let end = (v.as_mut_ptr() as usize).saturating_add(bytes).saturating_add(PAGE - 1) & !(PAGE - 1);
+    unsafe { let _ = madvise(start as *mut std::ffi::c_void, end - start, MADV_HUGEPAGE); }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn advise_huge<T>(_v: &mut Vec<T>) {}
+
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const LOOK: i64 = 7 * DAY;
@@ -585,7 +610,9 @@ struct Tab {
 impl Tab {
     fn new(n: usize) -> Tab {
         let cap = (n * 2).next_power_of_two().max(16);
-        Tab { slots: vec![(0, 0); cap], mask: cap - 1 }
+        let mut slots = vec![(0, 0); cap];
+        advise_huge(&mut slots);
+        Tab { slots, mask: cap - 1 }
     }
     #[inline]
     fn prefetch(&self, key: u64) {
@@ -1276,7 +1303,8 @@ fn fast(seed: u64) -> bool {
         let sl: &[AtomicU64] = unsafe { std::slice::from_raw_parts(ltab.slots.as_mut_ptr() as *const AtomicU64, cap * 2) };
         // zeroed (calloc'd, so untouched pages cost nothing) arrays viewed as atomics
         fn zeroed<A>(n: usize) -> &'static [A] {
-            let v: Vec<u64> = vec![0; n];
+            let mut v: Vec<u64> = vec![0; n];
+            advise_huge(&mut v);
             let p = v.as_ptr() as *const A;
             std::mem::forget(v);
             unsafe { std::slice::from_raw_parts(p, n * 8 / std::mem::size_of::<A>()) }
