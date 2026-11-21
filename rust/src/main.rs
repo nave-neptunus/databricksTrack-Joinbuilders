@@ -11,6 +11,7 @@ mod user_parquet;
 
 use ahash::AHashMap as HashMap;
 use rayon::prelude::*;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::time::Instant;
@@ -1101,24 +1102,23 @@ impl<'a> Users<'a> {
         }
     }
 
-    /// Names of all dense ids (padded to whole blocks; unused ids are empty and have no
-    /// events) and the per-partition local id bound.
-    fn names(&self, linked: &[&'static [u8]], coll: &AtomicBool) -> (u32, Vec<&'static [u8]>) {
+    /// The assigned ID range, rounded up to whole person partitions.
+    fn person_extent(&self, coll: &AtomicBool) -> usize {
         let n = (self.next.load(Relaxed) as usize).min(self.names.len());
         if n >= PERSON_SET as usize {
             coll.store(true, Relaxed);
         }
-        let all: Vec<&'static [u8]> = (0..n).into_par_iter().map(|id| {
-            if id < linked.len() {
-                linked[id]
-            } else {
-                match self.names[id].load(Relaxed) {
-                    0 => &[][..],
-                    r => unpack_ref(r),
-                }
-            }
-        }).collect();
-        ((n.div_ceil(P)) as u32, all)
+        n
+    }
+
+    fn name(&self, id: usize, linked: &[&'static [u8]]) -> &'static [u8] {
+        if let Some(&name) = linked.get(id) {
+            return name;
+        }
+        match self.names[id].load(Relaxed) {
+            0 => &[],
+            name => unpack_ref(name),
+        }
     }
 }
 
@@ -2044,8 +2044,9 @@ fn fast(seed: u64) -> bool {
                 acc
             },
         );
-    let (linked_count, pname) = users.names(&pname, &coll);
-    lap(&format!("events parsed ({} folds, {} persons)", folds.len(), pname.len()));
+    let people = users.person_extent(&coll);
+    let people_per_partition = people.div_ceil(P);
+    lap(&format!("events parsed ({} folds, {} persons)", folds.len(), people));
     if coll.load(Relaxed) {
         return false;
     }
@@ -2157,8 +2158,8 @@ fn fast(seed: u64) -> bool {
         let user = user_parquet::UserParquet::new(path, user_schema.clone());
         let mut state = PartitionState::new(ncs, ndays, cat_names.len(), user);
         while let Some(&(_, partition)) = order.get(next.fetch_add(1, Relaxed)) {
-            state.group(partition, linked_count, &paccs, &caccs);
-            state.aggregate(partition, &pname, &cat_names, w0, day0, ndays, ncamp);
+            state.group(partition, people_per_partition, &paccs, &caccs);
+            state.aggregate(partition, &users, &pname, &cat_names, w0, day0, ndays, ncamp);
         }
         state.user.close();
         (state.user_rows, state.cd)
@@ -2239,9 +2240,9 @@ struct PartitionState {
     active: Vec<u32>,
     catsum: Vec<i64>,
     touched_categories: Vec<u32>,
-    event_ends: Vec<usize>,
+    event_rows: PersonEventRows,
     click_ends: Vec<usize>,
-    events: Vec<u64>,
+    medium_events: Vec<u64>,
     clicks: Vec<Click>,
     event_scratch: Vec<u64>,
     click_scratch: Vec<Click>,
@@ -2259,9 +2260,9 @@ impl PartitionState {
             active: Vec::new(),
             catsum: vec![0; categories],
             touched_categories: Vec::new(),
-            event_ends: Vec::new(),
+            event_rows: PersonEventRows::default(),
             click_ends: Vec::new(),
-            events: Vec::new(),
+            medium_events: Vec::new(),
             clicks: Vec::new(),
             event_scratch: Vec::new(),
             click_scratch: Vec::new(),
@@ -2274,52 +2275,42 @@ impl PartitionState {
     fn group(
         &mut self,
         partition: usize,
-        people: u32,
+        people: usize,
         event_folds: &[People],
         click_folds: &[Vec<Vec<Click>>],
     ) {
-        let Self { event_ends, click_ends, events, clicks, .. } = self;
-        event_ends.clear();
-        event_ends.resize(people as usize, 0);
+        let Self { event_rows, click_ends, clicks, .. } = self;
+        event_rows.reset(people);
         click_ends.clear();
-        click_ends.resize(people as usize, 0);
-        let event_rows = || event_folds.iter()
-            .flat_map(|fold| fold.records(partition))
-            .flatten()
-            .filter_map(EvP::session_input);
-        let click_rows = || click_folds.iter().flat_map(|fold| &fold[partition]);
-        for (person, _) in event_rows() {
-            event_ends[(person >> PB) as usize] += 1;
+        click_ends.resize(people, 0);
+        for event in event_folds.iter().flat_map(|f| f.records(partition)).flatten() {
+            if let Some((person, payload)) = event.session_input() {
+                event_rows.push((person >> PB) as usize, payload);
+            }
         }
+        let click_rows = || click_folds.iter().flat_map(|fold| &fold[partition]);
         for click in click_rows() {
             let person = (click.person >> PB) as usize;
-            if event_ends[person] != 0 {
+            if event_rows.count(person) != 0 {
                 click_ends[person] += 1;
             }
         }
-        // Retain the original event counts until the click scatter is done.
-        // The prefix sums then become exclusive ends as records are placed.
         clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0 });
         for &click in click_rows() {
             let person = (click.person >> PB) as usize;
-            if event_ends[person] != 0 {
+            if event_rows.count(person) != 0 {
                 let next = &mut click_ends[person];
                 clicks[*next] = click;
                 *next += 1;
             }
-        }
-        events.resize(prefix_starts(event_ends), 0);
-        for (person, payload) in event_rows() {
-            let next = &mut event_ends[(person >> PB) as usize];
-            events[*next] = payload;
-            *next += 1;
         }
     }
 
     fn aggregate(
         &mut self,
         partition: usize,
-        pname: &[&[u8]],
+        users: &Users<'_>,
+        linked_names: &[&'static [u8]],
         categories: &[&[u8]],
         origin: i64,
         day0: i64,
@@ -2328,19 +2319,19 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
-            event_ends, click_ends, events, clicks, event_scratch, click_scratch, buckets,
+            event_rows, click_ends, medium_events, clicks, event_scratch, click_scratch, buckets,
             user, user_rows,
         } = self;
-        let (mut event_start, mut click_start) = (0, 0);
-        for (person, (&event_end, &click_end)) in event_ends.iter().zip(click_ends.iter()).enumerate() {
-            let events = &mut events[event_start..event_end];
+        let mut click_start = 0;
+        for (person, &click_end) in click_ends.iter().enumerate() {
             let clicks = &mut clicks[click_start..click_end];
-            (event_start, click_start) = (event_end, click_end);
-            if events.is_empty() {
+            click_start = click_end;
+            let n_events = event_rows.count(person);
+            if n_events == 0 {
                 continue;
             }
             sort_timeline(clicks, click_scratch, |click| click.ts);
-            let name = pname[person * P + partition];
+            let name = users.name(person * P + partition, linked_names);
             let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
                 let category = top_cat(sums, touched, categories);
                 user.append(name, row, categories.get(category as usize).copied());
@@ -2392,7 +2383,14 @@ impl PartitionState {
                 total[2] += revenue;
             };
 
-            if events.len() < BUCKET_MIN_LEN {
+            if n_events < BUCKET_MIN_LEN {
+                let events = if n_events <= INLINE_EVENTS {
+                    event_rows.inline_mut(person)
+                } else {
+                    medium_events.clear();
+                    medium_events.extend(event_rows.iter(person));
+                    &mut medium_events[..]
+                };
                 sort_timeline(events, event_scratch, |event| (event >> 32) as u32);
                 aggregate_sessions(
                     events, origin, catsum, touched_categories,
@@ -2404,7 +2402,7 @@ impl PartitionState {
                     write_day, &mut attribute,
                 );
             } else {
-                buckets.build(events);
+                buckets.build(event_rows.iter(person));
                 aggregate_sessions(
                     &buckets.used, origin, catsum, touched_categories,
                     |index| {
@@ -2481,6 +2479,117 @@ fn add_purchase(payload: u32, sums: &mut [i64], touched: &mut Vec<u32>) -> i64 {
     price
 }
 
+const INLINE_EVENTS: usize = 32;
+const BLOCK_EVENTS: usize = 64;
+
+#[derive(Clone, Copy, Default)]
+struct EventList {
+    len: usize,
+    /// One-based pointer into the overflow block arena.
+    head: usize,
+}
+
+struct EventBlock {
+    rows: [MaybeUninit<u64>; BLOCK_EVENTS],
+    previous: usize,
+}
+
+/// Append to a dense person's inline rows or its overflow chain in one scan.
+/// A small person's rows are already contiguous when it is time to sort.
+#[derive(Default)]
+struct PersonEventRows {
+    people: Vec<EventList>,
+    inline: Vec<[MaybeUninit<u64>; INLINE_EVENTS]>,
+    blocks: Vec<EventBlock>,
+}
+
+impl PersonEventRows {
+    fn reset(&mut self, people: usize) {
+        self.people.resize(people, EventList::default());
+        self.people.fill(EventList::default());
+        self.inline.resize(people, [MaybeUninit::uninit(); INLINE_EVENTS]);
+        self.blocks.clear();
+    }
+
+    #[inline]
+    fn count(&self, person: usize) -> usize {
+        self.people[person].len
+    }
+
+    #[inline]
+    fn push(&mut self, person: usize, value: u64) {
+        let list = &mut self.people[person];
+        if list.len < INLINE_EVENTS {
+            self.inline[person][list.len].write(value);
+        } else {
+            let offset = (list.len - INLINE_EVENTS) % BLOCK_EVENTS;
+            if offset == 0 {
+                self.blocks.push(EventBlock {
+                    rows: [MaybeUninit::uninit(); BLOCK_EVENTS],
+                    previous: list.head,
+                });
+                list.head = self.blocks.len();
+            }
+            self.blocks[list.head - 1].rows[offset].write(value);
+        }
+        list.len += 1;
+    }
+
+    fn inline_mut(&mut self, person: usize) -> &mut [u64] {
+        let len = self.people[person].len.min(INLINE_EVENTS);
+        // Each append initialized its slot before incrementing len.
+        unsafe { std::slice::from_raw_parts_mut(self.inline[person].as_mut_ptr().cast(), len) }
+    }
+
+    fn iter(&self, person: usize) -> impl Iterator<Item = u64> + '_ {
+        let EventList { len, mut head } = self.people[person];
+        // Every inline slot below the recorded length was written by push.
+        let inline = unsafe { initialized_prefix(&self.inline[person], len.min(INLINE_EVENTS)) };
+        let mut remaining = len.saturating_sub(INLINE_EVENTS);
+        let blocks = std::iter::from_fn(move || {
+            if head == 0 {
+                return None;
+            }
+            let block = &self.blocks[head - 1];
+            let in_block = (remaining - 1) % BLOCK_EVENTS + 1;
+            remaining -= in_block;
+            head = block.previous;
+            // Only the head can be partial. The recorded length gives its size.
+            Some(unsafe { initialized_prefix(&block.rows, in_block) })
+        });
+        inline.iter().chain(blocks.flatten()).copied()
+    }
+}
+
+// Safety: every entry before len must be initialized.
+unsafe fn initialized_prefix(rows: &[MaybeUninit<u64>], len: usize) -> &[u64] {
+    assert!(len <= rows.len());
+    unsafe { std::slice::from_raw_parts(rows.as_ptr().cast(), len) }
+}
+
+#[test]
+fn person_event_blocks_preserve_only_initialized_rows_across_partitions() {
+    let mut rows = PersonEventRows::default();
+    let count = INLINE_EVENTS + BLOCK_EVENTS + 3;
+    rows.reset(2);
+    for i in 0..count as u64 {
+        rows.push(0, i);
+        if i % 3 == 0 {
+            rows.push(1, i);
+        }
+    }
+    let mut first: Vec<_> = rows.iter(0).collect();
+    first.sort_unstable();
+    assert_eq!(first, (0..count as u64).collect::<Vec<_>>());
+    let second: Vec<_> = rows.iter(1).collect();
+    assert_eq!(second, (0..count as u64).step_by(3).collect::<Vec<_>>());
+
+    rows.reset(2);
+    rows.push(0, 999);
+    assert_eq!(rows.inline_mut(0), [999]);
+    assert_eq!(rows.iter(1).count(), 0);
+}
+
 const BUCKET_MIN_LEN: usize = 128;
 const MAX_EVENT_BUCKETS: usize = ((1u32 << 31) / GAP as u32) as usize + 1;
 
@@ -2501,13 +2610,13 @@ struct EventBuckets {
 }
 
 impl EventBuckets {
-    fn build(&mut self, events: &[u64]) {
+    fn build(&mut self, events: impl Iterator<Item = u64>) {
         for index in self.used.drain(..) {
             self.by_time[index] = EventBucket::default();
         }
         self.by_time.resize_with(MAX_EVENT_BUCKETS, EventBucket::default);
         self.purchases.clear();
-        for &event in events {
+        for event in events {
             let time = (event >> 32) as u32;
             // A half-hour bucket is connected for every input distribution.
             // Only its endpoints matter when joining adjacent occupied buckets.
