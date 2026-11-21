@@ -557,16 +557,58 @@ fn hs(b: &[u8], seed: u64) -> (u64, u32) {
 struct Tab {
     slots: Vec<(u64, u64)>, // (key, (chk << 32) | val); key 0 = empty
     mask: usize,
+    // When set, the slots live here instead (huge-page backed, read-only after build).
+    map: Option<memmap2::MmapMut>,
 }
 impl Tab {
     fn new(n: usize) -> Tab {
         let cap = (n * 2).next_power_of_two().max(16);
-        Tab { slots: vec![(0, 0); cap], mask: cap - 1 }
+        Tab { slots: vec![(0, 0); cap], mask: cap - 1, map: None }
+    }
+    #[inline]
+    fn s(&self) -> &[(u64, u64)] {
+        match &self.map {
+            // The mapping holds mask + 1 initialized (zeroed or written) slots.
+            Some(m) => unsafe { std::slice::from_raw_parts(m.as_ptr().cast(), self.mask + 1) },
+            None => &self.slots,
+        }
+    }
+    /// A copy with the same entries at a load of at most 2/3, on huge pages where available,
+    /// so the per-event probe touches half the memory of the build table (2 * edges slots).
+    /// None (keep the original) if the mapping fails or it would not be smaller.
+    fn compact(&self, entries: usize) -> Option<Tab> {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let cap = (entries + entries / 2 + 16).next_power_of_two();
+        if cap >= self.mask + 1 {
+            return None;
+        }
+        let map = memmap2::MmapMut::map_anon(cap * 16).ok()?;
+        #[cfg(target_os = "linux")]
+        let _ = map.advise(memmap2::Advice::HugePage);
+        let mask = cap - 1;
+        let dst: &[AtomicU64] = unsafe { std::slice::from_raw_parts(map.as_ptr().cast(), cap * 2) };
+        let src = &self.slots;
+        const CH: usize = 1 << 14;
+        (0..src.len().div_ceil(CH)).into_par_iter().for_each(|c| {
+            for &(k, v) in &src[c * CH..((c + 1) * CH).min(src.len())] {
+                if k == 0 {
+                    continue;
+                }
+                // Keys are distinct, so a claimed slot never holds this key already.
+                let mut i = (k as usize) & mask;
+                while dst[2 * i].compare_exchange(0, k, Relaxed, Relaxed).is_err() {
+                    i = (i + 1) & mask;
+                }
+                dst[2 * i + 1].store(v, Relaxed);
+            }
+        });
+        // The rayon join above orders every store before later reads.
+        Some(Tab { slots: Vec::new(), mask, map: Some(map) })
     }
     #[inline]
     fn prefetch(&self, key: u64) {
         let index = (if key == 0 { 1 } else { key }) as usize & self.mask;
-        let ptr = self.slots.as_ptr().wrapping_add(index);
+        let ptr = self.s().as_ptr().wrapping_add(index);
         #[cfg(target_arch = "aarch64")]
         unsafe {
             std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
@@ -582,8 +624,9 @@ impl Tab {
     fn get(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
+        let slots = self.s();
         loop {
-            let (kk, vv) = self.slots[i];
+            let (kk, vv) = slots[i];
             if kk == 0 {
                 return None;
             }
@@ -1441,6 +1484,9 @@ fn fast(seed: u64) -> bool {
         (nids as usize, pname)
     };
     lap("  links repointed");
+    // Shrink the probe table for the event and click lookups (Linux: huge pages).
+    let ltab = if std::env::var_os("BLUE2_NO_COMPACT").is_none() { ltab.compact(nids).unwrap_or(ltab) } else { ltab };
+    lap("  links compacted");
     let coll = AtomicBool::new(false);
     let resolve_person = |key, check, name| {
         match ltab.get(key, check, &coll) {
