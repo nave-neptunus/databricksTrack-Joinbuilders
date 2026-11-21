@@ -1447,8 +1447,13 @@ fn campaign_number(c: &[u8]) -> Option<usize> {
     if d.is_empty() || d.len() > 9 || (d[0] == b'0' && d.len() > 1) {
         return None;
     }
-    if let &[a, b, c, d] = d {
-        let digits = u32::from_le_bytes([a, b, c, d]) ^ 0x3030_3030;
+    let word = match *d {
+        [a, b, c, d] => u32::from_le_bytes([a, b, c, d]),
+        [a, b, c] => u32::from_le_bytes([b'0', a, b, c]),
+        _ => 0,
+    };
+    if word != 0 {
+        let digits = word ^ 0x3030_3030;
         if (digits | digits.wrapping_add(0x0606_0606)) & 0xf0f0_f0f0 != 0 {
             return None;
         }
@@ -1495,6 +1500,14 @@ impl Click {
             std::slice::from_raw_parts(ptr, len)
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PendingClick {
+    key: u64,
+    tag: u64,
+    ts: u32,
+    check: u32,
 }
 
 #[derive(Default)]
@@ -2102,18 +2115,18 @@ fn fast(seed: u64, nova: bool) -> bool {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
             let mut dates = nova::Dates::default();
+            let mut batch = [PendingClick::default(); 48];
+            let mut count = 0;
+            let mut flush = |batch: &[PendingClick]| {
+                for &PendingClick { key, tag, ts, check } in batch {
+                    let Some(person) = users.find(key, check, &coll) else { continue };
+                    acc.push(Click { tag, person, ts });
+                }
+            };
             clicks::rows(chunk, |[cid, user, cmp, ts]| {
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }
-                let (key, check) = if nova {
-                    // A supported link or event user always has a short key.
-                    let Some(key) = nova::user_key(user) else { return };
-                    (key, 0)
-                } else {
-                    hs(user, seed)
-                };
-                users.prefetch(key);
                 let Some(campaign) = campaign_of(cmp) else { return };
                 let ts = match dates.parse(ts) {
                     Some(t) if t >= click_start && t < w1 => (t - click_start) as u32,
@@ -2124,10 +2137,23 @@ fn fast(seed: u64, nova: bool) -> bool {
                     coll.store(true, Relaxed);
                     return;
                 }
-                let Some(person) = users.find(key, check, &coll) else { return };
+                let (key, check) = if nova {
+                    // A supported link or event user always has a short key.
+                    let Some(key) = nova::user_key(user) else { return };
+                    (key, 0)
+                } else {
+                    hs(user, seed)
+                };
+                users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
-                acc.push(Click { tag, person, ts });
+                batch[count] = PendingClick { key, tag, ts, check };
+                count += 1;
+                if count == batch.len() {
+                    flush(&batch);
+                    count = 0;
+                }
             });
+            flush(&batch[..count]);
             acc
         },
     );
