@@ -86,6 +86,9 @@ jobs:
           test -x "$LLVM_PROFDATA"
           "$LLVM_PROFDATA" merge --failure-mode=all -o pgo/fast.profdata "$PROFILE_DIR"/*.profraw
           ls -lh pgo/fast.profdata
+      - name: Build profile-use image
+        if: hashFiles('pgo/fast.profdata') != ''
+        run: docker build --platform linux/amd64 --tag g7-pgo .
       - uses: actions/upload-artifact@v4
         with:
           name: g7-fast-pgo-${{ github.run_id }}
