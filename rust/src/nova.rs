@@ -211,10 +211,12 @@ impl<T: Copy, const N: usize> Streams<T, N> {
 #[derive(Clone, Copy)]
 struct Claim {
     key: u64,
+    high: u64,
     ingest: i32,
     loc: u32,
+    tag: u32,
 }
-const _: () = assert!(size_of::<Claim>() == 16);
+const _: () = assert!(size_of::<Claim>() == 32);
 
 const LOC_INDEX_BITS: u32 = 28 - PB;
 const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
@@ -337,8 +339,11 @@ unsafe fn copy_people(src: *const EvP, dst: *mut EvP, count: usize) {
 #[derive(Clone, Copy)]
 struct Pending {
     key: u64,
+    high: u64,
+    tag: u32,
     ingest: i32,
     uid: u64,
+    uid_check: u32,
     name: u64,
     ts: u32,
     price: u32,
@@ -347,8 +352,11 @@ struct Pending {
 impl Pending {
     const EMPTY: Self = Self {
         key: 0,
+        high: 0,
+        tag: 0,
         ingest: 0,
         uid: 0,
+        uid_check: 0,
         name: 0,
         ts: INVALID,
         price: 0,
@@ -704,7 +712,7 @@ impl Parser<'_, '_, '_> {
             let loc = if pending.ts != INVALID {
                 let person = self
                     .users
-                    .person(pending.uid, 0, pending.name, &mut self.ids, self.declined);
+                    .person(pending.uid, pending.uid_check, pending.name, &mut self.ids, self.declined);
                 let part = person as usize & (P - 1);
                 let index = self.people.push(part, person, pending.ts, pending.price);
                 if index >= INDEX_MASK as usize {
@@ -721,7 +729,7 @@ impl Parser<'_, '_, '_> {
             };
             self.streams.push(
                 (pending.key >> 55) as u8 as usize,
-                Claim { key: pending.key, ingest: pending.ingest, loc },
+                Claim { key: pending.key, high: pending.high, tag: pending.tag, ingest: pending.ingest, loc },
             );
         }
         self.count = 0;
@@ -737,10 +745,14 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         }
         // The parser can release its input chunk after this call. No
         // captured identities reference the source buffer.
-        // Short event IDs use the reversible packed key; v5's suffixed IDs
-        // are interned by their full bytes and stay exact.
-        let key = short_key(id, b'e').map(permute_short)
-            .unwrap_or_else(|| self.interner.intern(id));
+        // Short IDs stay in SHORT_KEY space. A fixed v5 suffix has an exact
+        // tagged u128 identity, while only malformed/odd shapes use ExactIds.
+        let (key, high, tag) = short_key(id, b'e').map(permute_short)
+            .map(|key| (key, 0, 0))
+            .unwrap_or_else(|| match crate::v5_hex_key(id, b'e') {
+                Some(hex) => (hex.lo, hex.hi, 1),
+                None => (self.interner.intern(id), 0, 0),
+            });
         let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
             self.declined.store(true, Relaxed);
             return;
@@ -751,6 +763,8 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         };
         let mut pending = Pending::EMPTY;
         pending.key = key;
+        pending.high = high;
+        pending.tag = tag;
         pending.ingest = order;
         'valid: {
             let user = fields.field::<1>();
@@ -780,7 +794,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.price = value | (category << 24);
             }
-            let uid = user_key(user).unwrap_or_else(|| self.interner.intern(user));
+            let (uid, check) = self.interner.user(user);
             // Keep a direct reference to the full ID for the name. This avoids
             // decoding short keys later (and an allocation per person).
             let Some(r) = crate::pack_ref(user) else {
@@ -791,6 +805,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.users.prefetch(uid);
             pending.ts = relative as u32;
             pending.uid = uid;
+            pending.uid_check = check;
         }
         self.batch[self.count] = pending;
         self.count += 1;
@@ -866,7 +881,7 @@ fn events(
 
 type ClaimStream = Streams<Claim, SHARDS>;
 
-// One 16-byte cell holds the full event key, the winning ingest time and the
+// A cell holds the full tagged event key, the winning ingest time and the
 // location of the payload parse already wrote into its final person partition.
 // The high byte of `meta` is a generation, so tables are reused across shards.
 const META_GEN_SHIFT: u32 = 24;
@@ -877,8 +892,10 @@ const INGEST_BIAS: i32 = 1 << 21;
 #[derive(Clone, Copy, Default)]
 struct Slot {
     key: u64,
+    high: u64,
     meta: u32,
     loc: u32,
+    tag: u32,
 }
 
 struct Router {
@@ -910,7 +927,7 @@ impl Router {
         people[worker].get(part, index).ts.store(INVALID, Relaxed);
     }
 
-    fn route(&mut self, people: &[People], claims: &[ClaimStream], shard: usize) {
+    fn route(&mut self, people: &[People], claims: &[ClaimStream], shard: usize, declined: &AtomicBool) {
         let begin = std::time::Instant::now();
         let count: usize = claims.iter().map(|fold| fold.len(shard)).sum();
         if count == 0 {
@@ -941,14 +958,21 @@ impl Router {
                     loop {
                         let winner = self.slots[slot];
                         if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
-                            self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
+                            self.slots[slot] = Slot { key: claim.key, high: claim.high, tag: claim.tag, meta, loc: claim.loc };
                             break;
                         }
                         if winner.key == claim.key {
+                            if winner.high != claim.high || winner.tag != claim.tag {
+                                // The hash-table probe is shared by exact
+                                // packed and legacy key shapes. Refuse any
+                                // non-identical identity instead of merging.
+                                declined.store(true, Relaxed);
+                                break;
+                            }
                             let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
                             if claim.ingest < previous {
                                 Self::tombstone(people, winner.loc);
-                                self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
+                                self.slots[slot] = Slot { key: claim.key, high: claim.high, tag: claim.tag, meta, loc: claim.loc };
                             } else {
                                 Self::tombstone(people, claim.loc);
                             }
@@ -990,7 +1014,7 @@ pub(super) fn run_events(
         SHARDS,
         Router::new,
         |mut router, shard| {
-            router.route(&people, &claims, shard);
+            router.route(&people, &claims, shard, declined);
             router
         },
     )
@@ -1032,7 +1056,7 @@ mod tests {
                 let index = people.push(part, person, ts, price);
                 (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
             };
-            claims[worker as usize].push((key >> 55) as u8 as usize, Claim { key, ingest, loc });
+            claims[worker as usize].push((key >> 55) as u8 as usize, Claim { key, high: 0, tag: 0, ingest, loc });
         }
 
         let mut people = [People::new(32), People::new(1)];
@@ -1052,7 +1076,7 @@ mod tests {
         second.finish();
         assert_eq!(people[0].len(3), 300);
         assert_eq!(people[1].len(7), 1);
-        Router::new().route(&people, &claims, 0);
+        Router::new().route(&people, &claims, 0, &AtomicBool::new(false));
         let live = |part| people.iter().flat_map(|p| p.records(part).into_iter().flatten())
             .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
         assert_eq!(live(3), vec![(3, 10, 1); 298]);
