@@ -72,6 +72,10 @@ def main():
         for size in ("20m",):
             _, ms, _, err = run(CAND_BIN, HOME / f"v5-{size}", f"gen-{size}", ("--generic",))
             print(f"GENERIC {size}: {ms:.0f} ms\n" + "\n".join(l for l in err.splitlines() if "v1nd" in l), flush=True)
+    st_bin = CAND_BIN.parent / "cand_stats"
+    if st_bin.exists():
+        _, ms, _, err = run(st_bin, HOME / "v5-20m", "stats")
+        print("STATS " + " | ".join(l for l in err.splitlines() if l.startswith("[stats]")), flush=True)
     if os.environ.get("MODES", "1") == "1":
         for mode in (1, 2, 3, 0):
             _, ms, _, err = run(CAND_BIN, HOME / "v5-20m", f"mode{mode}", xenv={"XL_V5MODE": str(mode)})

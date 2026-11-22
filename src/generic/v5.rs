@@ -895,6 +895,13 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
         return why(b);
     }
     lap(log, &mut last, t0, "parse");
+    #[cfg(feature = "stats")]
+    for (i, n) in crate::k_free::REASONS.iter().enumerate() {
+        let n = n.load(Ordering::Relaxed);
+        if n != 0 {
+            eprintln!("[stats] {} = {}", crate::k_free::REASON_NAMES[i], n);
+        }
+    }
     let nthreads = states.len();
     let lost: Vec<Vec<AtomicU8>> = states
         .iter()

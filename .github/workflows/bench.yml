@@ -54,6 +54,7 @@ jobs:
           sudo cp fallback/target/x86_64-unknown-linux-gnu/release/pipeline /fallback
           sudo chmod 0755 /fallback
           mkdir -p $HOME/bin && cp target/x86_64-unknown-linux-musl/release/pipeline $HOME/bin/cand
+          cargo build --release --features stats --target x86_64-unknown-linux-musl --target-dir $HOME/tstats 2>&1 | tail -2 && cp $HOME/tstats/x86_64-unknown-linux-musl/release/pipeline $HOME/bin/cand_stats
       - name: Generate v5 corpora
         if: steps.cpu.outputs.ok == 'true'
         run: |
