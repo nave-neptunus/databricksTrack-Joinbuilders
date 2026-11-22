@@ -162,6 +162,7 @@ fn find(parent: &mut [u32], mut id: u32) -> u32 {
 }
 
 fn links(g: &G) -> (FrozenDictionary, Vec<u32>) {
+    let t_links = std::time::Instant::now();
     let users = Dictionary::new();
     let chunks: Vec<_> = g
         .queue
@@ -193,6 +194,7 @@ fn links(g: &G) -> (FrozenDictionary, Vec<u32>) {
         g.t(tid).n_lk_rows = edges.len() as u64;
     });
     let users = users.freeze();
+    let t_par = t_links.elapsed().as_secs_f64() * 1e3;
     let mut parent = Vec::new();
     for thread_edges in edges {
         for (a, b) in thread_edges.into_inner().unwrap() {
@@ -208,6 +210,7 @@ fn links(g: &G) -> (FrozenDictionary, Vec<u32>) {
             parent[ra.max(rb) as usize] = ra.min(rb);
         }
     }
+    let t_uf = t_links.elapsed().as_secs_f64() * 1e3 - t_par;
     let mut minimum = vec![u32::MAX; parent.len()];
     for i in 0..parent.len() as u32 {
         let Some(id) = users.id(i) else { continue };
@@ -223,6 +226,11 @@ fn links(g: &G) -> (FrozenDictionary, Vec<u32>) {
     }
     for p in &mut parent {
         *p = minimum[*p as usize];
+    }
+    unsafe {
+        sys::LAPS.push(("x.lk_par", t_par));
+        sys::LAPS.push(("x.lk_uf", t_uf));
+        sys::LAPS.push(("x.lk_min", t_links.elapsed().as_secs_f64() * 1e3 - t_par - t_uf));
     }
     (users, parent)
 }
@@ -851,6 +859,7 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                     }
                 });
             }
+            LAP_US[6].fetch_add(t_ev.elapsed().as_micros() as u64, Ordering::Relaxed);
             // Every repeated bit has at least two claims. Two slots per
             // additional claim bound the exact table size, even on collisions.
             short.reset(2 * collisions);
@@ -918,6 +927,7 @@ fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Par
 // Express consumes contiguous runs in event-slot order. Assign those slots
 // after dedup so opaque event IDs and shuffled input cannot split a person.
 fn order_events(g: &G, parsed: &[Parsed]) {
+    let t_off = std::time::Instant::now();
     let mut offsets = Vec::with_capacity(g.nub + 1);
     offsets.push(0usize);
     for bucket in 0..g.nub {
@@ -931,6 +941,7 @@ fn order_events(g: &G, parsed: &[Parsed]) {
     if offsets[g.nub] as u64 > g.ecap {
         sys::fallback("events exceed slot capacity");
     }
+    unsafe { sys::LAPS.push(("x.order_offsets", t_off.elapsed().as_secs_f64() * 1e3)) };
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
         let part = &mut g.t(tid).ev;
@@ -1008,7 +1019,7 @@ pub fn stage1(g: &mut G) {
     sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
     sys::lap("dedup_ids");
     unsafe {
-        for (i, name) in [(4, "x.dedup_ev"), (5, "x.dedup_ck")] {
+        for (i, name) in [(4, "x.dedup_ev"), (5, "x.dedup_ck"), (6, "x.dedup_ev_pass1")] {
             sys::LAPS.push((name, LAP_US[i].load(Ordering::Relaxed) as f64 / 1e3 / g.nt as f64));
         }
     }
