@@ -956,7 +956,10 @@ fn resolve_people(g: &G, users: &Users, parsed: &[Parsed]) {
             for p in parsed {
                 for rows in p.people.bucket(stripe) {
                     for (i, row) in rows.iter().enumerate() {
-                        if let Some(ahead) = rows.get(i + 8) {
+                        if let Some(ahead) = rows.get(i + 32) {
+                            prefetch_id(g, ahead.key.load(Ordering::Relaxed));
+                        }
+                        if let Some(ahead) = rows.get(i + 12) {
                             users.prefetch(g, 0, ahead.key.load(Ordering::Relaxed));
                         }
                         let id = id_at(g, row.key.load(Ordering::Relaxed), 0);
