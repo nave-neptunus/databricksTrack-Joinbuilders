@@ -13,11 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         sha:
-          - 531c2dc5c0706742242615ba523abb2a29313510
-          - 563ccb8d1294333ddbf4dd361028da19ea6fb188
-          - f88df38c12c103700ab5a3e219c9b54ffd48be12
-          - cbf00604db96a0bca78a7f35dae87c464080e781
-          - 167f273ff04dbd492e4aa30f49c66f2195eb355e
+          - 7c28e420e476b6df40f623ceed6eae767b387737
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
