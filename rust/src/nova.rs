@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use std::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
-const SHARDS: usize = 512;
+const SHARDS: usize = 1024;
 const SHARD_BITS: u32 = SHARDS.trailing_zeros();
 
 /// The shard is the top `SHARD_BITS` mixed bits below the short-ID tag bit.
