@@ -31,21 +31,10 @@ jobs:
           cargo build --release --locked --manifest-path generator/Cargo.toml
           generator/target/release/generate --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/big60" --threads "$NCPU"
           du -sh "$HOME/big60"
-      - name: Build baseline and candidates
+      - name: Build baseline first
         run: |
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          for spec in \
-            baseline:ed40599 \
-            s60-ev3a-lpt:c26ce00f384baad7461ec9232a3cf618c6c40344 \
-            s60-cx-reserve:d60f04e3f237d058288910dba29374ee86bd54e8 \
-            s60-uf-parent:285050fa5798b7c452f959160015174a32e2abe6 \
-            io-readahead:4b419d7f1ad8ceff04160f21f3d0e76db72bac17 \
-            io-readahead-s1:8dade0009da3851f675f0b4a48fed7b27586ff0e \
-            stack1:96572eb5bd532675e025554369d69f4266f03685
-          do
-            label=${spec%%:*}; sha=${spec#*:}
-            git archive --format=tar "$sha" | docker build --platform linux/amd64 --load --tag "g7-v5-$label" -
-          done
+          git archive --format=tar ed40599 | docker build --platform linux/amd64 --load --tag g7-v5-baseline -
       - name: Baseline v5 fast-path report
         run: |
           mkdir -p "$HOME/v5-baseline/out" "$HOME/v5-baseline/scratch"
@@ -57,6 +46,17 @@ jobs:
           sed -n 's/.*exit at \([0-9.]*\) ms.*/baseline_engine_ms=\1/p' "$HOME/v5-baseline/stderr" >> "$HOME/v5-baseline/report.txt"
           if grep -qi fallback "$HOME/v5-baseline/stderr"; then echo 'baseline_fast_path=FALLBACK' >> "$HOME/v5-baseline/report.txt"; else echo 'baseline_fast_path=NO_FALLBACK' >> "$HOME/v5-baseline/report.txt"; fi
           cat "$HOME/v5-baseline/report.txt"
+      - name: Build valid candidates
+        run: |
+          for spec in \
+            s60-ev3a-lpt:c26ce00f384baad7461ec9232a3cf618c6c40344 \
+            s60-cx-reserve:d60f04e3f237d058288910dba29374ee86bd54e8 \
+            s60-uf-parent:285050fa5798b7c452f959160015174a32e2abe6 \
+            stack1:96572eb5bd532675e025554369d69f4266f03685
+          do
+            label=${spec%%:*}; sha=${spec#*:}
+            git archive --format=tar "$sha" | docker build --platform linux/amd64 --load --tag "g7-v5-$label" -
+          done
       - name: Eight alternating 60M pairs and exact gates
         run: |
           set -o pipefail
@@ -64,8 +64,6 @@ jobs:
             s60-ev3a-lpt:c26ce00f384baad7461ec9232a3cf618c6c40344 \
             s60-cx-reserve:d60f04e3f237d058288910dba29374ee86bd54e8 \
             s60-uf-parent:285050fa5798b7c452f959160015174a32e2abe6 \
-            io-readahead:4b419d7f1ad8ceff04160f21f3d0e76db72bac17 \
-            io-readahead-s1:8dade0009da3851f675f0b4a48fed7b27586ff0e \
             stack1:96572eb5bd532675e025554369d69f4266f03685
           do
             label=${spec%%:*}; sha=${spec#*:}
@@ -75,7 +73,7 @@ jobs:
       - if: always()
         run: |
           cat "$HOME/v5-baseline/report.txt" >> "$GITHUB_STEP_SUMMARY" || true
-          for report in "$HOME"/v5-*/summary.md; do test -f "$report" && cat "$report" >> "$GITHUB_STEP_SUMMARY"; done
+          for report in "$HOME"/v5-*/summary.md; do if test -f "$report"; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi; done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
