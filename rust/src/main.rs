@@ -152,7 +152,7 @@ fn pt_ordered<T: Send>(n: usize, init: impl Fn() -> T + Sync, f: impl Fn(T, usiz
     })
 }
 
-/// Cold-cache read-ahead: threads populate the page cache for 16 MiB ranges of the input
+/// Cold-cache read-ahead: threads populate the page cache for fixed-size ranges of the input
 /// mappings in the order the parse consumes them (links, events, clicks). Each range has a
 /// ready flag, so a parse worker that gets ahead waits for its range instead of faulting
 /// pages in one small read at a time. Flags only order work; correctness never depends on them.
@@ -160,21 +160,53 @@ struct ReadAhead {
     // per mapping (by address): start address, length, index of its first range
     maps: Vec<(usize, usize, usize)>,
     ready: Vec<std::sync::atomic::AtomicBool>,
+    piece: usize,
 }
 
 const RA_PIECE: usize = 16 << 20;
 
+/// How a read-ahead thread asks the kernel to fill the page cache.
+#[derive(Clone, Copy, PartialEq)]
+enum RaMode {
+    /// sendfile to /dev/null: synchronous, no user-space copy, kernel readahead window per request.
+    Sendfile,
+    /// posix_fadvise(WILLNEED): queues the whole range in large requests, returns after submission.
+    Fadvise,
+    /// readahead(2): like fadvise but Linux-specific.
+    Readahead,
+    /// pread into a user buffer: synchronous, one large request per call.
+    Pread,
+    /// madvise(MADV_POPULATE_READ) on the mapping.
+    Populate,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+    fn readahead(fd: i32, offset: i64, count: usize) -> isize;
+}
+
 impl ReadAhead {
     fn start(maps: Vec<&'static memmap2::Mmap>, paths: Vec<&'static str>) -> &'static ReadAhead {
-        let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let env = |k: &str| std::env::var(k).ok();
+        let threads: usize = env("BLUE2_IO_THREADS").and_then(|s| s.parse().ok()).unwrap_or(16);
+        let piece: usize = env("BLUE2_RA_PIECE_KIB").and_then(|s| s.parse::<usize>().ok()).filter(|&k| k >= 64).map_or(RA_PIECE, |k| k << 10);
+        let mode = match env("BLUE2_RA_MODE").as_deref() {
+            Some("fadvise") => RaMode::Fadvise,
+            Some("readahead") => RaMode::Readahead,
+            Some("pread") => RaMode::Pread,
+            Some("populate") => RaMode::Populate,
+            _ if std::env::var_os("BLUE2_WARM_POPULATE").is_some() => RaMode::Populate,
+            _ => RaMode::Sendfile,
+        };
         let mut table = vec![];
         let mut ranges = vec![];
         for (m, path) in maps.iter().zip(&paths) {
             table.push((m.as_ptr() as usize, m.len(), ranges.len()));
             let mut off = 0;
             while off < m.len() {
-                ranges.push((*m, *path, off, RA_PIECE.min(m.len() - off)));
-                off += RA_PIECE;
+                ranges.push((*m, *path, off, piece.min(m.len() - off)));
+                off += piece;
             }
         }
         table.sort_unstable();
@@ -182,32 +214,65 @@ impl ReadAhead {
         let ra: &'static ReadAhead = Box::leak(Box::new(ReadAhead {
             maps: table,
             ready: (0..ranges.len()).map(|_| std::sync::atomic::AtomicBool::new(!on)).collect(),
+            piece,
         }));
         if on {
             let ranges: &'static [(&'static memmap2::Mmap, &'static str, usize, usize)] = Box::leak(ranges.into_boxed_slice());
-            let populate = std::env::var_os("BLUE2_WARM_POPULATE").is_some();
             let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
             for _ in 0..threads {
                 std::thread::spawn(move || {
-                    // sendfile to /dev/null fills the page cache without copying to user space
-                    // (std::io::copy picks sendfile/splice for a file reader on Linux).
                     let mut null = std::fs::OpenOptions::new().write(true).open("/dev/null").ok();
+                    let mut buf: Vec<u8> = vec![];
                     let mut open: Option<(&str, std::fs::File)> = None;
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         let Some(&(m, path, off, len)) = ranges.get(i) else { break };
                         let mut done = false;
-                        if !populate && cfg!(target_os = "linux") {
-                            if let Some(sink) = null.as_mut() {
-                                if open.as_ref().map(|o| o.0) != Some(path) {
-                                    open = std::fs::File::open(path).ok().map(|f| (path, f));
-                                }
-                                if let Some((_, f)) = open.as_mut() {
-                                    use std::io::{Read, Seek, SeekFrom};
-                                    if f.seek(SeekFrom::Start(off as u64)).is_ok() {
-                                        let reader: &std::fs::File = f;
-                                        done = std::io::copy(&mut reader.take(len as u64), sink).is_ok();
+                        if cfg!(target_os = "linux") && mode != RaMode::Populate {
+                            if open.as_ref().map(|o| o.0) != Some(path) {
+                                open = std::fs::File::open(path).ok().map(|f| (path, f));
+                            }
+                            if let Some((_, f)) = open.as_mut() {
+                                use std::io::{Read, Seek, SeekFrom};
+                                use std::os::fd::AsRawFd;
+                                match mode {
+                                    RaMode::Sendfile => {
+                                        // std::io::copy picks sendfile/splice for a file reader on Linux.
+                                        if let Some(sink) = null.as_mut() {
+                                            if f.seek(SeekFrom::Start(off as u64)).is_ok() {
+                                                let reader: &std::fs::File = f;
+                                                done = std::io::copy(&mut reader.take(len as u64), sink).is_ok();
+                                            }
+                                        }
                                     }
+                                    #[cfg(target_os = "linux")]
+                                    RaMode::Fadvise => {
+                                        done = unsafe { posix_fadvise(f.as_raw_fd(), off as i64, len as i64, 3) } == 0;
+                                    }
+                                    #[cfg(target_os = "linux")]
+                                    RaMode::Readahead => {
+                                        done = unsafe { readahead(f.as_raw_fd(), off as i64, len) } == 0;
+                                    }
+                                    RaMode::Pread => {
+                                        use std::os::unix::fs::FileExt;
+                                        if buf.is_empty() {
+                                            buf = vec![0u8; len.min(4 << 20)];
+                                        }
+                                        let mut at = 0;
+                                        done = true;
+                                        while at < len {
+                                            let n = (len - at).min(buf.len());
+                                            match f.read_at(&mut buf[..n], (off + at) as u64) {
+                                                Ok(0) => break,
+                                                Ok(r) => at += r,
+                                                Err(_) => {
+                                                    done = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -241,8 +306,8 @@ impl ReadAhead {
         if p >= start + len {
             return;
         }
-        let lo = (p - start) / RA_PIECE;
-        let hi = (p + b.len() - 1 - start).min(len - 1) / RA_PIECE;
+        let lo = (p - start) / self.piece;
+        let hi = (p + b.len() - 1 - start).min(len - 1) / self.piece;
         for r in first + lo..=first + hi {
             let mut spins = 0u32;
             while !self.ready[r].load(std::sync::atomic::Ordering::Acquire) {
