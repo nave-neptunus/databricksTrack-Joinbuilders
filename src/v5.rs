@@ -716,7 +716,21 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena, people_arena: &sys::Arena) -> 
 }
 
 #[inline]
-fn choose(winner: &mut CopyLocation, copy: CopyLocation, parsed: &[Parsed]) {
+// Raw absolute user keys are equal as IDs: identical packed shorts, or long
+// IDs with the same bytes at different file offsets.
+fn same_user(g: &G, a: u64, b: u64) -> bool {
+    if a == b {
+        return true;
+    }
+    if a & ID_ODD != 0 && b & ID_ODD != 0 && a != ID_EMPTY && b != ID_EMPTY {
+        if let (Id::Long(x), Id::Long(y)) = (id_at(g, a, 0), id_at(g, b, 0)) {
+            return x == y;
+        }
+    }
+    false
+}
+
+fn choose(g: &G, winner: &mut CopyLocation, copy: CopyLocation, parsed: &[Parsed]) {
     let loser = if copy.ingest < winner.ingest {
         let loser = winner.loc;
         *winner = copy;
@@ -726,7 +740,7 @@ fn choose(winner: &mut CopyLocation, copy: CopyLocation, parsed: &[Parsed]) {
             let same = match (event_at(parsed, winner.loc), event_at(parsed, copy.loc)) {
                 (Some(a), Some(b)) => {
                     a.w0.load(Ordering::Relaxed) == b.w0.load(Ordering::Relaxed)
-                        && a.key.load(Ordering::Relaxed) == b.key.load(Ordering::Relaxed)
+                        && same_user(g, a.key.load(Ordering::Relaxed), b.key.load(Ordering::Relaxed))
                 }
                 (None, None) => true,
                 _ => false,
@@ -782,7 +796,7 @@ impl EventSlots {
     }
 
     #[inline]
-    fn copy(&mut self, parsed: &[Parsed], key: u64, copy: CopyLocation) {
+    fn copy(&mut self, g: &G, parsed: &[Parsed], key: u64, copy: CopyLocation) {
         let mask = self.slots.len() - 1;
         let mut i = key as usize & mask;
         loop {
@@ -792,7 +806,7 @@ impl EventSlots {
                 return;
             }
             if slot.key == key {
-                choose(&mut slot.copy, copy, parsed);
+                choose(g, &mut slot.copy, copy, parsed);
                 return;
             }
             i = (i + 1) & mask;
@@ -894,7 +908,7 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                                         prefetch_event(parsed, CopyLocation::unpack(next.w1).loc);
                                     }
                                 }
-                                short.copy(parsed, row.w0, CopyLocation::unpack(row.w1));
+                                short.copy(g, parsed, row.w0, CopyLocation::unpack(row.w1));
                             }
                         } else {
                             if let Some(next) = part.get(i + 32) {
@@ -906,7 +920,7 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                             if is_new {
                                 long_slots.push(copy);
                             } else {
-                                choose(&mut long_slots[index as usize], copy, parsed);
+                                choose(g, &mut long_slots[index as usize], copy, parsed);
                             }
                         }
                     }
@@ -947,12 +961,15 @@ fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Par
 
 // Express consumes contiguous runs in event-slot order. Assign those slots
 // after dedup so opaque event IDs and shuffled input cannot split a person.
-// Resolves every person row one hash partition at a time, so each pass only
-// touches that stripe of the user tables.
-fn resolve_people(g: &G, users: &Users, parsed: &[Parsed]) {
+// Resolves every surviving person row one hash partition at a time, so each
+// pass only touches that stripe of the user tables, and regroups the rows by
+// user bucket for ordering.
+fn resolve_and_scatter(g: &G, users: &Users, parsed: &[Parsed], scatter_arena: &sys::Arena) -> Vec<PersonEvents> {
+    let slots: Vec<Mutex<Option<PersonEvents>>> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
-    sys::run_par(g.nt, |_| {
+    sys::run_par(g.nt, |tid| {
         let mut sink = ids::LongSink::new();
+        let mut out = PersonEvents::new(g.nub);
         loop {
             let stripe = next.fetch_add(1, Ordering::Relaxed);
             if stripe >= SHARDS {
@@ -967,46 +984,22 @@ fn resolve_people(g: &G, users: &Users, parsed: &[Parsed]) {
                         if let Some(ahead) = rows.get(i + 12) {
                             users.prefetch(g, 0, ahead.key.load(Ordering::Relaxed));
                         }
+                        let w0 = row.w0.load(Ordering::Relaxed);
+                        if w0 == u64::MAX {
+                            continue;
+                        }
                         let id = id_at(g, row.key.load(Ordering::Relaxed), 0);
                         let user = users.person(id, id.hash(), &mut sink);
                         if user as u64 >= g.ucap {
                             sys::fallback("IDs exceed user capacity");
                         }
-                        row.key.store(user as u64, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn order_events(g: &G, parsed: &[Parsed], scatter_arena: &sys::Arena) {
-    // Regroup the surviving resolved rows by user bucket.
-    let t_scatter = std::time::Instant::now();
-    let slots: Vec<Mutex<Option<PersonEvents>>> = (0..g.nt).map(|_| Mutex::new(None)).collect();
-    let next_p = AtomicUsize::new(0);
-    sys::run_par(g.nt, |tid| {
-        let mut out = PersonEvents::new(g.nub);
-        loop {
-            let stripe = next_p.fetch_add(1, Ordering::Relaxed);
-            if stripe >= SHARDS {
-                break;
-            }
-            for p in parsed {
-                for rows in p.people.bucket(stripe) {
-                    for row in rows {
-                        let w0 = row.w0.load(Ordering::Relaxed);
-                        if w0 == u64::MAX {
-                            continue;
-                        }
-                        let user = row.key.load(Ordering::Relaxed);
                         out.push(
                             scatter_arena,
                             tid as u32,
                             (user >> UB) as usize,
                             PersonEvent {
                                 w0: AtomicU64::new(w0),
-                                key: AtomicU64::new(user),
+                                key: AtomicU64::new(user as u64),
                             },
                         );
                     }
@@ -1016,9 +1009,7 @@ fn order_events(g: &G, parsed: &[Parsed], scatter_arena: &sys::Arena) {
         out.finish();
         *slots[tid].lock().unwrap() = Some(out);
     });
-    let groups: Vec<PersonEvents> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
-    unsafe { sys::LAPS.push(("x.order_scatter", t_scatter.elapsed().as_secs_f64() * 1e3)) };
-    order_grouped(g, &groups);
+    slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
 }
 
 fn order_grouped(g: &G, parsed: &[PersonEvents]) {
@@ -1110,8 +1101,6 @@ pub fn stage1(g: &mut G) {
         let flt = std::fs::read_to_string("/proc/self/stat").ok().and_then(|t| t.rsplit(')').next().and_then(|r| r.split_whitespace().nth(7).map(str::to_owned))).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
         sys::LAPS.push(("x.minflt_k", flt / 1e3));
     }
-    resolve_people(g, &users, &parsed);
-    sys::lap("resolve_people");
     let clicks = dedup(g, &parsed);
     sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
     sys::lap("dedup_ids");
@@ -1125,7 +1114,10 @@ pub fn stage1(g: &mut G) {
             + g.nt * g.nub * PERSON_BLOCK_ROWS * std::mem::size_of::<PersonEvent>()
             + (2 << 20),
     );
-    order_events(g, &parsed, &scatter_arena);
+    let scat_arena_ref = &scatter_arena;
+    let groups = resolve_and_scatter(g, &users, &parsed, scat_arena_ref);
+    sys::lap("resolve_scatter");
+    order_grouped(g, &groups);
     sys::lap("order_events");
     sys::run_par(g.nt, |tid| people_arena.release_part(tid, g.nt));
     sys::run_par(g.nt, |tid| scatter_arena.release_part(tid, g.nt));
