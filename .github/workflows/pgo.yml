@@ -66,7 +66,8 @@ jobs:
           test "$size" -gt 1000 || { echo "profdata too small ($size bytes)" >&2; exit 1; }
           "$LLVM_PROFDATA" show --all-functions --counts rust/pgo/merged.profdata > /tmp/functions.txt
           head -30 /tmp/functions.txt
-          grep -E 'rproto|nova|events' /tmp/functions.txt | head -20
+          grep -E 'rproto|nova|events' /tmp/functions.txt > /tmp/hot.txt
+          head -20 /tmp/hot.txt
 
       - uses: actions/upload-artifact@v4
         with:
