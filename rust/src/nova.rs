@@ -743,6 +743,65 @@ struct Parser<'a, 'catalog, 'table> {
     worker: u32,
 }
 
+/// The part of event parsing which is independent of the link/user table.
+/// Keeping these records lets the cold event scan run beside link construction;
+/// resolution is replayed, in worker order, after the table is published.
+pub(super) struct ParsedEvents {
+    pending: Vec<Vec<Pending>>,
+}
+
+struct ScanParser<'a, 'catalog> {
+    input: &'a EventInput<'catalog>,
+    declined: &'a AtomicBool,
+    window_seconds: i64,
+    window_ms: u64,
+    dates: Dates,
+    pending: Vec<Pending>,
+}
+
+impl ScanParser<'_, '_> {
+    #[inline]
+    fn parse_chunk(&mut self, bytes: &[u8]) { scan_event_rows(bytes, self); }
+}
+
+impl<'a> EventSink<'a> for ScanParser<'_, '_> {
+    #[inline]
+    fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
+        let id = fields.field::<0>();
+        if id.is_empty() { return; }
+        let (key, eref) = match short_key(id, b'e') {
+            Some(key) => (permute_short(key), 0),
+            None => {
+                let Some(eref) = crate::pack_ref(id) else { self.declined.store(true, Relaxed); return; };
+                (crate::hs(id, EVENT_ID_SEED).0 & (u64::MAX >> 1), eref)
+            }
+        };
+        let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else { self.declined.store(true, Relaxed); return; };
+        let Ok(order) = i32::try_from(seconds - self.window_seconds) else { self.declined.store(true, Relaxed); return; };
+        if order == CARRIER { self.declined.store(true, Relaxed); return; }
+        let mut pending = Pending { key, eref, ingest: order, ..Pending::EMPTY };
+        'valid: {
+            let user = fields.field::<1>();
+            if user.is_empty() || fields.empty::<5>() { break 'valid; }
+            let purchase = match fields.field::<4>() { b"purchase" => true, b"view" | b"cart" => false, _ => break 'valid };
+            let Some(time) = self.dates.parse(fields.field::<2>()) else { break 'valid; };
+            let relative = time.wrapping_sub(self.input.start) as u64;
+            if relative >= self.window_ms || seconds * 1000 - time > DAY { break 'valid; }
+            if purchase {
+                let Some(value) = parse_price(fields.field::<6>()) else { break 'valid; };
+                pending.price = value | (*self.input.products.get(fields.field::<5>()).unwrap_or(&self.input.unknown) << 24);
+            }
+            let (uid, chk) = user_ident(user);
+            let Some(name) = crate::pack_ref(user) else { self.declined.store(true, Relaxed); break 'valid; };
+            pending.uid = uid;
+            pending.chk = chk;
+            pending.name = name;
+            pending.ts = relative as u32;
+        }
+        self.pending.push(pending);
+    }
+}
+
 impl Parser<'_, '_, '_> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
         scan_event_rows(bytes, self);
@@ -870,65 +929,55 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
     }
 }
 
-fn events(
+pub(super) fn scan_events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
+    input: &EventInput<'_>,
+    declined: &AtomicBool,
+) -> ParsedEvents {
+    let next = AtomicUsize::new(0);
+    let workers = AtomicUsize::new(0);
+    let mut parsed: Vec<_> = rayon::broadcast(|_| {
+        let worker = workers.fetch_add(1, Relaxed) as u32;
+        let mut parser = ScanParser { input, declined, window_seconds: input.start.div_euclid(1000), window_ms: (input.end - input.start) as u64, dates: Dates::default(), pending: Vec::new() };
+        loop {
+            let index = next.fetch_add(1, Relaxed);
+            if index >= work.len() { break; }
+            read_ahead.wait(work.raw(index));
+            parser.parse_chunk(work.get(index));
+        }
+        (worker, parser.pending)
+    });
+    parsed.sort_unstable_by_key(|(worker, _)| *worker);
+    ParsedEvents { pending: parsed.into_iter().map(|(_, pending)| pending).collect() }
+}
+
+fn resolve_events(
+    parsed: ParsedEvents,
     users: &Users<'_>,
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
 ) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
-    let next = AtomicUsize::new(0);
-    let workers = AtomicUsize::new(0);
-    let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
-    let reservation = (rows_per_partition + rows_per_partition / 4)
-        .clamp(PAYLOAD_ROWS, INDEX_MASK as usize + 1)
-        .next_multiple_of(PAYLOAD_ROWS);
-    let mut parsed: Vec<_> = rayon::broadcast(|_| {
-        let worker = workers.fetch_add(1, Relaxed) as u32;
-        let too_many = worker >= 1 << (32 - LOC_WORKER_SHIFT);
-        if too_many {
-            declined.store(true, Relaxed);
-        }
+    let rows_per_partition = estimated_rows.div_ceil(P * parsed.pending.len().max(1));
+    let reservation = (rows_per_partition + rows_per_partition / 4).clamp(PAYLOAD_ROWS, INDEX_MASK as usize + 1).next_multiple_of(PAYLOAD_ROWS);
+    let mut output: Vec<_> = parsed.pending.into_par_iter().enumerate().map(|(worker, pending)| {
+        let too_many = worker >= 1usize << (32 - LOC_WORKER_SHIFT);
+        if too_many { declined.store(true, Relaxed); }
         let mut people = People::new(if too_many { 0 } else { reservation });
-        let streams = {
-            let mut parser = Parser {
-                input,
-                users,
-                declined,
-                window_seconds: input.start.div_euclid(1000),
-                window_ms: (input.end - input.start) as u64,
-                dates: Dates::default(),
-                ids: (0, 0),
-                batch: [Pending::EMPTY; 16],
-                count: 0,
-                streams: Streams::new(),
-                people: PeopleWriter::new(&mut people),
-                worker,
-            };
-            loop {
-                let index = next.fetch_add(1, Relaxed);
-                if index >= work.len() {
-                    break;
-                }
-                read_ahead.wait(work.raw(index));
-                parser.parse_chunk(work.get(index));
-            }
-            parser.flush();
-            parser.people.finish();
-            parser.streams
-        };
-        (worker, streams, people)
-    });
-    // `broadcast` returns results in completion order, but locations encode
-    // the assigned worker id, so restore that order before indexing.
-    parsed.sort_unstable_by_key(|(worker, _, _)| *worker);
-    let mut streams = Vec::with_capacity(parsed.len());
-    let mut people = Vec::with_capacity(parsed.len());
-    for (_, s, p) in parsed {
-        streams.push(s);
-        people.push(p);
-    }
+        let mut parser = Parser { input, users, declined, window_seconds: input.start.div_euclid(1000), window_ms: (input.end - input.start) as u64, dates: Dates::default(), ids: (0, 0), batch: [Pending::EMPTY; 16], count: 0, streams: Streams::new(), people: PeopleWriter::new(&mut people), worker: worker as u32 };
+        for pending in pending {
+            parser.batch[parser.count] = pending;
+            parser.count += 1;
+            if parser.count == parser.batch.len() { parser.flush(); }
+        }
+        parser.flush();
+        parser.people.finish();
+        (parser.streams, people)
+    }).collect();
+    let mut streams = Vec::with_capacity(output.len());
+    let mut people = Vec::with_capacity(output.len());
+    for (s, p) in output.drain(..) { streams.push(s); people.push(p); }
     (streams, people)
 }
 
@@ -1061,9 +1110,8 @@ impl Router {
     }
 }
 
-pub(super) fn run_events<C: Send>(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
+pub(super) fn finish_events<C: Send>(
+    parsed: ParsedEvents,
     users: &Users<'_>,
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
@@ -1071,7 +1119,7 @@ pub(super) fn run_events<C: Send>(
     estimated_rows: usize,
     parse_clicks: impl FnOnce() -> C + Send,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>, C)> {
-    let (claims, people) = events(work, read_ahead, users, input, declined, estimated_rows);
+    let (claims, people) = resolve_events(parsed, users, input, declined, estimated_rows);
     if declined.load(Relaxed) {
         return None;
     }
