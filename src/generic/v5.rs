@@ -112,6 +112,7 @@ struct Arena {
     cur: *mut u8,
     left: usize,
 }
+unsafe impl Send for Arena {}
 impl Arena {
     fn new() -> Arena {
         Arena { cur: std::ptr::null_mut(), left: 0 }
