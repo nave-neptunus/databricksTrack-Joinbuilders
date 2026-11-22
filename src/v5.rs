@@ -228,6 +228,18 @@ fn links(g: &G) -> (FrozenDictionary, Vec<u32>) {
 }
 
 #[inline]
+fn prefetch_id(g: &G, id: u64) {
+    if id & ID_ODD != 0 && id != ID_EMPTY {
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let at = g.region.add(odd_offset(id)).cast::<i8>();
+            _mm_prefetch::<_MM_HINT_T0>(at);
+            _mm_prefetch::<_MM_HINT_T0>(at.add(64));
+        }
+    }
+}
+
+#[inline]
 fn id_at(g: &G, id: u64, base: usize) -> Id<'_> {
     if id & ID_ODD == 0 {
         return Id::Short(id);
@@ -267,17 +279,9 @@ struct Scan<'a> {
     n_ck: u64,
     tsc_ev: u64,
     tsc_ck: u64,
-    tsc_person: u64,
-    tsc_push: u64,
-    tsc_claim: u64,
-    n_hit: u64,
-    n_short: u64,
-    n_long: u64,
-    tsc_short: u64,
-    tsc_long: u64,
 }
 
-static LAP_US: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static LAP_US: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 #[inline(always)]
 fn tsc() -> u64 {
@@ -420,22 +424,14 @@ impl Scan<'_> {
         if let Id::Short(short) = key {
             let slot = hash as usize & (USER_CACHE - 1);
             if self.user_keys[slot] == short {
-                self.n_hit += 1;
                 return self.user_values[slot];
             }
-            let t = tsc();
             let p = self.intern_person(key, hash);
-            self.tsc_short += tsc() - t;
-            self.n_short += 1;
             self.user_keys[slot] = short;
             self.user_values[slot] = p;
             p
         } else {
-            let t = tsc();
-            let p = self.intern_person(key, hash);
-            self.tsc_long += tsc() - t;
-            self.n_long += 1;
-            p
+            self.intern_person(key, hash)
         }
     }
 
@@ -467,10 +463,7 @@ impl Scan<'_> {
             && r.ingest.wrapping_sub(r.ts) <= DAY_MS;
         let mut loc = NO_PAYLOAD;
         if valid {
-            let t0 = tsc();
             let user = self.person(r.uid);
-            let t1 = tsc();
-            self.tsc_person += t1 - t0;
             let cat = if r.price == 0 {
                 0
             } else {
@@ -485,7 +478,6 @@ impl Scan<'_> {
                     user,
                 },
             );
-            self.tsc_push += tsc() - t1;
         }
         let (id, hash) = if r.eid & ID_ODD == 0 {
             let key = ids::event_key(r.eid);
@@ -497,9 +489,7 @@ impl Scan<'_> {
             ingest: (ingest / 1000) as u32,
             loc,
         };
-        let t2 = tsc();
         self.claims.push(event_shard(hash), id, copy.pack());
-        self.tsc_claim += tsc() - t2;
     }
 
     #[inline]
@@ -633,14 +623,6 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena, people_arena: &sys::Arena) -> 
             n_ck: 0,
             tsc_ev: 0,
             tsc_ck: 0,
-            tsc_person: 0,
-            tsc_push: 0,
-            tsc_claim: 0,
-            n_hit: 0,
-            n_short: 0,
-            n_long: 0,
-            tsc_short: 0,
-            tsc_long: 0,
         };
         let (wall0, tsc0) = (std::time::Instant::now(), tsc());
         while let Some(chunk) = g.queue.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -670,14 +652,6 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena, people_arena: &sys::Arena) -> 
         LAP_US[2].fetch_add((s.tsc_ck as f64 * per_tsc) as u64, Ordering::Relaxed);
         let fin0 = std::time::Instant::now();
         s.claims.finish();
-        LAP_US[4].fetch_add((s.tsc_person as f64 * per_tsc) as u64, Ordering::Relaxed);
-        LAP_US[5].fetch_add((s.tsc_push as f64 * per_tsc) as u64, Ordering::Relaxed);
-        LAP_US[6].fetch_add((s.tsc_claim as f64 * per_tsc) as u64, Ordering::Relaxed);
-        LAP_US[7].fetch_add((s.tsc_short as f64 * per_tsc) as u64, Ordering::Relaxed);
-        LAP_US[8].fetch_add((s.tsc_long as f64 * per_tsc) as u64, Ordering::Relaxed);
-        LAP_US[9].fetch_add(s.n_hit / 1000, Ordering::Relaxed);
-        LAP_US[10].fetch_add(s.n_short / 1000, Ordering::Relaxed);
-        LAP_US[11].fetch_add(s.n_long / 1000, Ordering::Relaxed);
         LAP_US[3].fetch_add(fin0.elapsed().as_micros() as u64, Ordering::Relaxed);
         *workers[tid].lock().unwrap() = Some(Parsed {
             claims: FinishedClaims(s.claims),
@@ -826,10 +800,13 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                 if stripe >= SHARDS {
                     break;
                 }
+                let t_ck = std::time::Instant::now();
                 let keys = dedup_clicks(g, parsed, stripe, clicks);
+                LAP_US[5].fetch_add(t_ck.elapsed().as_micros() as u64, Ordering::Relaxed);
                 *click_names[stripe].lock().unwrap() = Some(keys);
                 continue;
             }
+            let t_ev = std::time::Instant::now();
             let total: usize = parsed.iter().map(|p| p.claims.0.count(shard)).sum();
             filter.reset(total);
             let mut collisions = 0usize;
@@ -859,6 +836,9 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                                 short.copy(parsed, row.w0, CopyLocation::unpack(row.w1));
                             }
                         } else {
+                            if let Some(next) = part.get(i + 8) {
+                                prefetch_id(g, next.w0);
+                            }
                             let copy = CopyLocation::unpack(row.w1);
                             let id = id_at(g, row.w0, 0);
                             let (index, is_new) = long.intern(id, id.hash());
@@ -871,6 +851,7 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                     }
                 });
             }
+            LAP_US[4].fetch_add(t_ev.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         clicks.finish();
     });
@@ -885,7 +866,10 @@ fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Par
     let mut keys = Shard::with_capacity(count);
     for p in parsed {
         let part = std::mem::take(&mut *p.clicks[stripe].lock().unwrap());
-        for row in part {
+        for (i, row) in part.iter().enumerate() {
+            if let Some(next) = part.get(i + 8) {
+                prefetch_id(g, next.id);
+            }
             let id = id_at(g, row.id, 0);
             let (local, is_new) = keys.intern(id, id.hash());
             if is_new {
@@ -982,7 +966,7 @@ pub fn stage1(g: &mut G) {
     let parsed = scan(g, &users, &claim_arena, &people_arena);
     sys::lap("scan_ids");
     unsafe {
-        for (i, name) in ["x.thr_loop", "x.resolve_ev", "x.resolve_ck", "x.claims_finish", "x.ev_person", "x.ev_ppush", "x.ev_claim", "x.person_short", "x.person_long", "x.n_hit_M_thr", "x.n_short_M_thr", "x.n_long_M_thr"].into_iter().enumerate() {
+        for (i, name) in ["x.thr_loop", "x.resolve_ev", "x.resolve_ck", "x.claims_finish"].into_iter().enumerate() {
             sys::LAPS.push((name, LAP_US[i].load(Ordering::Relaxed) as f64 / 1e3 / g.nt as f64));
         }
         let flt = std::fs::read_to_string("/proc/self/stat").ok().and_then(|t| t.rsplit(')').next().and_then(|r| r.split_whitespace().nth(7).map(str::to_owned))).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
@@ -991,6 +975,11 @@ pub fn stage1(g: &mut G) {
     let clicks = dedup(g, &parsed);
     sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
     sys::lap("dedup_ids");
+    unsafe {
+        for (i, name) in [(4, "x.dedup_ev"), (5, "x.dedup_ck")] {
+            sys::LAPS.push((name, LAP_US[i].load(Ordering::Relaxed) as f64 / 1e3 / g.nt as f64));
+        }
+    }
     order_events(g, &parsed);
     sys::lap("order_events");
     sys::run_par(g.nt, |tid| people_arena.release_part(tid, g.nt));
