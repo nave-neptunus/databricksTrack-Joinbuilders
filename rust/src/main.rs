@@ -1563,6 +1563,21 @@ pub(crate) fn unpack_ref(r: u64) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts((r & ((1u64 << 48) - 1)) as *const u8, (r >> 48) as usize) }
 }
 
+#[cfg(feature = "pgo")]
+#[inline]
+pub fn pgo_flush() {
+    unsafe extern "C" {
+        fn __llvm_profile_write_file() -> i32;
+    }
+    unsafe {
+        let _ = __llvm_profile_write_file();
+    }
+}
+
+#[cfg(not(feature = "pgo"))]
+#[inline]
+pub fn pgo_flush() {}
+
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
     let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
@@ -1572,6 +1587,7 @@ fn main() {
         }
         slow::run();
     }
+    pgo_flush();
     std::process::exit(0);
 }
 
@@ -2257,6 +2273,7 @@ fn fast(nova: bool) -> bool {
     user_parquet::write_campaign(&format!("{out}/campaign_daily/part-0.parquet"), &camp_rows);
     lap("parquet written");
     // The user parts and campaign table have flushed and closed their writers.
+    pgo_flush();
     std::process::exit(0);
 }
 

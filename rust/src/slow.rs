@@ -738,5 +738,6 @@ pub fn run() {
     );
     lap("parquet written");
     // Skip freeing the big buffers.
+    crate::pgo_flush();
     std::process::exit(0);
 }

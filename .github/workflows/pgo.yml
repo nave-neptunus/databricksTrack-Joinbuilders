@@ -1,0 +1,74 @@
+name: Generate PGO profile
+
+on:
+  push:
+    branches: [ci/pgo-collect]
+  workflow_dispatch:
+
+jobs:
+  pgo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.100.0 --profile minimal --component llvm-tools-preview
+          rustup default 1.100.0
+          rustc --version
+          cargo --version
+
+      - name: Build v5 generator and generate training corpora
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show origin/ci/gum-uid:bench/assets/generator.zip > /tmp/generator.zip
+          unzip -q /tmp/generator.zip -d /tmp/gen
+          cargo build --release --locked --manifest-path /tmp/gen/generator/Cargo.toml
+          /tmp/gen/generator/target/release/generate --seed 17 --events 1000000 --clicks 250000 --output /tmp/v5-1m --threads 8
+          /tmp/gen/generator/target/release/generate --seed 17 --events 20000000 --clicks 5000000 --output /tmp/v5-20m --threads 8
+
+      - name: Build instrumented rproto
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pgo-raw
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -Cprofile-generate=/tmp/pgo-raw" \
+            cargo build --release --locked --features pgo --manifest-path rust/Cargo.toml
+          cp rust/target/release/rproto /tmp/rproto-pgo
+
+      - name: Run training workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLVM_PROFILE_FILE="/tmp/pgo-raw/%m_%p.profraw" DATA_DIR=/tmp/v5-1m OUTPUT_DIR=/tmp/out-1m NCPU=8 /tmp/rproto-pgo
+          ls -lh /tmp/pgo-raw/
+          LLVM_PROFILE_FILE="/tmp/pgo-raw/%m_%p.profraw" DATA_DIR=/tmp/v5-20m OUTPUT_DIR=/tmp/out-20m NCPU=8 /tmp/rproto-pgo
+          ls -lh /tmp/pgo-raw/
+
+      - name: Merge profile and verify hot symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p rust/pgo
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          LLVM_PROFDATA="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          "$LLVM_PROFDATA" merge --sparse -o rust/pgo/merged.profdata /tmp/pgo-raw/*.profraw
+          ls -lh rust/pgo/merged.profdata
+          size=$(stat -c %s rust/pgo/merged.profdata)
+          echo "Merged profdata size: $size bytes"
+          test "$size" -lt 5000000 || { echo "profdata too large ($size bytes)" >&2; exit 1; }
+          test "$size" -gt 1000 || { echo "profdata too small ($size bytes)" >&2; exit 1; }
+          "$LLVM_PROFDATA" show --all-functions --counts rust/pgo/merged.profdata > /tmp/functions.txt
+          head -30 /tmp/functions.txt
+          grep -E 'rproto|nova|events' /tmp/functions.txt | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: merged-profdata
+          path: rust/pgo/merged.profdata
