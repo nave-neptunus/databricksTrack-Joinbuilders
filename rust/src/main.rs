@@ -13,6 +13,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::time::Instant;
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn munmap(addr: *mut std::ffi::c_void, len: usize) -> std::os::raw::c_int;
+    fn _exit(status: std::os::raw::c_int) -> !;
+}
+
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const LOOK: i64 = 7 * DAY;
@@ -1193,6 +1199,16 @@ impl People {
         Self { storage, stride, lengths: Box::new([0; P]), overflow }
     }
 
+    /// No reader remains after Parquet is closed.  Return mapped pages before
+    /// the process teardown path has to walk them on one thread.
+    fn release(mut self) {
+        if let Some(mapping) = &self.storage {
+            let _ = mapping.advise(memmap2::Advice::DontNeed);
+        }
+        self.storage = None;
+        self.overflow = Box::new(std::array::from_fn(|_| Vec::new()));
+    }
+
     #[inline]
     fn len(&self, part: usize) -> usize {
         self.lengths[part] + self.overflow[part].len()
@@ -2227,8 +2243,6 @@ fn fast(nova: bool) -> bool {
         state.user.close();
         (state.user_rows, state.cd)
     });
-    std::mem::forget(paccs);
-    std::mem::forget(caccs);
     lap("sessions + credit + aggregate + user parquet");
 
     let mut cd = vec![[0i64; 4]; ncs * ndays];
@@ -2257,6 +2271,31 @@ fn fast(nova: bool) -> bool {
     user_parquet::write_campaign(&format!("{out}/campaign_daily/part-0.parquet"), &camp_rows);
     lap("parquet written");
     // The user parts and campaign table have flushed and closed their writers.
+    // Drop the large anonymous producers on all workers, rather than leaving
+    // the kernel's single-threaded process teardown to reclaim them.
+    rayon::join(
+        || paccs.into_par_iter().for_each(People::release),
+        || caccs.into_par_iter().for_each(|stream| stream.release()),
+    );
+    // Read-ahead has no remaining parser consumers.  Wait for it before raw
+    // unmapping the leaked input mappings, then let eight workers do teardown.
+    for bytes in lkb.iter().chain(&evb).chain(&ckb) {
+        ra.wait(bytes);
+    }
+    let maps: Vec<(usize, usize)> = lkm
+        .iter()
+        .chain(evm.iter())
+        .chain(ckm.iter())
+        .chain(smm.iter())
+        .filter_map(|mapping| mapping.as_ref().map(|m| (m.as_ptr() as usize, m.len())))
+        .collect();
+    #[cfg(unix)]
+    maps.par_iter().for_each(|&(addr, len)| unsafe {
+        let _ = munmap(addr as *mut std::ffi::c_void, len);
+    });
+    #[cfg(unix)]
+    unsafe { _exit(0) }
+    #[cfg(not(unix))]
     std::process::exit(0);
 }
 
