@@ -9,6 +9,10 @@ jobs:
   gate-and-time:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -18,12 +22,14 @@ jobs:
           set -euo pipefail
           lscpu
           grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || echo 'WARN: AMD runner (timing indicative only)'
-          grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo || { echo 'Express requires AVX-512BW and AVX-512VL'; exit 1; }
+          if grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo; then echo "RUN=yes" >> "$GITHUB_ENV"; else echo 'no AVX-512 on this runner: skipping'; echo "RUN=no" >> "$GITHUB_ENV"; exit 0; fi
           test "$(nproc)" -ge 4 || { echo "need 4+ vCPUs, got $(nproc)" >&2; exit 1; }; echo "RUNNER_VCPUS=$(nproc)" >> "$GITHUB_ENV"
           echo "NCPU=8" >> "$GITHUB_ENV"
       - name: Install exact-check dependency
+        if: env.RUN == 'yes'
         run: python3 -m pip install --disable-pip-version-check polars
       - name: Build the supplied v5 generator and generate corpora
+        if: env.RUN == 'yes'
         shell: bash
         run: |
           set -euo pipefail
@@ -35,6 +41,7 @@ jobs:
           "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/v5-60m" --threads "$NCPU"
           du -sh "$HOME/v5-dev" "$HOME/v5-20m" "$HOME/v5-60m"
       - name: Gate candidate and interleave timing rounds
+        if: env.RUN == 'yes'
         shell: bash
         run: |
           set -euo pipefail
@@ -47,7 +54,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: express-v5-${{ github.run_id }}-${{ github.run_attempt }}
+          name: express-v5-${{ matrix.rep }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             bench-work/logs/
             bench-work/summary.md
