@@ -44,7 +44,7 @@ def source_for(sha):
 
 def build(sha):
     source, target = source_for(sha), WORK / "target" / sha
-    if sha == CAND:
+    if sha != BASE:
         # Use the actual musl artifact from the Dockerfile for native timing.
         image = f"express-v5-bench:{sha[:12]}"
         call(["docker", "build", "--target", "build", "-t", image, str(source)])
