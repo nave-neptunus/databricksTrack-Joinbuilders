@@ -2,7 +2,6 @@
 
 use crate::{DAY, EvP, LazyChunks, P, PB, People, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
-use rayon::prelude::*;
 use std::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
@@ -53,57 +52,15 @@ pub(super) fn user_key(uid: &[u8]) -> Option<u64> {
     short_key(uid, b'u').map(permute_short)
 }
 
-#[derive(Default)]
-struct PersonName {
-    bytes: [u8; 9],
-    len: u8,
-}
-
-impl PersonName {
-    fn decode(key: u64) -> Self {
-        if key == 0 {
-            return Self::default();
-        }
-        const INVERSE: u64 = 0x71de_83e1_9937_733d;
-        let value = key & (SHORT_KEY - 1);
-        let mixed = value ^ (value >> 31) ^ (value >> 62);
-        let shifted = mixed.wrapping_mul(INVERSE) & (SHORT_KEY - 1);
-        let raw = shifted ^ (shifted >> 27) ^ (shifted >> 54);
-        let mut bytes = [0; 9];
-        bytes[0] = b'u' ^ (((raw >> 55) & 1) as u8 * 32);
-        bytes[1..].copy_from_slice(&(raw & 0x7f7f_7f7f_7f7f_7f7f).to_le_bytes());
-        let tail = if raw & (1 << 31) != 0 {
-            8
-        } else {
-            ((raw >> 7) & 1) | ((raw >> 14) & 2) | ((raw >> 21) & 4)
-        };
-        Self {
-            bytes,
-            len: tail as u8 + 1,
-        }
+/// The fixed v5 form has an exact 128-bit suffix. Its mixed key/check pair
+/// stays allocation-free, while `Users` checks source bytes on a match.
+#[inline]
+pub(super) fn full_user_key(uid: &[u8]) -> Option<(u64, u32)> {
+    if let Some(key) = user_key(uid) {
+        return Some((key, 0));
     }
-}
-
-fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec<&'static [u8]>)> {
-    let n = (users.next.load(Relaxed) as usize).min(users.names.len());
-    if n < linked.len() || n >= crate::PERSON_SET as usize {
-        return None;
-    }
-    let names: &'static [PersonName] = Box::leak(
-        (linked.len()..n)
-            .into_par_iter()
-            .map(|id| PersonName::decode(users.names[id].load(Relaxed)))
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    );
-    let mut all = Vec::with_capacity(n);
-    all.extend_from_slice(linked);
-    all.extend(
-        names
-            .iter()
-            .map(|person| &person.bytes[..person.len as usize]),
-    );
-    Some((n.div_ceil(P) as u32, all))
+    let hex = crate::v5_hex_key(uid, b'u')?;
+    Some((hex.hash(), hex.check() | (1 << 31)))
 }
 
 /// A producer owns disjoint blocks within demand-paged slabs. Stream order is
@@ -341,6 +298,8 @@ struct Pending {
     key: u64,
     ingest: i32,
     uid: u64,
+    uid_check: u32,
+    uid_name: u64,
     ts: u32,
     price: u32,
 }
@@ -350,6 +309,8 @@ impl Pending {
         key: 0,
         ingest: 0,
         uid: 0,
+        uid_check: 0,
+        uid_name: 0,
         ts: INVALID,
         price: 0,
     };
@@ -672,6 +633,7 @@ impl Dates {
 
 pub(super) struct EventInput<'a> {
     pub(super) products: &'a AHashMap<&'a [u8], u32>,
+    pub(super) ids: &'a crate::ExactIds,
     pub(super) unknown: u32,
     pub(super) start: i64,
     pub(super) end: i64,
@@ -703,7 +665,7 @@ impl Parser<'_, '_, '_> {
             let loc = if pending.ts != INVALID {
                 let person = self
                     .users
-                    .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                    .person(pending.uid, pending.uid_check, pending.uid_name, &mut self.ids, self.declined);
                 let part = person as usize & (P - 1);
                 let index = self.people.push(part, person, pending.ts, pending.price);
                 if index >= INDEX_MASK as usize {
@@ -736,7 +698,13 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         }
         // The parser can release its input chunk after this call. No
         // captured identities reference the source buffer.
-        let Some(key) = short_key(id, b'e').map(permute_short) else {
+        let key = if let Some(key) = short_key(id, b'e').map(permute_short) {
+            key
+        } else if crate::v5_hex_key(id, b'e').is_some() {
+            // Interned long IDs remain exact and cannot overlap the packed
+            // short form, whose marker bit is always set.
+            self.input.ids.intern(id)
+        } else {
             self.declined.store(true, Relaxed);
             return;
         };
@@ -779,13 +747,19 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.price = value | (category << 24);
             }
-            let Some(uid) = user_key(user) else {
+            let Some((uid, uid_check)) = full_user_key(user) else {
+                self.declined.store(true, Relaxed);
+                break 'valid;
+            };
+            let Some(uid_name) = crate::pack_ref(user) else {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
             self.users.prefetch(uid);
             pending.ts = relative as u32;
             pending.uid = uid;
+            pending.uid_check = uid_check;
+            pending.uid_name = uid_name;
         }
         self.batch[self.count] = pending;
         self.count += 1;
@@ -969,7 +943,7 @@ pub(super) fn run_events(
     if declined.load(Relaxed) {
         return None;
     }
-    let (local_count, names) = person_names(users, linked_names)?;
+    let (local_count, names) = users.names(linked_names, declined);
     lap(&format!(
         "events parsed (nova, {} folds, {} persons)",
         claims.len(),
@@ -1084,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_names_round_trip_byte_for_byte() {
+    fn full_user_key_accepts_only_short_or_canonical_v5_hex() {
         for name in [
             &b"u"[..],
             b"U",
@@ -1097,9 +1071,13 @@ mod tests {
             b"U\0\0\0\0\0\0\0\0",
             b"u\x7f1234567",
         ] {
-            let decoded = PersonName::decode(user_key(name).unwrap());
-            assert_eq!(&decoded.bytes[..decoded.len as usize], name);
+            assert_eq!(full_user_key(name).unwrap().1, 0);
         }
+        assert_ne!(
+            full_user_key(b"u0123456789abcdef0123456789abcdef"),
+            full_user_key(b"u0123456789abcdef0123456789abcdee"),
+        );
+        assert!(full_user_key(b"u0123456789abcdef0123456789abcdeF").is_none());
     }
 
     #[test]

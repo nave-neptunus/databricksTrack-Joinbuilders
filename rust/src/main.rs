@@ -1,8 +1,8 @@
 // Shopping Sessions pipeline in Rust. This is the submitted pipeline (root Dockerfile).
 // Env: DATA_DIR, OUTPUT_DIR, NCPU, TIMING (stage times on stderr), FORCE_SLOW (use the fallback).
 //
-// The mixed-ID engine packs common short IDs and interns other IDs by their full
-// bytes. The fixed-shape Nova engine remains available with NOVA=1.
+// Nova accepts packed short IDs plus the generator's tagged v5 hex IDs. It
+// declines anything else before falling back to the fully general engine.
 mod nova;
 mod slow;
 mod user_parquet;
@@ -1604,7 +1604,7 @@ fn unpack_ref(r: u64) -> &'static [u8] {
 
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
-    let nova = std::env::var_os("NOVA").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
     if std::env::var_os("FORCE_SLOW").is_some() || !fast(nova) {
         if std::env::var_os("TIMING").is_some() {
             eprintln!("fast engine declined; running the exact fallback");
@@ -1744,11 +1744,11 @@ fn build_links(
                     return;
                 };
                 let (key, check) = if nova {
-                    let Some(key) = nova::user_key(s) else {
+                    let Some(key) = nova::full_user_key(s) else {
                         collision.store(true, Relaxed);
                         return;
                     };
-                    (key, 0)
+                    key
                 } else {
                     ids.user(s)
                 };
@@ -2042,7 +2042,7 @@ fn fast(nova: bool) -> bool {
     // Produce person partitions with exactly the retained, valid events.
     let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs) = if nova {
-        let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
+        let input = nova::EventInput { products: &prod, ids: &ids, unknown, start: w0, end: w1 };
         let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll, estimated_rows) else {
             return false;
         };
@@ -2218,9 +2218,11 @@ fn fast(nova: bool) -> bool {
                     return;
                 };
                 let (key, check) = if nova {
-                    // A supported link or event user always has a short key.
-                    let Some(key) = nova::user_key(user) else { return };
-                    (key, 0)
+                    let Some(key) = nova::full_user_key(user) else {
+                        coll.store(true, Relaxed);
+                        return;
+                    };
+                    key
                 } else {
                     ids.user(user)
                 };

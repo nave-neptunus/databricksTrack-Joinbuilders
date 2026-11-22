@@ -1,9 +1,9 @@
-name: v5 hex-key Intel gate
+name: Nova v5 correctness gate (Intel)
 
 on:
   workflow_dispatch:
   push:
-    branches: [gum-hexkey]
+    branches: [gum-nova]
 
 permissions:
   contents: read
@@ -23,8 +23,11 @@ jobs:
         with: { python-version: '3.12' }
       - uses: dtolnay/rust-toolchain@stable
         with: { toolchain: stable }
-      - name: Install fixture comparator
-        run: python -m pip install --disable-pip-version-check 'polars>=1,<2'
+      - name: Fetch fixture runner and output comparator
+        run: |
+          git fetch --no-tags origin ci-bench
+          git checkout FETCH_HEAD -- scripts
+          python -m pip install --disable-pip-version-check 'polars>=1,<2'
       - name: Cargo tests and v5 generator build
         run: |
           cargo test --manifest-path rust/Cargo.toml --locked
