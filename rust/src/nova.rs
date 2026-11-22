@@ -686,11 +686,42 @@ struct Parser<'a, 'catalog, 'table> {
     window_ms: u64,
     dates: Dates,
     ids: (u32, u32),
+    abl: u32,
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Claim, SHARDS>,
     people: PeopleWriter<'a>,
     worker: u32,
+}
+
+/// Measurement-only ablation flags from ABL=comma,list. Results are wrong when set.
+pub(super) fn abl() -> u32 {
+    static ABL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ABL.get_or_init(|| {
+        const NAMES: [&str; 11] =
+            ["scan", "evkey", "ingest", "time", "user", "name", "price", "prefetch", "person", "push", "claim"];
+        let v = std::env::var("ABL").unwrap_or_default();
+        v.split(',').filter_map(|n| NAMES.iter().position(|x| *x == n)).fold(0, |a, i| a | 1 << i)
+    })
+}
+const A_SCAN: u32 = 1;
+const A_EVKEY: u32 = 2;
+const A_INGEST: u32 = 4;
+const A_TIME: u32 = 8;
+const A_USER: u32 = 16;
+const A_NAME: u32 = 32;
+const A_PRICE: u32 = 64;
+const A_PREFETCH: u32 = 128;
+const A_PERSON: u32 = 256;
+const A_PUSH: u32 = 512;
+const A_CLAIM: u32 = 1024;
+
+#[inline]
+fn cheap_key(b: &[u8]) -> u64 {
+    let mut a = [0u8; 8];
+    let n = b.len().min(8);
+    a[..n].copy_from_slice(&b[..n]);
+    u64::from_le_bytes(a) | (1 << 63)
 }
 
 impl Parser<'_, '_, '_> {
@@ -702,11 +733,17 @@ impl Parser<'_, '_, '_> {
     fn flush(&mut self) {
         for pending in &self.batch[..self.count] {
             let loc = if pending.ts != INVALID {
-                let person = self
-                    .users
-                    .person(pending.uid, 0, pending.name, &mut self.ids, self.declined);
+                let person = if self.abl & A_PERSON != 0 {
+                    pending.uid as u32
+                } else {
+                    self.users.person(pending.uid, 0, pending.name, &mut self.ids, self.declined)
+                };
                 let part = person as usize & (P - 1);
-                let index = self.people.push(part, person, pending.ts, pending.price);
+                let index = if self.abl & A_PUSH != 0 {
+                    0
+                } else {
+                    self.people.push(part, person, pending.ts, pending.price)
+                };
                 if index >= INDEX_MASK as usize {
                     self.declined.store(true, Relaxed);
                     continue;
@@ -719,10 +756,12 @@ impl Parser<'_, '_, '_> {
                 // they have no payload to keep or tombstone.
                 NO_LOC
             };
-            self.streams.push(
-                (pending.key >> 55) as u8 as usize,
-                Claim { key: pending.key, ingest: pending.ingest, loc },
-            );
+            if self.abl & A_CLAIM == 0 {
+                self.streams.push(
+                    (pending.key >> 55) as u8 as usize,
+                    Claim { key: pending.key, ingest: pending.ingest, loc },
+                );
+            }
         }
         self.count = 0;
     }
@@ -731,6 +770,9 @@ impl Parser<'_, '_, '_> {
 impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
     #[inline]
     fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
+        if self.abl & A_SCAN != 0 {
+            return;
+        }
         let id = fields.field::<0>();
         if id.is_empty() {
             return;
@@ -739,9 +781,17 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         // captured identities reference the source buffer.
         // Short event IDs use the reversible packed key; v5's suffixed IDs
         // are interned by their full bytes and stay exact.
-        let key = short_key(id, b'e').map(permute_short)
-            .unwrap_or_else(|| self.interner.intern(id));
-        let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
+        let key = if self.abl & A_EVKEY != 0 {
+            cheap_key(id)
+        } else {
+            short_key(id, b'e').map(permute_short).unwrap_or_else(|| self.interner.intern(id))
+        };
+        let utc = if self.abl & A_INGEST != 0 {
+            Some(self.window_seconds + 1)
+        } else {
+            self.dates.utc_seconds(fields.field::<3>())
+        };
+        let Some(seconds) = utc else {
             self.declined.store(true, Relaxed);
             return;
         };
@@ -762,14 +812,19 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                 b"view" | b"cart" => false,
                 _ => break 'valid,
             };
-            let Some(time) = self.dates.parse(fields.field::<2>()) else {
+            let parsed = if self.abl & A_TIME != 0 {
+                Some((seconds * 1000 - 1).clamp(self.input.start, self.input.start + self.window_ms as i64 - 1))
+            } else {
+                self.dates.parse(fields.field::<2>())
+            };
+            let Some(time) = parsed else {
                 break 'valid;
             };
             let relative = time.wrapping_sub(self.input.start) as u64;
             if relative >= self.window_ms || seconds * 1000 - time > DAY {
                 break 'valid;
             }
-            if purchase {
+            if purchase && self.abl & A_PRICE == 0 {
                 let Some(value) = parse_price(fields.field::<6>()) else {
                     break 'valid;
                 };
@@ -780,15 +835,23 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.price = value | (category << 24);
             }
-            let uid = user_key(user).unwrap_or_else(|| self.interner.intern(user));
+            let uid = if self.abl & A_USER != 0 {
+                cheap_key(user)
+            } else {
+                user_key(user).unwrap_or_else(|| self.interner.intern(user))
+            };
             // Keep a direct reference to the full ID for the name. This avoids
             // decoding short keys later (and an allocation per person).
-            let Some(r) = crate::pack_ref(user) else {
-                self.declined.store(true, Relaxed);
-                break 'valid;
-            };
-            pending.name = r;
-            self.users.prefetch(uid);
+            if self.abl & A_NAME == 0 {
+                let Some(r) = crate::pack_ref(user) else {
+                    self.declined.store(true, Relaxed);
+                    break 'valid;
+                };
+                pending.name = r;
+            }
+            if self.abl & (A_PREFETCH | A_PERSON) == 0 {
+                self.users.prefetch(uid);
+            }
             pending.ts = relative as u32;
             pending.uid = uid;
         }
@@ -832,6 +895,7 @@ fn events(
                 window_ms: (input.end - input.start) as u64,
                 dates: Dates::default(),
                 ids: (0, 0),
+                abl: abl(),
                 batch: [Pending::EMPTY; 16],
                 count: 0,
                 streams: Streams::new(),
@@ -983,6 +1047,9 @@ pub(super) fn run_events(
         claims.len(),
         names.len()
     ));
+    if abl() != 0 {
+        std::process::exit(0);
+    }
     if declined.load(Relaxed) {
         return None;
     }
