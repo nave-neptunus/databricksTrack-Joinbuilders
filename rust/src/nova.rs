@@ -939,44 +939,39 @@ fn events(
 }
 
 
-// One 16-byte cell holds the full event key, the winning ingest time and the
-// location of the payload parse already wrote into its final person partition.
-// The high byte of `meta` is a generation, so tables are reused across shards.
-const META_GEN_SHIFT: u32 = 24;
-const META_INGEST_MASK: u32 = (1 << META_GEN_SHIFT) - 1;
-const INGEST_BIAS: i32 = 1 << 21;
+// The table is 4-byte cells: an 8-bit tag from the key and a 1-based index into
+// a dense array of entries (full key, winning ingest, payload location and, for
+// long IDs, the reference to the full bytes). Cells are cleared per shard.
+// Most probes see an empty cell or a different tag and never touch an entry,
+// and the whole table of a shard stays in L2.
+const CELL_TAG_SHIFT: u32 = 24;
+const CELL_INDEX_MASK: u32 = (1 << CELL_TAG_SHIFT) - 1;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Slot {
+#[derive(Clone, Copy)]
+struct Entry {
     key: u64,
-    meta: u32,
+    // Zero for short IDs, whose keys are exact by themselves.
+    eref: u64,
+    ingest: i32,
     loc: u32,
 }
 
-struct Router {
-    slots: Vec<Slot>,
-    // For a long event ID, the packed reference to the bytes that produced
-    // `slots[i].key`. Zero for short IDs, whose keys are exact by themselves.
-    refs: Vec<u64>,
-    generation: u32,
-    route_ns: u64,
-    table_percent: usize,
+/// Losing copies are tombstoned a few claims after they are found, once their
+/// timestamp line has been prefetched, so the random write never stalls the
+/// probe loop. Order does not matter: tombstones only ever set `INVALID`.
+struct Tombstones<'a> {
+    ring: [Option<&'a AtomicU32>; 8],
+    next: usize,
 }
 
-impl Router {
+impl<'a> Tombstones<'a> {
     fn new() -> Self {
-        Self {
-            slots: Vec::new(),
-            refs: Vec::new(),
-            generation: 0,
-            route_ns: 0,
-            table_percent: std::env::var("BREAKER_TABLE_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(110),
-        }
+        Self { ring: [None; 8], next: 0 }
     }
 
     #[inline]
-    fn tombstone(people: &[People], loc: u32) {
+    fn add(&mut self, people: &'a [People], loc: u32) {
         if loc == NO_LOC {
             return;
         }
@@ -984,58 +979,88 @@ impl Router {
         let part = ((loc >> LOC_PART_SHIFT) as usize) & (P - 1);
         let index = (loc & INDEX_MASK) as usize;
         // The payload is already in its final slot; only its timestamp changes.
-        people[worker].get(part, index).ts.store(INVALID, Relaxed);
+        let ts = &people[worker].get(part, index).ts;
+        crate::prefetch_read((ts as *const AtomicU32).cast());
+        if let Some(old) = self.ring[self.next].replace(ts) {
+            old.store(INVALID, Relaxed);
+        }
+        self.next = (self.next + 1) % self.ring.len();
     }
 
-    fn route(&mut self, people: &[People], claims: &[Folds], shard: usize) {
+    fn drain(&mut self) {
+        for entry in &mut self.ring {
+            if let Some(ts) = entry.take() {
+                ts.store(INVALID, Relaxed);
+            }
+        }
+    }
+}
+
+struct Router {
+    cells: Vec<u32>,
+    entries: Vec<Entry>,
+    route_ns: u64,
+    table_percent: usize,
+}
+
+impl Router {
+    fn new() -> Self {
+        Self {
+            cells: Vec::new(),
+            entries: Vec::new(),
+            route_ns: 0,
+            table_percent: std::env::var("BREAKER_TABLE_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(110),
+        }
+    }
+
+    // Parse has already placed every copy in its final person partition.
+    // Dedup only chooses the earliest-ingest copy and tombstones losers,
+    // so there is no scatter pass and no second traversal of event data.
+    fn route<'p>(&mut self, people: &'p [People], claims: &[Folds], shard: usize) {
         let begin = std::time::Instant::now();
         // Every record is one logical claim, so physical counts size the table.
         let count: usize = claims.iter().map(|fold| fold.short.len(shard) + fold.long.len(shard)).sum();
         if count == 0 {
             return;
         }
+        // Entry indexes live in 24 bits; a shard that large cannot be held in memory.
+        assert!(count < CELL_INDEX_MASK as usize, "dedup shard too large");
         let mask = (count * self.table_percent / 100).next_power_of_two() - 1;
-        if self.slots.len() < mask + 1 {
-            self.slots.resize(mask + 1, Slot::default());
-            self.refs.resize(mask + 1, 0);
-        }
-        self.generation += 1;
-        if self.generation == 1 << (32 - META_GEN_SHIFT) {
-            self.slots.fill(Slot::default());
-            self.refs.fill(0);
-            self.generation = 1;
-        }
-        let generation = self.generation << META_GEN_SHIFT;
+        self.cells.clear();
+        self.cells.resize(mask + 1, 0);
+        self.entries.clear();
+        self.entries.reserve(count);
+        let cells = &mut self.cells[..];
+        let entries = &mut self.entries;
+        let mut dead = Tombstones::new();
 
-        // Parse has already placed every copy in its final person partition.
-        // Dedup only chooses the earliest-ingest copy and tombstones losers,
-        // so there is no scatter pass and no second traversal of event data.
         for fold in claims {
             for block in fold.short.chunks(shard) {
                 for (offset, claim) in block.iter().enumerate() {
                     if let Some(next) = block.get(offset + 8) {
-                        crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
+                        crate::prefetch_read(cells.as_ptr().wrapping_add((next.key >> 8) as usize & mask).cast());
                     }
-                    let meta = generation | ((claim.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
-                    let mut slot = claim.key as usize & mask;
+                    let tag = claim.key as u32 & 0xff;
+                    let mut slot = (claim.key >> 8) as usize & mask;
                     loop {
-                        let winner = self.slots[slot];
-                        if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
-                            self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
+                        let cell = cells[slot];
+                        if cell == 0 {
+                            entries.push(Entry { key: claim.key, eref: 0, ingest: claim.ingest, loc: claim.loc });
+                            cells[slot] = tag << CELL_TAG_SHIFT | entries.len() as u32;
                             break;
                         }
-                        // A long ID's key has the short tag bit clear, so it
-                        // can never equal a short key; refs are read only
-                        // for long slots, which always set them.
-                        if winner.key == claim.key {
-                            let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
-                            if claim.ingest < previous {
-                                Self::tombstone(people, winner.loc);
-                                self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
-                            } else {
-                                Self::tombstone(people, claim.loc);
+                        if cell >> CELL_TAG_SHIFT == tag {
+                            let winner = &mut entries[(cell & CELL_INDEX_MASK) as usize - 1];
+                            if winner.key == claim.key {
+                                if claim.ingest < winner.ingest {
+                                    dead.add(people, winner.loc);
+                                    winner.ingest = claim.ingest;
+                                    winner.loc = claim.loc;
+                                } else {
+                                    dead.add(people, claim.loc);
+                                }
+                                break;
                             }
-                            break;
                         }
                         slot = (slot + 1) & mask;
                     }
@@ -1046,39 +1071,45 @@ impl Router {
             for block in fold.long.chunks(shard) {
                 for (offset, claim) in block.iter().enumerate() {
                     if let Some(next) = block.get(offset + 8) {
-                        crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
+                        crate::prefetch_read(cells.as_ptr().wrapping_add((next.key >> 8) as usize & mask).cast());
                     }
-                    let meta = generation | ((claim.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
-                    let mut slot = claim.key as usize & mask;
+                    let tag = claim.key as u32 & 0xff;
+                    let mut slot = (claim.key >> 8) as usize & mask;
                     loop {
-                        let winner = self.slots[slot];
-                        if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
-                            self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
-                            self.refs[slot] = claim.eref;
+                        let cell = cells[slot];
+                        if cell == 0 {
+                            entries.push(Entry { key: claim.key, eref: claim.eref, ingest: claim.ingest, loc: claim.loc });
+                            cells[slot] = tag << CELL_TAG_SHIFT | entries.len() as u32;
                             break;
                         }
-                        // Equal hashes identify one event only when the full
-                        // byte strings agree. Different IDs with the same hash
-                        // keep probing, just as table collisions always have.
-                        if winner.key == claim.key
-                            && (self.refs[slot] == claim.eref
-                                || crate::unpack_ref(self.refs[slot]) == crate::unpack_ref(claim.eref))
-                        {
-                            let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
-                            if claim.ingest < previous {
-                                Self::tombstone(people, winner.loc);
-                                self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
-                                self.refs[slot] = claim.eref;
-                            } else {
-                                Self::tombstone(people, claim.loc);
+                        if cell >> CELL_TAG_SHIFT == tag {
+                            let winner = &mut entries[(cell & CELL_INDEX_MASK) as usize - 1];
+                            // Equal hashes identify one event only when the full
+                            // byte strings agree. Different IDs with the same hash
+                            // keep probing, just as table collisions always have.
+                            // Short keys have the tag bit set, so they never equal
+                            // a long key and `eref` is nonzero here.
+                            if winner.key == claim.key
+                                && (winner.eref == claim.eref
+                                    || crate::unpack_ref(winner.eref) == crate::unpack_ref(claim.eref))
+                            {
+                                if claim.ingest < winner.ingest {
+                                    dead.add(people, winner.loc);
+                                    winner.ingest = claim.ingest;
+                                    winner.loc = claim.loc;
+                                    winner.eref = claim.eref;
+                                } else {
+                                    dead.add(people, claim.loc);
+                                }
+                                break;
                             }
-                            break;
                         }
                         slot = (slot + 1) & mask;
                     }
                 }
             }
         }
+        dead.drain();
         self.route_ns += begin.elapsed().as_nanos() as u64;
     }
 }
@@ -1120,7 +1151,8 @@ pub(super) fn run_events<C: Send>(
                 }
             }
             lap("  dedup tombstoned");
-            drop(claims);
+            // The process exits right after output, so skip unmapping the claim slabs.
+            std::mem::forget(claims);
             lap("events dedup + validate");
         },
         parse_clicks,
@@ -1247,6 +1279,44 @@ mod tests {
             .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
         assert_eq!(live(3), vec![(3, 10, 1); 298]);
         assert_eq!(live(7), vec![(7, 5, 2)]);
+    }
+
+    #[test]
+    fn router_resolves_equal_tags_and_homes_by_full_key() {
+        let mut people = [People::new(128)];
+        let mut writer = PeopleWriter::new(&mut people[0]);
+        let mut claims = vec![Folds::new()];
+        // Keys differ only above the tag and home bits, so every claim shares
+        // one probe chain and one tag. Each event has a late and an early copy.
+        for i in 0..40u64 {
+            let key = SHORT_KEY | (i << 40);
+            for (ingest, price) in [(20i32, 1u32), (10, 2)] {
+                let index = writer.push(3, 3, 100 + i as u32, price);
+                let loc = (3u32 << LOC_PART_SHIFT) | index as u32;
+                claims[0].short.push(0, Claim { key, ingest, loc });
+            }
+        }
+        let ids: Vec<&'static [u8]> = (0..20)
+            .map(|i| {
+                let id: &'static [u8] = Box::leak(format!("e_long_identifier_{i:02}").into_bytes().into_boxed_slice());
+                id
+            })
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            let key = (i as u64) << 40;
+            for (ingest, price) in [(20i32, 1u32), (10, 2)] {
+                let index = writer.push(5, 5, 500 + i as u32, price);
+                let loc = (5u32 << LOC_PART_SHIFT) | index as u32;
+                claims[0].long.push(0, LongClaim { key, eref: crate::pack_ref(id).unwrap(), ingest, loc });
+            }
+        }
+        writer.finish();
+        Router::new().route(&people, &claims, 0);
+        for (part, expected) in [(3, 40), (5, 20)] {
+            let rows = live_rows(&people[0], part);
+            assert_eq!(rows.len(), expected);
+            assert!(rows.iter().all(|&(_, price)| price == 2));
+        }
     }
 
     #[test]
