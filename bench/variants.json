@@ -1,0 +1,38 @@
+{
+  "control": {
+    "sha": "05eb96b0d6e70239bbe6b33273ec5b93ffba5a16",
+    "features": []
+  },
+  "counts": {
+    "sha": "44e7e83903a01e72e7602cdb44cfc3bd4cb1637e",
+    "features": []
+  },
+  "shards512": {
+    "sha": "44e7e83903a01e72e7602cdb44cfc3bd4cb1637e",
+    "features": [
+      "nova-shards-512"
+    ]
+  },
+  "shards1024": {
+    "sha": "44e7e83903a01e72e7602cdb44cfc3bd4cb1637e",
+    "features": [
+      "nova-shards-1024"
+    ]
+  },
+  "shards2048": {
+    "sha": "44e7e83903a01e72e7602cdb44cfc3bd4cb1637e",
+    "features": [
+      "nova-shards-2048"
+    ]
+  },
+  "user-control": {
+    "sha": "1705263cc1b57db3058e215acc89512274691216",
+    "features": []
+  },
+  "hex-users": {
+    "sha": "1705263cc1b57db3058e215acc89512274691216",
+    "features": [
+      "hex-users"
+    ]
+  }
+}

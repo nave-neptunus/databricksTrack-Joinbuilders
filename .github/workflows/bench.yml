@@ -41,7 +41,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 bench/ci_bench.py "$HOME" "$GITHUB_WORKSPACE/bench-work"
+          python3 bench/rewrite_sweep.py "$HOME" "$GITHUB_WORKSPACE/bench-work"
       - name: Publish benchmark evidence
         if: always()
         shell: bash
