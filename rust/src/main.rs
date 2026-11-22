@@ -767,8 +767,33 @@ impl ExactIds {
     }
 
     fn user(&self, bytes: &[u8]) -> (u64, u32) {
+        if let Some(hex) = v5_hex_key(bytes, b'u') {
+            return (hex.hash(), hex.check() | (1 << 31));
+        }
         (nova::user_key(bytes).unwrap_or_else(|| self.intern(bytes)), 0)
     }
+}
+
+/// The generator's long v5 form is a fixed lowercase-hex 128-bit suffix.
+/// Big-endian halves are an exact key and retain the suffix byte ordering.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct V5HexKey { pub(crate) hi: u64, pub(crate) lo: u64 }
+impl V5HexKey {
+    #[inline] fn hash(self) -> u64 { mum(self.hi ^ K1, self.lo ^ K3) }
+    #[inline] fn check(self) -> u32 { mum(self.hi ^ K2, self.lo ^ K4) as u32 }
+}
+
+/// Everything except `prefix` + exactly 32 lowercase hex chars remains on
+/// ExactIds, including quotes, upper-case and other lengths.
+#[inline]
+pub(crate) fn v5_hex_key(id: &[u8], prefix: u8) -> Option<V5HexKey> {
+    if id.len() != 33 || id.first().copied()? != prefix { return None; }
+    let mut value = [0u8; 16];
+    for (out, pair) in value.iter_mut().zip(id[1..].chunks_exact(2)) {
+        let nibble = |b: u8| match b { b'0'..=b'9' => Some(b - b'0'), b'a'..=b'f' => Some(b - b'a' + 10), _ => None };
+        *out = nibble(pair[0])? << 4 | nibble(pair[1])?;
+    }
+    Some(V5HexKey { hi: u64::from_be_bytes(value[..8].try_into().unwrap()), lo: u64::from_be_bytes(value[8..].try_into().unwrap()) })
 }
 
 /// Open-addressing map from a 64-bit key (plus check) to a u32 value.
@@ -864,6 +889,7 @@ const _: () = assert!(std::mem::size_of::<EvP>() == 12);
 #[derive(Clone, Copy)]
 struct D {
     hid: u64,
+    hhi: u64, // second half for a tagged long v5 event; otherwise zero
     loc: u64, // partition in bits 32..42, row in low 32; NO_EVENT if invalid
     ingest: i32,
     hchk: u32,
@@ -951,11 +977,11 @@ impl From<ShortD> for D {
             NO_EVENT
         };
         // In this stream the full key is a bijection of the ID bytes.
-        D { hid: copy.key, loc, ingest: copy.ingest, hchk: 0 }
+        D { hid: copy.key, hhi: 0, loc, ingest: copy.ingest, hchk: 0 }
     }
 }
 
-const _: () = assert!(std::mem::size_of::<D>() == 24);
+const _: () = assert!(std::mem::size_of::<D>() == 32);
 const _: () = assert!(std::mem::size_of::<ShortD>() == 16);
 
 /// The hot dedup stream has one anonymous mapping per worker. Each shard
@@ -1033,10 +1059,11 @@ struct Users<'a> {
     used: std::sync::atomic::AtomicUsize,
     next: std::sync::atomic::AtomicU32,
     names: &'a [std::sync::atomic::AtomicU64],
+    refs: &'a [std::sync::atomic::AtomicU64],
 }
 
 impl<'a> Users<'a> {
-    fn new(tab: &'a mut Tab, nids: usize, npersons: usize) -> Self {
+    fn new(tab: &'a mut Tab, nids: usize, npersons: usize, initial_refs: Vec<u64>) -> Self {
         use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
         let cap = tab.mask + 1;
         // The slots are not otherwise accessed until the table is dropped; AtomicU64 has u64's layout.
@@ -1048,7 +1075,8 @@ impl<'a> Users<'a> {
         let v: Vec<u64> = vec![0; ids];
         let names = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU64, ids) };
         std::mem::forget(v);
-        Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names }
+        let refs = Box::leak(initial_refs.into_iter().map(AtomicU64::new).collect::<Vec<_>>().into_boxed_slice());
+        Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names, refs }
     }
 
     #[inline]
@@ -1098,6 +1126,7 @@ impl<'a> Users<'a> {
                         } else {
                             coll.store(true, Relaxed);
                         }
+                        self.refs[i].store(name, Relaxed);
                         let v = (u64::from(c) << 32) | PERSON_SET | u64::from(id & (PERSON_SET as u32 - 1));
                         self.sl[2 * i + 1].store(v, Release);
                         return id & (PERSON_SET as u32 - 1);
@@ -1114,6 +1143,8 @@ impl<'a> Users<'a> {
                 if (v >> 32) as u32 != c {
                     coll.store(true, Relaxed);
                 }
+                let old_name = self.refs[i].load(Relaxed);
+                if old_name == 0 || (old_name != name && unpack_ref(old_name) != unpack_ref(name)) { coll.store(true, Relaxed); }
                 return (v as u32) & (PERSON_SET as u32 - 1);
             }
             i = (i + 1) & self.mask;
@@ -1123,7 +1154,7 @@ impl<'a> Users<'a> {
     /// The person of a user id, if it is linked or on a valid event (lookup only; every
     /// insert has finished).
     #[inline]
-    fn find(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
+    fn find(&self, k: u64, c: u32, name: u64, coll: &AtomicBool) -> Option<u32> {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
         loop {
@@ -1137,6 +1168,8 @@ impl<'a> Users<'a> {
                     coll.store(true, Relaxed);
                     return None;
                 }
+                let old_name = self.refs[i].load(Relaxed);
+                if old_name == 0 || (old_name != name && unpack_ref(old_name) != unpack_ref(name)) { coll.store(true, Relaxed); return None; }
                 return Some((v as u32) & (PERSON_SET as u32 - 1));
             }
             i = (i + 1) & self.mask;
@@ -1354,7 +1387,7 @@ impl Dedup {
                         let row = index & row_mask;
                         let winner: D = prefix.get(row).copied().unwrap_or_else(|| overflow[row - prefix.len()]).into();
                         if winner.hid == event.hid {
-                            if winner.hchk != event.hchk {
+                            if winner.hchk != event.hchk || winner.hhi != event.hhi {
                                 coll.store(true, Relaxed);
                             } else if event.order() < winner.order() {
                                 winner.tombstone(winner_fold);
@@ -1388,7 +1421,7 @@ mod single_scatter_tests {
         } else {
             NO_EVENT
         };
-        fold.copies[0].push(D { hid: 7, hchk: 9, ingest, loc });
+        fold.copies[0].push(D { hid: 7, hhi: 0, hchk: 9, ingest, loc });
     }
 
     fn dedup(folds: &[EventFold]) {
@@ -1431,7 +1464,7 @@ mod single_scatter_tests {
     #[test]
     fn unparseable_ingest_loses_to_largest_parsed_ingest() {
         let mut folds = [EventFold::new(0)];
-        folds[0].copies[0].push(D { hid: 7, hchk: 9, ingest: i32::MAX, loc: NO_EVENT | UNPARSED_INGEST });
+        folds[0].copies[0].push(D { hid: 7, hhi: 0, hchk: 9, ingest: i32::MAX, loc: NO_EVENT | UNPARSED_INGEST });
         copy(&mut folds[0], i32::MAX, Some(3));
         dedup(&folds);
         assert!(folds[0].people.get(3, 0).live().is_some());
@@ -1509,14 +1542,30 @@ struct Click {
     tag: u64,
     person: u32,
     ts: u32,
+    // The leading packed half avoids most pointer walks for long-v5 ties;
+    // the raw bytes settle the (exceptional) equal-half case exactly.
+    id_hi: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<Click>() == 16);
+const _: () = assert!(std::mem::size_of::<Click>() == 24);
+const CLICK_LONG: u32 = 1 << 31;
 
 impl Click {
     #[inline]
     fn campaign(self) -> usize {
         (self.tag >> 48) as usize
+    }
+    #[inline]
+    fn time(self) -> u32 { self.ts & !CLICK_LONG }
+    #[inline]
+    fn id_before(self, other: Self) -> bool {
+        if self.ts & other.ts & CLICK_LONG != 0 && self.id_hi != other.id_hi {
+            self.id_hi < other.id_hi
+        } else {
+            // Different shapes, and the equal-high-half long case, retain the
+            // exact raw-byte lexical ordering.
+            self.id() < other.id()
+        }
     }
 
     fn id(self) -> &'static [u8] {
@@ -1537,6 +1586,7 @@ struct PendingClick {
     click: Click,
     key: u64,
     check: u32,
+    name: u64,
 }
 
 #[derive(Default)]
@@ -1669,8 +1719,7 @@ fn build_links(
     input: &[&'static [u8]],
     estimated_users: usize,
     ids: &ExactIds,
-    nova: bool,
-) -> Option<(Tab, usize, usize, Vec<&'static [u8]>)> {
+) -> Option<(Tab, usize, usize, Vec<&'static [u8]>, Vec<u64>)> {
     let chunks = chunks(input, 1 << 18);
     // Physical rows give an upper bound on valid links, including a final
     // unterminated line. Size the table before hashing and bucketing.
@@ -1704,13 +1753,9 @@ fn build_links(
                     collision.store(true, Relaxed);
                     return;
                 };
-                let (key, check) = if nova {
-                    // Short IDs use the packed key; anything else (including
-                    // v5's suffixed IDs) is interned by its full bytes.
-                    (nova::user_key(s).unwrap_or_else(|| ids.intern(s)), 0)
-                } else {
-                    ids.user(s)
-                };
+                // This same tagged key space feeds both engines. Short IDs
+                // keep SHORT_KEY; fixed v5 hex IDs avoid ExactIds entirely.
+                let (key, check) = ids.user(s);
                 let key = if key == 0 { 1 } else { key };
                 let shard = ((key as usize) & table.mask) >> shift;
                 ends[shard].push(LinkEnd { key, name, check, endpoint: count });
@@ -1858,6 +1903,12 @@ fn build_links(
     let pname = name_groups.into_iter().flatten().collect();
     lap("  links numbered");
 
+    // Values still hold node ids here; retain source bytes so compressed v5
+    // lookups cannot merge distinct people on a hash/check collision.
+    let slot_refs: Vec<u64> = table.slots.iter().map(|&(key, value)| {
+        if key == 0 { 0 } else { names[value as u32 as usize].reference.load(Relaxed) }
+    }).collect();
+
     let nids = ranges.iter().map(|(nodes, _)| nodes.len()).sum();
     table.slots.par_chunks_mut(range_len).zip(&ranges).for_each(|(slots, (nodes, _))| {
         for &(slot, node) in nodes {
@@ -1870,7 +1921,7 @@ fn build_links(
         }
     });
     lap("  links repointed");
-    Some((table, nend as usize / 2, nids, pname))
+    Some((table, nend as usize / 2, nids, pname, slot_refs))
 }
 
 /// Runs the fast engine. Returns false (having written nothing) if it cannot guarantee exactness.
@@ -1985,11 +2036,11 @@ fn fast(nova: bool) -> bool {
     }
     lap("  links read");
     let ids = ExactIds::new();
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, &ids, nova) else {
+    let Some((mut ltab, nedges, nids, pname, slot_refs)) = build_links(&lkb, est_users, &ids) else {
         return false;
     };
     let coll = AtomicBool::new(false);
-    let users = Users::new(&mut ltab, nids, pname.len());
+    let users = Users::new(&mut ltab, nids, pname.len(), slot_refs);
     lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Produce person partitions with exactly the retained, valid events.
@@ -2053,7 +2104,12 @@ fn fast(nova: bool) -> bool {
                             return;
                         }
                         let short_key = short_event_key(id);
-                        let (hid, hchk) = short_key.map_or_else(|| (ids.intern(id).rotate_left(1), 0), |key| (key, 0));
+                        let (hid, hhi, hchk) = short_key.map_or_else(|| match v5_hex_key(id, b'e') {
+                            // Tagged two-word identity: no lock/allocation and
+                            // Dedup compares both words directly.
+                            Some(hex) => (hex.lo, hex.hi, 1),
+                            None => (ids.intern(id).rotate_left(1), 0, 0),
+                        }, |key| (key, 0, 0));
                         let ingest = dates.parse(ing);
                         let (order, loc) = match ingest {
                             None => (i32::MAX, NO_EVENT | UNPARSED_INGEST),
@@ -2066,7 +2122,7 @@ fn fast(nova: bool) -> bool {
                             }
                         };
                         let mut r = ParsedEvent {
-                            copy: D { hid, hchk, ingest: order, loc },
+                            copy: D { hid, hhi, hchk, ingest: order, loc },
                             name_ref: 0,
                             pkey: 0, pchk: 0, ts: TOMBSTONE, price: 0,
                             short_id: short_key.is_some(),
@@ -2144,9 +2200,9 @@ fn fast(nova: bool) -> bool {
             let mut dates = nova::Dates::default();
             let mut batch = Vec::with_capacity(16);
             let mut flush = |batch: &mut Vec<PendingClick>| {
-                for PendingClick { mut click, key, check } in batch.drain(..) {
+                for PendingClick { mut click, key, check, name } in batch.drain(..) {
                     // A user id not in the table has no valid event, so no session to credit.
-                    let Some(person) = users.find(key, check, &coll) else { continue };
+                    let Some(person) = users.find(key, check, name, &coll) else { continue };
                     click.person = person;
                     acc.push(person as usize & (P - 1), click);
                 }
@@ -2165,16 +2221,14 @@ fn fast(nova: bool) -> bool {
                     coll.store(true, Relaxed);
                     return;
                 };
-                let (key, check) = if nova {
-                    // Short IDs use the packed key; anything else is interned
-                    // by its full bytes so the click is never dropped.
-                    (nova::user_key(user).unwrap_or_else(|| ids.intern(user)), 0)
-                } else {
-                    ids.user(user)
-                };
+                let (key, check) = ids.user(user);
+                let Some(name) = pack_ref(user) else { coll.store(true, Relaxed); return; };
                 users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
-                batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
+                let (id_hi, ts) = match v5_hex_key(cid, b'k') {
+                    Some(hex) => (hex.hi, ts | CLICK_LONG), None => (0, ts),
+                };
+                batch.push(PendingClick { click: Click { tag, person: 0, ts, id_hi }, key, check, name });
                 if batch.len() == 16 {
                     flush(&mut batch);
                 }
@@ -2386,7 +2440,7 @@ impl PartitionState {
         }
         // Retain the original event counts until the click scatter is done.
         // The prefix sums then become exclusive ends as records are placed.
-        clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0 });
+        clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0, id_hi: 0 });
         for &click in click_rows() {
             let person = (click.person >> PB) as usize;
             if event_ends[person] != 0 {
@@ -2427,7 +2481,7 @@ impl PartitionState {
             if events.is_empty() {
                 continue;
             }
-            sort_timeline(clicks, click_scratch, |click| click.ts);
+            sort_timeline(clicks, click_scratch, |click| click.time());
             let name = pname[person * P + partition];
             let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
                 let category = top_cat(sums, touched, categories);
@@ -2439,16 +2493,16 @@ impl PartitionState {
                 let time = start + LOOK as u32;
                 let day_index = (session_day - day0) as usize;
                 let lower = start;
-                while lo < hi && clicks[lo].ts < lower {
+                while lo < hi && clicks[lo].time() < lower {
                     counts[clicks[lo].campaign()] -= 1;
                     lo += 1;
                 }
                 while let Some(&click) = clicks.get(hi) {
-                    if click.ts > time {
+                    if click.time() > time {
                         break;
                     }
                     hi += 1;
-                    if click.ts < lower {
+                    if click.time() < lower {
                         // This click has already expired before its first session.
                         lo += 1;
                         continue;
@@ -2459,7 +2513,7 @@ impl PartitionState {
                         in_active[campaign] = true;
                         active.push(campaign as u32);
                     }
-                    if best_click.is_none_or(|old| click.ts != old.ts || click.id() < old.id()) {
+                    if best_click.is_none_or(|old| click.time() != old.time() || click.id_before(old)) {
                         best_click = Some(click);
                     }
                 }
@@ -2473,7 +2527,7 @@ impl PartitionState {
                         true
                     }
                 });
-                let campaign = best_click.filter(|click| click.ts >= lower).map_or(organic, Click::campaign);
+                let campaign = best_click.filter(|click| click.time() >= lower).map_or(organic, Click::campaign);
                 let total = &mut cd[campaign * days + day_index];
                 total[0] += 1;
                 total[1] += i64::from(revenue > 0);
