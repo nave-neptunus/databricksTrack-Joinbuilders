@@ -128,6 +128,11 @@ def parquet_equal(left, right, label):
         matches = actual.equals(expected, null_equal=True)
         print(f"{label} {table}: {actual.height} vs {expected.height} rows, "
               f"{'MATCH' if matches else 'DIFFER'}", flush=True)
+        if not matches:
+            cols = list(schema)
+            for side, a, b in (("candidate", actual, expected), ("baseline", expected, actual)):
+                diff = a.join(b, on=cols, how="anti", nulls_equal=True)
+                print(f"{label} {table}: {side} has {diff.height} exclusive rows\n{diff.head(4)}", flush=True)
         ok = ok and matches
     if not ok:
         GATE_FAILURES.append(f"{label}: canonical parquet rows differ")
