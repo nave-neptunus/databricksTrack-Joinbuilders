@@ -18,8 +18,17 @@ const GAP: i64 = 1_800_000;
 const LOOK: i64 = 7 * DAY;
 
 static mut T0: Option<Instant> = None;
+/// Set once at process startup. The session hot path must not query the
+/// environment (or take clocks) for each person when timing is disabled.
+static TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub(crate) fn timing_enabled() -> bool {
+    TIMING_ENABLED.load(Relaxed)
+}
+
 fn lap(name: &str) {
-    if std::env::var_os("TIMING").is_some() {
+    if timing_enabled() {
         #[allow(static_mut_refs)]
         let t = unsafe { T0.unwrap() };
         eprintln!("{:8.1} ms  {}", t.elapsed().as_secs_f64() * 1000.0, name);
@@ -1629,10 +1638,11 @@ pub(crate) fn unpack_ref(r: u64) -> &'static [u8] {
 }
 
 fn main() {
+    TIMING_ENABLED.store(std::env::var_os("TIMING").is_some(), Relaxed);
     unsafe { T0 = Some(Instant::now()) };
     let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
     if std::env::var_os("FORCE_SLOW").is_some() || !fast(nova) {
-        if std::env::var_os("TIMING").is_some() {
+        if timing_enabled() {
             eprintln!("fast engine declined; running the exact fallback");
         }
         slow::run();
@@ -2323,7 +2333,7 @@ fn fast(nova: bool) -> bool {
         }
         session_timing.add(timing);
     }
-    if std::env::var_os("TIMING").is_some() {
+    if timing_enabled() {
         session_timing.print();
     }
     lap(&format!("merged: user_daily {}", nrows));
@@ -2479,8 +2489,8 @@ impl PartitionState {
         click_folds: &[Box<nova::Streams<Click, P>>],
     ) {
         let Self { event_ends, click_ends, grouped_people, events, clicks, gather, timing, .. } = self;
-        let timed = std::env::var_os("TIMING").is_some();
-        let start = Instant::now();
+        let timed = timing_enabled();
+        let start = timed.then(Instant::now);
         if event_ends.len() < people as usize {
             event_ends.resize(people as usize, 0);
             click_ends.resize(people as usize, 0);
@@ -2489,7 +2499,7 @@ impl PartitionState {
             event_ends[person as usize] = 0;
             click_ends[person as usize] = 0;
         }
-        if timed { timing.group_reset += start.elapsed(); }
+        if let Some(start) = start { timing.group_reset += start.elapsed(); }
         let event_rows = || event_folds.iter()
             .flat_map(|fold| fold.records(partition))
             .flatten()
@@ -2499,7 +2509,7 @@ impl PartitionState {
         // The old code walked those records twice (once to count, once to
         // scatter), reloading each atomic timestamp on both passes.
         gather.clear();
-        let start = Instant::now();
+        let start = timed.then(Instant::now);
         for (person, payload) in event_rows() {
             let person = (person >> PB) as u32;
             if event_ends[person as usize] == 0 {
@@ -2508,15 +2518,15 @@ impl PartitionState {
             gather.push((person, payload));
             event_ends[person as usize] += 1;
         }
-        if timed { timing.group_gather_events += start.elapsed(); }
-        let start = Instant::now();
+        if let Some(start) = start { timing.group_gather_events += start.elapsed(); }
+        let start = timed.then(Instant::now);
         for click in click_rows() {
             let person = (click.person >> PB) as usize;
             if event_ends[person] != 0 {
                 click_ends[person] += 1;
             }
         }
-        if timed { timing.group_count_clicks += start.elapsed(); }
+        if let Some(start) = start { timing.group_count_clicks += start.elapsed(); }
         // Only people with events can make sessions. Sorting restores the
         // former ascending-person order without scanning every person in each
         // partition, while the sparse reset above avoids zero-filling them.
@@ -2532,7 +2542,7 @@ impl PartitionState {
             click_total += std::mem::replace(&mut click_ends[person], click_total);
         }
         // The prefix sums are exclusive write cursors.
-        let start = Instant::now();
+        let start = timed.then(Instant::now);
         clicks.resize(click_total, Click { tag: 0, person: 0, ts: 0, id_hi: 0 });
         for &click in click_rows() {
             let person = (click.person >> PB) as usize;
@@ -2542,15 +2552,15 @@ impl PartitionState {
                 *next += 1;
             }
         }
-        if timed { timing.group_scatter_clicks += start.elapsed(); }
-        let start = Instant::now();
+        if let Some(start) = start { timing.group_scatter_clicks += start.elapsed(); }
+        let start = timed.then(Instant::now);
         events.resize(event_total, 0);
         for &(person, payload) in gather.iter() {
             let next = &mut event_ends[person as usize];
             events[*next] = payload;
             *next += 1;
         }
-        if timed { timing.group_scatter_events += start.elapsed(); }
+        if let Some(start) = start { timing.group_scatter_events += start.elapsed(); }
     }
 
     fn aggregate(
@@ -2563,6 +2573,7 @@ impl PartitionState {
         days: usize,
         organic: usize,
     ) {
+        let timed = timing_enabled();
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
             event_ends, click_ends, grouped_people, events, clicks, gather: _, event_scratch, click_scratch, buckets,
@@ -2578,10 +2589,9 @@ impl PartitionState {
             if events.is_empty() {
                 continue;
             }
-            let timed = std::env::var_os("TIMING").is_some();
-            let start = Instant::now();
+            let start = timed.then(Instant::now);
             sort_timeline(clicks, click_scratch, |click| click.time());
-            if timed { timing.aggregate_sort_clicks += start.elapsed(); }
+            if let Some(start) = start { timing.aggregate_sort_clicks += start.elapsed(); }
             let name = pname[person * P + partition];
             let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
                 let category = top_cat(sums, touched, categories);
@@ -2635,10 +2645,10 @@ impl PartitionState {
             };
 
             if events.len() < BUCKET_MIN_LEN {
-                let start = Instant::now();
+                let start = timed.then(Instant::now);
                 sort_events(events, event_scratch);
-                if timed { timing.aggregate_sort_events += start.elapsed(); }
-                let start = Instant::now();
+                if let Some(start) = start { timing.aggregate_sort_events += start.elapsed(); }
+                let start = timed.then(Instant::now);
                 aggregate_sessions(
                     events, origin, catsum, touched_categories,
                     |event| {
@@ -2648,12 +2658,12 @@ impl PartitionState {
                     |event, sums, touched| (1, add_purchase(event as u32, sums, touched)),
                     write_day, &mut attribute,
                 );
-                if timed { timing.aggregate_sessions += start.elapsed(); }
+                if let Some(start) = start { timing.aggregate_sessions += start.elapsed(); }
             } else {
-                let start = Instant::now();
+                let start = timed.then(Instant::now);
                 buckets.build(events);
-                if timed { timing.aggregate_build_buckets += start.elapsed(); }
-                let start = Instant::now();
+                if let Some(start) = start { timing.aggregate_build_buckets += start.elapsed(); }
+                let start = timed.then(Instant::now);
                 aggregate_sessions(
                     &buckets.used, origin, catsum, touched_categories,
                     |index| {
@@ -2663,7 +2673,7 @@ impl PartitionState {
                     |index, sums, touched| buckets.aggregate(index, sums, touched),
                     write_day, &mut attribute,
                 );
-                if timed { timing.aggregate_sessions += start.elapsed(); }
+                if let Some(start) = start { timing.aggregate_sessions += start.elapsed(); }
             }
             for campaign in active.drain(..) {
                 counts[campaign as usize] = 0;
