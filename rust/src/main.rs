@@ -2561,7 +2561,9 @@ fn aggregate_sessions<T: Copy>(
     let mut i = 0;
     while i < rows.len() {
         let (start, _) = bounds(rows[i]);
-        let session_day = (origin + i64::from(start)).div_euclid(DAY);
+        let instant = origin + i64::from(start);
+        // Unsigned constant division is a multiply-shift; negative instants keep the Euclidean rule.
+        let session_day = if instant >= 0 { (instant as u64 / DAY as u64) as i64 } else { instant.div_euclid(DAY) };
         if day.sessions != 0 && day.day != session_day {
             write_day(&day, catsum, touched);
             day = UserDay::default();
