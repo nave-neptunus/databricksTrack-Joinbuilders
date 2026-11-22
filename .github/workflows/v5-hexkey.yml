@@ -1,0 +1,53 @@
+name: v5 hex-key Intel gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [gum-hexkey]
+
+permissions:
+  contents: read
+
+jobs:
+  v5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Refuse non-Intel runners
+        run: |
+          grep -qm1 GenuineIntel /proc/cpuinfo || { echo 'refusing AMD/non-Intel runner' >&2; exit 1; }
+          grep -qw avx512f /proc/cpuinfo || { echo 'refusing runner without AVX-512' >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { toolchain: stable }
+      - name: Install fixture comparator
+        run: python -m pip install --disable-pip-version-check 'polars>=1,<2'
+      - name: Cargo tests and v5 generator build
+        run: |
+          cargo test --manifest-path rust/Cargo.toml --locked
+          cargo build --manifest-path generator/Cargo.toml --release --locked
+      - name: Build baseline and candidate images
+        run: |
+          git archive --format=tar 6da0386b4ca6a001a5c7f747c68f40815fc14afb | docker build --platform linux/amd64 --load --tag hexkey-baseline -
+          docker build --platform linux/amd64 --load --tag hexkey-candidate .
+      - name: Run all 36 fixtures
+        env: { IMAGE: hexkey-candidate, CPUS: '4' }
+        run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+      - name: Generate v5 20M corpus
+        run: generator/target/release/generate --seed 17 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/v5-20m"
+      - name: v5 1M dev-answer MATCH
+        run: |
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/v5-dev"
+          IMAGE=hexkey-candidate CPUS=4 scripts/docker_run.sh "$RUNNER_TEMP/v5-dev" "$RUNNER_TEMP/v5-dev-out"
+          unzip -q v5-dev-answer.zip -d "$RUNNER_TEMP"
+          python3 scripts/compare.py "$RUNNER_TEMP/v5-dev-out" "$RUNNER_TEMP/dev-answer"
+      - name: v5 20M baseline MATCH
+        run: |
+          IMAGE=hexkey-baseline CPUS=4 scripts/docker_run.sh "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-base-out"
+          IMAGE=hexkey-candidate CPUS=4 scripts/docker_run.sh "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-candidate-out"
+          python3 scripts/compare.py "$RUNNER_TEMP/v5-candidate-out" "$RUNNER_TEMP/v5-base-out"
+      - if: always()
+        run: true
