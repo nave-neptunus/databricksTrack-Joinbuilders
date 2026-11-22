@@ -103,7 +103,7 @@ def run(binary, data, label, *, candidate=False, timing=False, require_fast=True
     laps = [(float(ms), name) for ms, name in re.findall(r"^\s*([0-9.]+) ms\s+(.+)$", result.stderr, re.M)]
     if candidate:
         timing_line = next((line for line in result.stderr.splitlines() if line.startswith("[v5] ms: ")), "")
-        laps = [(float(ms), name) for name, ms in re.findall(r"(\w+)=([0-9.]+)", timing_line)]
+        laps = [(float(ms), name) for name, ms in re.findall(r"([\w.]+)=([0-9.]+)", timing_line)]
     return out, elapsed, laps
 
 

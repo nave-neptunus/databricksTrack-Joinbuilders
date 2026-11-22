@@ -20,7 +20,7 @@ jobs:
           grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || echo 'WARN: AMD runner (timing indicative only)'
           grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo || { echo 'Express requires AVX-512BW and AVX-512VL'; exit 1; }
           test "$(nproc)" -ge 4 || { echo "need 4+ vCPUs, got $(nproc)" >&2; exit 1; }; echo "RUNNER_VCPUS=$(nproc)" >> "$GITHUB_ENV"
-          echo "NCPU=${{ inputs.ncpu || 8 }}" >> "$GITHUB_ENV"
+          echo "NCPU=8" >> "$GITHUB_ENV"
       - name: Install exact-check dependency
         run: python3 -m pip install --disable-pip-version-check polars
       - name: Build the supplied v5 generator and generate corpora

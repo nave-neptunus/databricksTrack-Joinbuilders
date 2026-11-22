@@ -76,7 +76,7 @@ impl<'a> Id<'a> {
         }
     }
 
-    fn cmp(self, other: Self, prefix: u8) -> Ordering {
+    pub fn cmp(self, other: Self, prefix: u8) -> Ordering {
         match (self, other) {
             (Self::Short(a), Self::Short(b)) => a.cmp(&b),
             (Self::Long(a), Self::Long(b)) => a.cmp(b),
@@ -110,7 +110,7 @@ pub fn shard(hash: u64) -> usize {
 }
 
 #[derive(Default)]
-struct IdentityHasher(u64);
+pub struct IdentityHasher(u64);
 
 impl Hasher for IdentityHasher {
     fn finish(&self) -> u64 {
@@ -140,6 +140,15 @@ impl Keys {
         let at = ((key & !LONG) >> 16) as usize;
         let len = (key as u16) as usize;
         Id::Long(&self.bytes[at..at + len])
+    }
+
+    #[inline]
+    fn matches(&self, index: u32, id: Id<'_>) -> bool {
+        match (id, self.id(index)) {
+            (Id::Short(a), Id::Short(b)) => a == b,
+            (Id::Long(a), Id::Long(b)) => a == b,
+            _ => false,
+        }
     }
 
     fn push(&mut self, id: Id<'_>) {
@@ -178,6 +187,18 @@ impl Shard {
         }
     }
 
+    #[inline]
+    fn lookup(&self, id: Id<'_>, hash: u64) -> Option<u32> {
+        let mut index = *self.table.get(&hash)?;
+        while index != NONE {
+            if self.keys.matches(index, id) {
+                return Some(index);
+            }
+            index = self.next[index as usize];
+        }
+        None
+    }
+
     // The hash is only a bucket selector. Check the stored bytes on every
     // matching long-ID hash and keep any true collisions on the same chain.
     #[inline]
@@ -185,12 +206,7 @@ impl Shard {
         let head = self.table.entry(hash).or_insert(NONE);
         let mut index = *head;
         while index != NONE {
-            let same = match (id, self.keys.id(index)) {
-                (Id::Short(a), Id::Short(b)) => a == b,
-                (Id::Long(a), Id::Long(b)) => a == b,
-                _ => false,
-            };
-            if same {
+            if self.keys.matches(index, id) {
                 return (index, false);
             }
             index = self.next[index as usize];
@@ -224,8 +240,27 @@ impl Dictionary {
         ((index << BITS) | stripe as u32, is_new)
     }
 
+    pub fn freeze(self) -> FrozenDictionary {
+        FrozenDictionary(self.0.map(|stripe| stripe.0.into_inner().unwrap()))
+    }
+
     pub fn into_names(self) -> Names {
-        Names(self.0.map(|stripe| stripe.0.into_inner().unwrap().keys))
+        self.freeze().into_names()
+    }
+}
+
+pub struct FrozenDictionary([Shard; SHARDS]);
+
+impl FrozenDictionary {
+    #[inline]
+    pub fn lookup(&self, id: Id<'_>, hash: u64) -> Option<u32> {
+        let stripe = shard(hash);
+        let index = self.0[stripe].lookup(id, hash)?;
+        Some((index << BITS) | stripe as u32)
+    }
+
+    pub fn into_names(self) -> Names {
+        Names(self.0.map(|shard| shard.keys))
     }
 }
 

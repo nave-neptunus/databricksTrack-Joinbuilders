@@ -1,15 +1,75 @@
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::ids::{self, Dictionary, Id, Names, Shard, SHARDS};
+use crate::ids::{Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard};
 use crate::iface::*;
 use crate::{
     core, k_ref, parse, setup, sys, Kind, Rec, BB, BSIZE, CBOUND, DAY_MS, G, ING_MAX, K, PBOUND, UB,
 };
 
 pub struct Dictionaries {
-    pub users: Names,
+    pub users: UserNames,
     pub clicks: Names,
+}
+
+pub struct UserNames {
+    linked: Names,
+    unlinked: Names,
+    boundary: u32,
+}
+
+impl UserNames {
+    pub fn bytes<'a>(&'a self, index: u32, prefix: u8, buf: &'a mut [u8; 9]) -> &'a [u8] {
+        if index < self.boundary {
+            self.linked.bytes(index, prefix, buf)
+        } else {
+            self.unlinked.bytes(index - self.boundary, prefix, buf)
+        }
+    }
+}
+
+struct Users {
+    linked: FrozenDictionary,
+    unlinked: Dictionary,
+    roots: Vec<u32>,
+    boundary: u32,
+}
+
+impl Users {
+    fn new(g: &G) -> Self {
+        let linked = Dictionary::new();
+        let roots = links(g, &linked);
+        let boundary = roots.len() as u32;
+        Self {
+            linked: linked.freeze(),
+            unlinked: Dictionary::new(),
+            roots,
+            boundary,
+        }
+    }
+
+    #[inline]
+    fn person(&self, id: Id<'_>, hash: u64) -> u32 {
+        if let Some(index) = self.linked.lookup(id, hash) {
+            self.roots[index as usize]
+        } else {
+            self.unlinked
+                .intern(id, hash)
+                .0
+                .checked_add(self.boundary)
+                .unwrap_or_else(|| sys::fallback("IDs exceed user index capacity"))
+        }
+    }
+
+    fn into_names(self) -> UserNames {
+        UserNames {
+            linked: self.linked.into_names(),
+            unlinked: self.unlinked.into_names(),
+            boundary: self.boundary,
+        }
+    }
 }
 
 fn file(g: &G, index: usize) -> &[u8] {
@@ -42,7 +102,7 @@ fn find(parent: &mut [u32], mut id: u32) -> u32 {
 
 fn links(g: &G, users: &Dictionary) -> Vec<u32> {
     let mut parent = Vec::new();
-    let mut names = Vec::<&[u8]>::new();
+    let mut names = Vec::<Option<Id>>::new();
     let mut n = 0;
     for (i, f) in g.files.iter().enumerate() {
         if f.kind != Kind::Lk {
@@ -67,17 +127,17 @@ fn links(g: &G, users: &Dictionary) -> Vec<u32> {
             }
             if needed > parent.len() {
                 parent.extend(parent.len() as u32..needed as u32);
-                names.resize(needed, &[]);
+                names.resize(needed, None);
             }
-            if names[ia as usize].is_empty() {
-                names[ia as usize] = a;
-            }
-            if names[ib as usize].is_empty() {
-                names[ib as usize] = b;
-            }
+            names[ia as usize] = Some(ka);
+            names[ib as usize] = Some(kb);
             let ra = find(&mut parent, ia);
             let rb = find(&mut parent, ib);
-            if names[ra as usize] < names[rb as usize] {
+            if names[ra as usize]
+                .unwrap()
+                .cmp(names[rb as usize].unwrap(), b'u')
+                .is_lt()
+            {
                 parent[rb as usize] = ra;
             } else {
                 parent[ra as usize] = rb;
@@ -105,16 +165,21 @@ fn id_at(g: &G, id: u64, base: usize) -> Id<'_> {
     Id::Long(unsafe { std::slice::from_raw_parts(g.region.add(at), len) })
 }
 
-const USER_CACHE: usize = 4096;
+const USER_CACHE: usize = 16384;
+const EVENT_SHARDS: usize = 256;
+
+#[inline]
+fn event_shard(hash: u64) -> usize {
+    (hash >> 32) as usize & (EVENT_SHARDS - 1)
+}
 
 struct Scan<'a> {
     g: &'a G,
-    users: &'a Dictionary,
+    users: &'a Users,
     clicks: &'a Dictionary,
-    roots: &'a [u32],
     user_keys: [u64; USER_CACHE],
     user_values: [u32; USER_CACHE],
-    events: [Vec<Event>; SHARDS],
+    events: [Vec<Event>; EVENT_SHARDS],
     us: &'a mut parse::Part,
     ev: Box<EvBatch>,
     ck: Box<CkBatch>,
@@ -152,8 +217,7 @@ impl Scan<'_> {
 
     #[inline]
     fn intern_person(&self, key: Id<'_>, hash: u64) -> u32 {
-        let (index, _) = self.users.intern(key, hash);
-        let person = self.roots.get(index as usize).copied().unwrap_or(index);
+        let person = self.users.person(key, hash);
         if person as u64 >= self.g.ucap {
             sys::fallback("IDs exceed user capacity");
         }
@@ -162,6 +226,9 @@ impl Scan<'_> {
 
     #[inline]
     fn event_row(&mut self, r: EvRow) {
+        if r.eid == ID_EMPTY {
+            return;
+        }
         let g = self.g;
         let ingest = r.ingest.wrapping_sub(g.ing_base) as u64;
         if r.ingest == TS_BAD || ingest >= ING_MAX * 1000 || ingest % 1000 != 0 {
@@ -190,7 +257,7 @@ impl Scan<'_> {
         } else {
             r.eid + ((self.base as u64) << 8)
         };
-        self.events[ids::shard(hash)].push(Event {
+        self.events[event_shard(hash)].push(Event {
             id,
             w0,
             user_ingest: (user as u64) << 21 | ingest / 1000,
@@ -201,7 +268,8 @@ impl Scan<'_> {
     fn click_row(&mut self, r: ClRow) {
         let g = self.g;
         let rel = r.ts.wrapping_sub(g.cbase) as u64;
-        if r.uid == ID_EMPTY
+        if r.cid == ID_EMPTY
+            || r.uid == ID_EMPTY
             || rel >= g.clen
             || r.campaign as usize >= CBOUND
             || g.camp[r.campaign as usize] == 255
@@ -247,12 +315,7 @@ impl ClickSink for Scan<'_> {
     }
 }
 
-fn scan(
-    g: &G,
-    users: &Dictionary,
-    clicks: &Dictionary,
-    roots: &[u32],
-) -> Vec<[Mutex<Vec<Event>>; SHARDS]> {
+fn scan(g: &G, users: &Users, clicks: &Dictionary) -> Vec<[Mutex<Vec<Event>>; EVENT_SHARDS]> {
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
@@ -271,7 +334,6 @@ fn scan(
             g,
             users,
             clicks,
-            roots,
             user_keys: [0; USER_CACHE],
             user_values: [0; USER_CACHE],
             events: std::array::from_fn(|_| Vec::new()),
@@ -311,41 +373,62 @@ fn scan(
         .collect()
 }
 
-fn dedup(g: &G, parsed: &[[Mutex<Vec<Event>>; SHARDS]]) -> Vec<Vec<Mutex<Vec<Rec>>>> {
+#[inline]
+fn update_event(slot: &mut Event, row: Event) {
+    let old_ing = slot.user_ingest & ING_MAX;
+    let new_ing = row.user_ingest & ING_MAX;
+    if new_ing < old_ing {
+        *slot = row;
+    } else if new_ing == old_ing && (slot.w0 != row.w0 || slot.user_ingest != row.user_ingest) {
+        sys::fallback("equal-ingest copies disagree");
+    }
+}
+
+fn dedup(g: &G, parsed: &[[Mutex<Vec<Event>>; EVENT_SHARDS]]) -> Vec<Vec<Mutex<Vec<Rec>>>> {
     let next = AtomicUsize::new(0);
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     sys::run_par(g.nt, |tid| {
         let mut people: Vec<Vec<Rec>> = (0..g.nub).map(|_| Vec::new()).collect();
         loop {
             let shard = next.fetch_add(1, Ordering::Relaxed);
-            if shard >= SHARDS {
+            if shard >= EVENT_SHARDS {
                 break;
             }
             let total = parsed.iter().map(|p| p[shard].lock().unwrap().len()).sum();
-            let mut keys = Shard::with_capacity(total);
+            let mut short =
+                HashMap::<u64, u32, BuildHasherDefault<IdentityHasher>>::with_capacity_and_hasher(
+                    total,
+                    BuildHasherDefault::default(),
+                );
+            let mut long = Shard::with_capacity(total / 8);
             let mut slots = Vec::<Event>::with_capacity(total);
+            let mut long_slots = Vec::<Event>::with_capacity(total / 8);
             for p in parsed {
                 let part = std::mem::take(&mut *p[shard].lock().unwrap());
                 for row in part {
                     let id = id_at(g, row.id, 0);
-                    let (index, is_new) = keys.intern(id, id.hash());
-                    if is_new {
-                        slots.push(row);
+                    let hash = id.hash();
+                    if let Id::Short(_) = id {
+                        // The mixer is a bijection on u64, so equal short
+                        // hashes imply equal packed keys.
+                        let next = slots.len() as u32;
+                        let index = *short.entry(hash).or_insert(next);
+                        if index == next {
+                            slots.push(row);
+                        } else {
+                            update_event(&mut slots[index as usize], row);
+                        }
                     } else {
-                        let slot = &mut slots[index as usize];
-                        let old_ing = slot.user_ingest & ING_MAX;
-                        let new_ing = row.user_ingest & ING_MAX;
-                        if new_ing < old_ing {
-                            *slot = row;
-                        } else if new_ing == old_ing
-                            && (slot.w0 != row.w0 || slot.user_ingest != row.user_ingest)
-                        {
-                            sys::fallback("equal-ingest copies disagree");
+                        let (index, is_new) = long.intern(id, hash);
+                        if is_new {
+                            long_slots.push(row);
+                        } else {
+                            update_event(&mut long_slots[index as usize], row);
                         }
                     }
                 }
             }
-            for e in slots {
+            for e in slots.into_iter().chain(long_slots) {
                 if e.w0 != u64::MAX {
                     let u = e.user_ingest >> 21;
                     people[(u >> UB) as usize].push(Rec { w0: e.w0, w1: u });
@@ -375,7 +458,11 @@ fn order_events(g: &G, people: &[Vec<Mutex<Vec<Rec>>>]) {
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
         let part = &mut g.t(tid).ev;
+        const USERS_PER_BUCKET: usize = 1 << UB;
         let mut rows = Vec::new();
+        let mut grouped = Vec::new();
+        let mut counts = vec![0; USERS_PER_BUCKET + 1];
+        let mut positions = vec![0; USERS_PER_BUCKET];
         loop {
             let bucket = next.fetch_add(1, Ordering::Relaxed);
             if bucket >= g.nub {
@@ -385,8 +472,27 @@ fn order_events(g: &G, people: &[Vec<Mutex<Vec<Rec>>>]) {
                 let mut source = std::mem::take(&mut *p[bucket].lock().unwrap());
                 rows.append(&mut source);
             }
-            rows.sort_unstable_by_key(|r| (r.w1, r.w0 >> 33));
-            for (index, row) in (offsets[bucket]..).zip(rows.drain(..)) {
+            if rows.is_empty() {
+                continue;
+            }
+            counts.fill(0);
+            for row in &rows {
+                counts[(row.w1 as usize & (USERS_PER_BUCKET - 1)) + 1] += 1;
+            }
+            for i in 0..USERS_PER_BUCKET {
+                counts[i + 1] += counts[i];
+            }
+            positions.copy_from_slice(&counts[..USERS_PER_BUCKET]);
+            grouped.resize(rows.len(), Rec { w0: 0, w1: 0 });
+            for row in rows.drain(..) {
+                let pos = &mut positions[row.w1 as usize & (USERS_PER_BUCKET - 1)];
+                grouped[*pos] = row;
+                *pos += 1;
+            }
+            for window in counts.windows(2) {
+                grouped[window[0]..window[1]].sort_unstable_by_key(|row| row.w0 >> 33);
+            }
+            for (index, row) in (offsets[bucket]..).zip(grouped.drain(..)) {
                 part.push(
                     index >> BB,
                     row.w0,
@@ -399,11 +505,10 @@ fn order_events(g: &G, people: &[Vec<Mutex<Vec<Rec>>>]) {
 }
 
 pub fn stage1(g: &mut G) {
-    let users = Dictionary::new();
+    let users = Users::new(g);
     let clicks = Dictionary::new();
-    let roots = links(g, &users);
     sys::lap("link_ids");
-    let parsed = scan(g, &users, &clicks, &roots);
+    let parsed = scan(g, &users, &clicks);
     sys::lap("scan_ids");
     let people = dedup(g, &parsed);
     sys::lap("dedup_ids");
