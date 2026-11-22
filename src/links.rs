@@ -209,6 +209,10 @@ pub fn name_of(g: &G, pkey: u64, out: &mut Vec<u8>) {
     match pkey >> 62 {
         0 => {
             let u = (pkey >> 4) as u32;
+            if let Some(ids) = &g.ids {
+                out.extend_from_slice(ids.users.bytes(u, b'u', &mut [0; 9]));
+                return;
+            }
             let code = (pkey & 15) as u32;
             let class = if code == 15 { (unsafe { *g.utab.add(u as usize) } & MASK) as u32 } else { 1 << code };
             let (v, len) = crate::core::simple_name(g, u, class);
@@ -412,9 +416,9 @@ fn fix_ties(g: &G, s: &mut [[u64; 2]]) {
         let x = s[i][0] ^ s[i - 1][0];
         if x >> 32 == 0 && x >> 4 != 0 {
             let ts = s[i][0] >> 32;
-            if (i < 2 || s[i - 2][0] >> 32 != ts) && (i + 1 >= n || s[i + 1][0] >> 32 != ts) && (s[i - 1][1] | s[i][1]) & RAW == 0 {
-                let (e0, e1) = (enc36(s[i - 1][1]).0, enc36(s[i][1]).0);
-                if e0 < e1 || (e0 == e1 && s[i - 1][0] > s[i][0]) {
+            if (i < 2 || s[i - 2][0] >> 32 != ts) && (i + 1 >= n || s[i + 1][0] >> 32 != ts) {
+                let order = crate::events::cid_cmp(g, s[i - 1][1], s[i][1]);
+                if order.is_lt() || (order.is_eq() && s[i - 1][0] > s[i][0]) {
                     s.swap(i - 1, i);
                 }
                 i += 1;
@@ -699,7 +703,7 @@ fn tie_group(g: &G, s: &mut [[u64; 2]], i: usize) -> usize {
         b += 1;
     }
     let grp = &mut s[a..b];
-    if grp.iter().all(|c| c[1] & RAW == 0) {
+    if g.ids.is_none() && grp.iter().all(|c| c[1] & RAW == 0) {
         if grp.len() <= 16 {
             let mut e = [0u64; 16];
             for (k, c) in grp.iter().enumerate() {

@@ -473,9 +473,13 @@ impl Core {
         self.n_sess += self.sess.len() as u64;
         match name {
             Name::Simple(u, class) => {
-                let (v, len) = simple_name(g, u, class);
-                self.names.push(b'u');
-                self.names.extend(&v.to_be_bytes()[..len]);
+                if let Some(ids) = &g.ids {
+                    self.names.extend(ids.users.bytes(u, b'u', &mut [0; 9]));
+                } else {
+                    let (v, len) = simple_name(g, u, class);
+                    self.names.push(b'u');
+                    self.names.extend(&v.to_be_bytes()[..len]);
+                }
             }
             Name::Bytes(b) => self.names.extend(b),
         }

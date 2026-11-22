@@ -16,6 +16,9 @@ pub fn cpush(t: &mut TState, pkey: u64, w0: u64) {
 }
 
 pub fn cid_cmp(g: &G, a: u64, b: u64) -> std::cmp::Ordering {
+    if let Some(ids) = &g.ids {
+        return ids.clicks.cmp(a as u32, b as u32, b'k');
+    }
     if (a | b) & RAW == 0 {
         return enc36(a).0.cmp(&enc36(b).0);
     }
@@ -1248,8 +1251,22 @@ impl Fast {
 }
 
 #[inline(never)]
-unsafe fn flush_names(fx: &Fast, core: &mut crate::core::Core, ukey: u64, row_cap: usize, np: &mut usize, na: &mut usize) {
+unsafe fn flush_names(fx: &Fast, core: &mut crate::core::Core, g: &G, row_cap: usize, np: &mut usize, na: &mut usize) {
     let (pv, pk, pr, best) = (fx.nm_v, fx.nm_k, fx.nm_r, fx.nm_best);
+    if let Some(ids) = &g.ids {
+        let mut buf = [0; 9];
+        for i in 0..*na {
+            let name = ids.users.bytes(*best.add(i) as u32, b'u', &mut buf);
+            core.names.extend(name);
+            if core.names.len() > u32::MAX as usize {
+                fallback("names over 4 GB");
+            }
+            core.names_off.push(core.names.len() as u32);
+        }
+        *na = 0;
+        return;
+    }
+    let ukey = g.ukey;
     let mut p = 0usize;
     while p < *np {
         _mm256_storeu_si256(pk.add(p) as *mut __m256i, name_key4v(ukey, _mm256_loadu_si256(pv.add(p) as *const __m256i)));
@@ -1648,7 +1665,9 @@ unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize,
         let ncl = class.count_ones() as usize;
         *nm_best.add(nm_na) = u64::MAX;
         *run_pidx.add(r) = pidx0 + nm_na as u32;
-        if ncl.wrapping_sub(1) >= 8 {
+        if g.ids.is_some() {
+            *nm_best.add(nm_na) = u as u64;
+        } else if ncl.wrapping_sub(1) >= 8 {
             *nm_best.add(nm_na) = name_key_scalar(g.ukey, u, class);
         } else {
             let al = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(_mm512_maskz_compress_epi32(class as u16, iota16)));
@@ -1948,7 +1967,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                     info.last = edge_copy_k(tid, u, &mut fx, a, e - a);
                     info.n = 2;
                 } else {
-                    flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut wk.nm_np, &mut wk.nm_na);
+                    flush_names(&fx, &mut t.core, g, row_cap, &mut wk.nm_np, &mut wk.nm_na);
                     let mut buf = std::mem::take(&mut t.runbuf);
                     buf.clear();
                     for_kept(slots, blkk, keepm, a, e - a, |w0| buf.push(Rec { w0, w1: (u as u64) << 37 }));
@@ -1958,7 +1977,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 xp.ph(15);
                 r += 1;
             }
-            flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut wk.nm_np, &mut wk.nm_na);
+            flush_names(&fx, &mut t.core, g, row_cap, &mut wk.nm_np, &mut wk.nm_na);
             t.n_runs += wk.c_runs;
             t.n_simple += wk.c_simple;
             t.core.n_sess += wk.c_sess;

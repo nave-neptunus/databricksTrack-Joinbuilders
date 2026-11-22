@@ -4,6 +4,7 @@ mod complex;
 mod core;
 mod events;
 mod iface;
+mod ids;
 mod k_ref;
 mod keyrec;
 mod links;
@@ -12,6 +13,7 @@ mod parse;
 mod pqw;
 mod setup;
 mod sys;
+mod v5;
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -174,6 +176,7 @@ pub struct G {
     pub ws_mod: u64,
     pub day0: i32,
     pub nd: usize,
+    pub ids: Option<v5::Dictionaries>,
     pub ukey: u64,
     pub ekey: u64,
     pub ckey: u64,
@@ -386,24 +389,15 @@ fn main() {
         links::sort_bench(g);
         unsafe { sys::_exit(0) };
     }
-    {
-        let gr: &G = g;
-        run_par(nt, |tid| parse::stage1(gr, tid));
-    }
+    v5::stage1(g);
     lap("parse");
     links::stage2(g);
     lap("st2sort");
     events::stage3(g);
     lap("ev3b");
-    if std::env::var("XL_OVL").map_or(true, |v| v != "0") {
-        out::stage45(g, &outdir);
-        lap("write");
-    } else {
-        complex::stage4(g);
-        lap("complex");
-        out::stage5(g, &outdir);
-        lap("write");
-    }
+    out::stage5(g, &outdir);
+    lap("write");
+    eprintln!("[v5] FAST path complete");
     if timing || check {
         let mut s = String::new();
         for (n, ms) in unsafe { sys::LAPS.iter() } {
@@ -423,7 +417,7 @@ fn main() {
             sess += t.core.n_sess;
         }
         let hwm = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())).unwrap_or_default();
-        eprintln!("[v2b] ms: {s}total={:.1} peak_rss_kb={hwm}", t0.elapsed().as_secs_f64() * 1e3);
+        eprintln!("[v5] ms: {s}total={:.1} peak_rss_kb={hwm}", t0.elapsed().as_secs_f64() * 1e3);
         let mut prof = [0u64; 8];
         for tid in 0..nt {
             for k in 0..8 {

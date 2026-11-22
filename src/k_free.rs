@@ -26,7 +26,18 @@ macro_rules! kernel {
         }
     };
 }
-kernel!(Free, "free", PIPE);
+pub struct Free;
+impl Kernel for Free {
+    const NAME: &'static str = "free";
+    fn events<S: EventSink>(buf: &[u8], sink: &mut S) {
+        unsafe { run_events::<S, PIPE>(buf, sink) }
+        sink.ev_flush();
+    }
+    fn clicks<S: ClickSink>(buf: &[u8], sink: &mut S) {
+        unsafe { run_clicks::<S, CHAIN>(buf, sink) }
+        sink.ck_flush();
+    }
+}
 kernel!(FreeN, "freen", CHAIN);
 
 #[cfg(feature = "stats")]
@@ -63,9 +74,9 @@ const fn id_shapes(prefix: u8, dig: usize, chk: usize, allow_empty: bool) -> [Id
             let mut ok = false;
             if raw >= plus + 1 && raw <= plus + 8 {
                 let nd = raw - plus;
-                let mut j = 8 - nd;
-                while j < 8 {
-                    t[i].ctrl[dig + j] = (8 - q + j) as u8;
+                let mut j = 0;
+                while j < nd {
+                    t[i].ctrl[dig + j] = (16 - q - nd + j) as u8;
                     t[i].subv[dig + j] = b'0';
                     j += 1;
                 }
@@ -74,9 +85,6 @@ const fn id_shapes(prefix: u8, dig: usize, chk: usize, allow_empty: bool) -> [Id
                 if q == 1 {
                     t[i].ctrl[chk + 1] = 15;
                     t[i].subv[chk + 1] = b'"';
-                }
-                if nd > 1 {
-                    t[i].lz[dig + 8 - nd] = 1;
                 }
                 ok = true;
             } else if allow_empty && raw == 2 * q {
@@ -854,20 +862,24 @@ unsafe fn ids2(xa: __m128i, sa: &IdShape, xb: __m128i, sb: &IdShape) -> (u64, u6
 #[inline(always)]
 unsafe fn ids2v(xa: __m128i, sa: &IdShape, xb: __m128i, sb: &IdShape) -> (__m128i, __m128i) {
     unsafe {
-        let va = _mm_sub_epi8(_mm_shuffle_epi8(xa, ld(sa.ctrl.as_ptr())), ld(sa.subv.as_ptr()));
-        let vb = _mm_sub_epi8(_mm_shuffle_epi8(xb, ld(sb.ctrl.as_ptr())), ld(sb.subv.as_ptr()));
+        let suba = ld(sa.subv.as_ptr());
+        let subb = ld(sb.subv.as_ptr());
+        let va = _mm_sub_epi8(_mm_shuffle_epi8(xa, ld(sa.ctrl.as_ptr())), suba);
+        let vb = _mm_sub_epi8(_mm_shuffle_epi8(xb, ld(sb.ctrl.as_ptr())), subb);
         let d = _mm_blend_epi32::<0b1100>(va, vb);
         let chk = _mm_blend_epi32::<0b1100>(vb, va);
+        let sub = _mm_blend_epi32::<0b1100>(suba, subb);
         let e = _mm_sub_epi8(d, _mm_set1_epi8(49));
         let notdig = _mm_subs_epu8(d, _mm_set1_epi8(9));
         let notlet = _mm_subs_epu8(e, _mm_set1_epi8(25));
         let val = _mm_min_epu8(d, _mm_sub_epi8(d, _mm_set1_epi8(39)));
-        let lz = _mm_subs_epu8(_mm_or_si128(ld(sa.lz.as_ptr()), ld(sb.lz.as_ptr())), val);
-        let bad = _mm_or_si128(_mm_or_si128(chk, lz), _mm_min_epu8(notdig, notlet));
-        let m1 = _mm_maddubs_epi16(val, _mm_set1_epi16(0x0124));
-        let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_0510));
-        let ids = _mm_add_epi64(_mm_mul_epu32(m2, _mm_set1_epi64x(1_679_616)), _mm_srli_epi64::<32>(m2));
+        let codes = _mm_sub_epi8(val, _mm_cmpeq_epi8(sub, _mm_set1_epi8(b'0' as i8)));
+        let bad = _mm_or_si128(chk, _mm_min_epu8(notdig, notlet));
+        let pairs = _mm_maddubs_epi16(codes, _mm_set1_epi16(0x0140));
+        let blocks = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000));
+        let ids = _mm_or_si128(_mm_srli_epi64::<8>(_mm_slli_epi64::<32>(blocks)), _mm_srli_epi64::<32>(blocks));
         (_mm_or_si128(ids, ld(sb.orv.as_ptr() as *const u8)), bad)
+
     }
 }
 
@@ -876,19 +888,19 @@ unsafe fn ids2j(xa: __m128i, xb: __m128i, r: &JidRow) -> (__m256i, __m256i) {
     unsafe {
         let ld2 = |q: *const u8| _mm256_load_si256(q as *const __m256i);
         let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(xa), xb);
-        let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ld2(r.ctrl.as_ptr())), ld2(r.subv.as_ptr()));
+        let sub = ld2(r.subv.as_ptr());
+        let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ld2(r.ctrl.as_ptr())), sub);
         let e = _mm256_sub_epi8(v, _mm256_set1_epi8(49));
         let notdig = _mm256_subs_epu8(v, _mm256_set1_epi8(9));
         let notlet = _mm256_subs_epu8(e, _mm256_set1_epi8(25));
         let val = _mm256_min_epu8(v, _mm256_sub_epi8(v, _mm256_set1_epi8(39)));
-        let lz = _mm256_subs_epu8(ld2(r.lz.as_ptr()), val);
+        let codes = _mm256_sub_epi8(val, _mm256_cmpeq_epi8(sub, _mm256_set1_epi8(b'0' as i8)));
         let cls = _mm256_ternarylogic_epi64::<0xF8>(_mm256_min_epu8(notdig, notlet), v, _mm256_set_epi64x(-1, 0, -1, 0));
-        let m1 = _mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0124));
-        let m2 = _mm256_madd_epi16(m1, _mm256_set1_epi32(0x0001_0510));
-        let hi: __m256i;
-        core::arch::asm!("vpmuludq {o:y}, {a:y}, {b:y}", o = lateout(zmm_reg) hi, a = in(zmm_reg) m2, b = in(zmm_reg) _mm256_set1_epi64x(1_679_616), options(pure, nomem, nostack, preserves_flags));
-        let ids = _mm256_add_epi64(hi, _mm256_srli_epi64::<32>(m2));
-        (_mm256_or_si256(ids, ld2(r.orv.as_ptr() as *const u8)), _mm256_or_si256(cls, lz))
+        let pairs = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
+        let blocks = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_1000));
+        let ids = _mm256_or_si256(_mm256_srli_epi64::<8>(_mm256_slli_epi64::<32>(blocks)), _mm256_srli_epi64::<32>(blocks));
+        (_mm256_or_si256(ids, ld2(r.orv.as_ptr() as *const u8)), cls)
+
     }
 }
 
@@ -2306,20 +2318,7 @@ mod slow {
         if v.is_empty() {
             return ID_EMPTY;
         }
-        let digits = &v[1..];
-        let canonical = v[0] == prefix
-            && (1..=8).contains(&digits.len())
-            && digits.iter().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
-            && !(digits[0] == b'0' && digits.len() > 1);
-        if !canonical {
-            return odd_id(s, v.len());
-        }
-        let mut value: u64 = 0;
-        for &b in digits {
-            let d = if b.is_ascii_digit() { b - b'0' } else { b - b'a' + 10 };
-            value = value * 36 + d as u64;
-        }
-        value
+        crate::ids::pack(v, prefix).unwrap_or_else(|| odd_id(s, v.len()))
     }
 
     fn canonical_decimal(d: &[u8]) -> Option<u32> {

@@ -9,7 +9,7 @@ RUN cargo build --release --target x86_64-unknown-linux-musl \
  && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline
 
 # Stage 2: the general pipeline (ours) that the fast path hands off to when the
-# data breaks its assumptions (long or opaque IDs, unusual categories, ...).
+# data exceeds its supported limits (unusual categories, window length, ...).
 FROM rust:1.100.0-slim-bookworm AS fallback
 WORKDIR /src
 COPY fallback/Cargo.toml fallback/Cargo.lock ./

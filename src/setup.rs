@@ -291,53 +291,6 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
         }
     }
 
-    let mut sample = keyrec::Sample::default();
-    for f in files.iter().filter(|f| f.kind == Kind::Ev) {
-        if sample.events.len() >= 5000 {
-            break;
-        }
-        let all = unsafe { std::slice::from_raw_parts(region.add(f.off), f.len) };
-        let hdr = all.iter().position(|&b| b == b'\n').map_or(f.len, |i| i + 1);
-        let bytes = &all[hdr..];
-        let mut cut = bytes.len().min(600_000);
-        if cut < bytes.len() {
-            while cut > 0 && bytes[cut - 1] != b'\n' {
-                cut -= 1;
-            }
-        }
-        sample.add_event_lines(&bytes[..cut], 5000);
-    }
-    lap("s.sample");
-    let mut st = keyrec::Stats::default();
-    let envkey = |n: &str| if cfg!(feature = "testkeys") { std::env::var(n).ok().and_then(|v| u64::from_str_radix(&v, 16).ok()) } else { None };
-    let (ukey, ekey) = match (envkey("XL_UKEY"), envkey("XL_EKEY")) {
-        (Some(u), Some(e)) => (u, e),
-        _ => {
-            let Some(ukey) = keyrec::recover_user_key(&sample, &mut st) else { fallback("no user key") };
-            let Some(ekey) = keyrec::recover_event_key(&sample, ukey, Some(ws), &mut st) else { fallback("no event key") };
-            (ukey, ekey)
-        }
-    };
-    if check {
-        eprintln!("[v2b] keys: XL_UKEY={ukey:x} XL_EKEY={ekey:x}");
-    }
-    let mut ccap = click_cap(ck_bytes);
-    let mut ckey = 0;
-    if ccap != 0 {
-        let mut cs = keyrec::Sample::default();
-        if let Some(f) = files.iter().find(|f| f.kind == Kind::Ck) {
-            cs.add_click_lines(sample_bytes(unsafe { std::slice::from_raw_parts(region.add(f.off), f.len) }), CK_SAMPLE);
-        }
-        match click_key(cs.clicks, ukey, ccap, &mut st) {
-            Some(k) => ckey = k,
-            None => ccap = 0,
-        }
-    }
-    if check {
-        eprintln!("[v2b] click key: XL_CKEY={ckey:x} ccap={ccap}");
-    }
-
-    lap("maps+keys");
     let Lookups { prod, cats, camp, channels, nc } = lk_handle.join().unwrap_or_else(|_| fallback("lookup thread"));
     lap("lookups");
     let ecap = ((ev_bytes / 64 + 4096 + BSIZE - 1) & !(BSIZE - 1)) as u64;
@@ -396,11 +349,12 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
         ws_mod: ws.rem_euclid(DAY_MS) as u64,
         day0: ws.div_euclid(DAY_MS) as i32,
         nd,
-        ukey,
-        ekey,
-        ckey,
-        ccap,
-        cpart: ckix_mode() == 2,
+        ukey: 0,
+        ekey: 0,
+        ckey: 0,
+        ccap: 0,
+        cpart: false,
+        ids: None,
         ecap,
         ucap,
         prod,
@@ -422,8 +376,8 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
         utab: anon(ucap as usize * 2) as *mut u16,
         claim: anon(ucap as usize / 8 + 64) as *const AtomicU64,
         csr_off: anon((ucap as usize + nub + 8) * 4) as *mut u32,
-        csr: anon(csr_cap(ccap, ck_bytes, lk_bytes) * 16) as *mut [u64; 2],
-        csr_cap: csr_cap(ccap, ck_bytes, lk_bytes),
+        csr: anon(csr_cap(0, ck_bytes, lk_bytes) * 16) as *mut [u64; 2],
+        csr_cap: csr_cap(0, ck_bytes, lk_bytes),
         csr_base: Vec::new(),
         ncsr: 0,
         uf: links::Uf::new(),
@@ -716,41 +670,12 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         0 => (2 * nt).clamp(2, 16),
         k => k.clamp(1, 64),
     };
-    let ks = nt.clamp(2, 8);
     let camps: Slot<(Vec<u8>, Vec<Vec<u8>>, usize)> = Slot::new();
     let ptxt: Slot<(usize, usize)> = Slot::new();
     let pparts: Vec<Slot<Option<(Vec<(u32, u8)>, Vec<Vec<u8>>)>>> = (0..kp).map(|_| Slot::new()).collect();
     let lookups: Slot<(Vec<u8>, Vec<Vec<u8>>)> = Slot::new();
     let rowcap: Slot<usize> = Slot::new();
     let cores: Vec<Slot<core::Core>> = (0..nt).map(|_| Slot::new()).collect();
-    let sbytes: Slot<(usize, usize)> = Slot::new();
-    let spieces: Vec<Slot<keyrec::Sample>> = (0..ks).map(|_| Slot::new()).collect();
-    let snext = AtomicUsize::new(0);
-    let cbytes: Slot<(usize, usize)> = Slot::new();
-    let crows: Slot<Vec<keyrec::ClickRow>> = Slot::new();
-    let ctaken = AtomicBool::new(false);
-    let click_sample = || {
-        if cbytes.done.load(Ordering::Acquire) && !ctaken.swap(true, Ordering::AcqRel) {
-            let (p, n) = *cbytes.get();
-            let mut s = keyrec::Sample::default();
-            s.add_click_lines(unsafe { std::slice::from_raw_parts(p as *const u8, n) }, CK_SAMPLE);
-            crows.set(s.clicks);
-        }
-    };
-    let sample_piece = |j: usize| {
-        let (p, n) = *sbytes.get();
-        let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, n) };
-        let (a, b) = piece(bytes, j, ks);
-        #[cfg(feature = "tl")]
-        let t0 = crate::sys::tl::now();
-        let mut s = keyrec::Sample::default();
-        s.add_event_lines(&bytes[a..b], 5000);
-        spieces[j].set(s);
-        #[cfg(feature = "tl")]
-        unsafe {
-            crate::sys::tl::TASK[48 + j.min(15)] = (t0, crate::sys::tl::now(), 0);
-        }
-    };
     let upart = crate::sys::SETUP_PARTS.load(Ordering::Relaxed);
     let npt = if upart { 1 } else { 0 };
     let (q_p, q_ord, q_merge, q_part) = (2, 2 + kp, 3 + kp, 4 + kp);
@@ -803,16 +728,6 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         }
     };
     let help = || {
-        click_sample();
-        if sbytes.done.load(Ordering::Acquire) {
-            loop {
-                let j = snext.fetch_add(1, Ordering::Relaxed);
-                if j >= ks {
-                    break;
-                }
-                sample_piece(j);
-            }
-        }
         let i = qnext.fetch_add(1, Ordering::Relaxed);
         if i < nq {
             task(i);
@@ -822,13 +737,8 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         }
     };
     let chain: Slot<(std::ptr::NonNull<u8>, Vec<FileInfo>, Vec<Chunk>, [usize; 3], u64, u64)> = Slot::new();
-    let keys: Slot<(u64, u64, u64, u64)> = Slot::new();
     run_par(nt, |tid| {
         if tid != 0 {
-            while help() {}
-            while !(sbytes.done.load(Ordering::Acquire) && cbytes.done.load(Ordering::Acquire)) && !keys.done.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
             while help() {}
             return;
         }
@@ -857,7 +767,6 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         }
         let region = ((region as usize + hpg - 1) & !(hpg - 1)) as *mut u8;
         unsafe { crate::parse::fds_init(all.len()) };
-        let ckix = ckix_mode() != 0;
         let mut files = Vec::with_capacity(all.len());
         let mut off = hpg;
         let mut bytes = [0usize; 3];
@@ -871,65 +780,9 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             files.push(FileInfo { kind: *kind, off, len: *len, hdr: usize::MAX });
             unsafe { crate::parse::set_fd(i, f) };
             off += (len + pg + hpg - 1) & !(hpg - 1);
-            if *kind == Kind::Ev && !sbytes.done.load(Ordering::Relaxed) {
-                let b = sample_bytes(unsafe { std::slice::from_raw_parts(region.add(files[i].off), *len) });
-                sbytes.set((b.as_ptr() as usize, b.len()));
-            }
-            if *kind == Kind::Ck && !cbytes.done.load(Ordering::Relaxed) {
-                if ckix {
-                    let b = sample_bytes(unsafe { std::slice::from_raw_parts(region.add(files[i].off), *len) });
-                    cbytes.set((b.as_ptr() as usize, b.len()));
-                } else {
-                    cbytes.set((region as usize, 0));
-                }
-            }
         }
         crate::parse::fault_around_check(region, &files);
         lap("s.mmap");
-        if !sbytes.done.load(Ordering::Relaxed) {
-            sbytes.set((region as usize, 0));
-        }
-        if !cbytes.done.load(Ordering::Relaxed) {
-            cbytes.set((region as usize, 0));
-        }
-        loop {
-            let j = snext.fetch_add(1, Ordering::Relaxed);
-            if j >= ks {
-                break;
-            }
-            sample_piece(j);
-        }
-        let mut sample = keyrec::Sample::default();
-        for p in &spieces {
-            sample.events.extend(p.take().events);
-        }
-        sample.events.truncate(5000);
-        for f in files.iter().filter(|f| f.kind == Kind::Ev).skip(1) {
-            if sample.events.len() >= 5000 {
-                break;
-            }
-            sample.add_event_lines(sample_bytes(unsafe { std::slice::from_raw_parts(region.add(f.off), f.len) }), 5000);
-        }
-        lap("s.sample");
-        let mut st = keyrec::Stats::default();
-        let envkey = |n: &str| if cfg!(feature = "testkeys") { std::env::var(n).ok().and_then(|v| u64::from_str_radix(&v, 16).ok()) } else { None };
-        let k = match (envkey("XL_UKEY"), envkey("XL_EKEY")) {
-            (Some(u), Some(e)) => (u, e),
-            _ => {
-                let Some(ukey) = keyrec::recover_user_key(&sample, &mut st) else { fallback("no user key") };
-                let Some(ekey) = keyrec::recover_event_key(&sample, ukey, Some(ws), &mut st) else { fallback("no event key") };
-                (ukey, ekey)
-            }
-        };
-        click_sample();
-        let mut ccap = click_cap(bytes[Kind::Ck as usize]);
-        let mut ckey = 0;
-        match click_key(crows.take(), k.0, ccap, &mut st) {
-            Some(x) => ckey = x,
-            None => ccap = 0,
-        }
-        keys.set((k.0, k.1, ckey, ccap));
-        lap("maps+keys");
         let total_bytes = bytes[0] + bytes[1] + bytes[2];
         let ch = (total_bytes / (nt * 16)).clamp(64 << 10, 2 << 20);
         let mut queue = Vec::new();
@@ -952,11 +805,6 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     let (region, files, queue, bytes, _, _) = chain.take();
     let region = region.as_ptr() as *const u8;
     let [ev_bytes, ck_bytes, lk_bytes] = bytes;
-    let (ukey, ekey, ckey, ccap) = keys.take();
-    if check {
-        eprintln!("[v2b] keys: XL_UKEY={ukey:x} XL_EKEY={ekey:x}");
-        eprintln!("[v2b] click key: XL_CKEY={ckey:x} ccap={ccap}");
-    }
     let (camp, channels, nc) = camps.take();
     let (prod, cats) = lookups.take();
     let row_cap = *rowcap.get();
@@ -992,11 +840,12 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         ws_mod,
         day0,
         nd,
-        ukey,
-        ekey,
-        ckey,
-        ccap,
-        cpart: ckix_mode() == 2,
+        ukey: 0,
+        ekey: 0,
+        ckey: 0,
+        ccap: 0,
+        cpart: false,
+        ids: None,
         ecap,
         ucap,
         prod,
@@ -1018,8 +867,8 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         utab: anon(ucap as usize * 2) as *mut u16,
         claim: anon(ucap as usize / 8 + 64) as *const AtomicU64,
         csr_off: anon((ucap as usize + nub + 8) * 4) as *mut u32,
-        csr: anon(csr_cap(ccap, ck_bytes, lk_bytes) * 16) as *mut [u64; 2],
-        csr_cap: csr_cap(ccap, ck_bytes, lk_bytes),
+        csr: anon(csr_cap(0, ck_bytes, lk_bytes) * 16) as *mut [u64; 2],
+        csr_cap: csr_cap(0, ck_bytes, lk_bytes),
         csr_base: Vec::new(),
         ncsr: 0,
         uf: links::Uf::new(),
