@@ -69,12 +69,14 @@ def fresh(path):
     path.mkdir(parents=True)
 
 
-def run(binary, data, label, *, timing=False):
+def run(binary, data, label, *, timing=False, cold=False):
     out, scratch = WORK / "outputs" / label, WORK / "scratch" / label
     fresh(out); fresh(scratch)
     env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out), SCRATCH_DIR=str(scratch), NCPU=NCPU)
     if timing:
         env["TIMING"] = "1"
+    if cold:
+        subprocess.run(['sudo', 'sh', '-c', 'sync; echo 3 > /proc/sys/vm/drop_caches'], check=False)
     started = time.perf_counter()
     result = subprocess.run([str(binary)], text=True, capture_output=True, env=env)
     elapsed = (time.perf_counter() - started) * 1000
@@ -133,14 +135,14 @@ def fixture_gate(binary, sha):
         compare(out, fx / "expected", f"{sha[:8]} fixture {fx.name}")
 
 
-def time_size(binaries, size, rounds):
+def time_size(binaries, size, rounds, cold=False):
     rows = []
     for number in range(rounds):
         order = TIMING[number % len(TIMING):] + TIMING[:number % len(TIMING)]
         row = {"round": number + 1, "order": order}
         for sha in order:
-            _, elapsed, laps = run(binaries[sha], HOME / f"v5-{size}", f"{size}-{number + 1}-{sha[:8]}", timing=True)
-            shutil.rmtree(WORK / "outputs" / f"{size}-{number + 1}-{sha[:8]}")
+            _, elapsed, laps = run(binaries[sha], HOME / f"v5-{size}", f"{size}{'c' if cold else ''}-{number + 1}-{sha[:8]}", timing=True, cold=cold)
+            shutil.rmtree(WORK / "outputs" / f"{size}{'c' if cold else ''}-{number + 1}-{sha[:8]}")
             row[sha] = (elapsed, laps)
         rows.append(row)
     return rows
@@ -175,7 +177,7 @@ def main():
                 parquet_equal(outputs[sha], outputs[base], f"{size} {sha} vs {base}")
         for output in outputs.values():
             shutil.rmtree(output)
-    results = {size: time_size(binaries, size, int(ROUNDS[size])) for size in ("20m", "60m")}
+    results = {f"{size}{mode}": time_size(binaries, size, int(ROUNDS[size]), cold=bool(mode)) for size in ("20m", "60m") for mode in ("", " COLD")}
     gate = "PASS" if not GATE_FAILURES else "FAIL — " + "; ".join(GATE_FAILURES)
     baselines = ", ".join(f"`{sha}`" for sha in GATE_BASELINES)
     lines = ["# gum v5 Intel gate and timing", "", f"- gate baselines: {baselines}", f"- candidates: {', '.join(CANDIDATES)}", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
