@@ -2,7 +2,7 @@ name: gum v5 Intel gate and timing
 
 on:
   push:
-    branches: [ci/gum]
+    branches: [ci/gum-evmem]
   workflow_dispatch:
 
 jobs:
@@ -23,6 +23,14 @@ jobs:
           grep -qw avx512f /proc/cpuinfo || { echo 'AVX-512F unavailable' >&2; exit 1; }
           test "$(nproc)" -ge 4 || { echo "need 4+ vCPUs, got $(nproc)" >&2; exit 1; }; echo "RUNNER_VCPUS=$(nproc)" >> "$GITHUB_ENV"
           echo NCPU=8 >> "$GITHUB_ENV"
+      - name: Record kernel huge-page policy and perf access
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "THP enabled: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>&1)"
+          echo "THP defrag:  $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>&1)"
+          echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid 2>&1)"
+          perf stat -e page-faults true || true
       - name: Install exact-check dependency
         run: python3 -m pip install --disable-pip-version-check polars
       - name: Build the supplied v5 generator and generate corpora
