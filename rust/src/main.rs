@@ -2457,6 +2457,9 @@ impl PartitionState {
                             best_click = Some(click);
                         }
                     }
+                    campaign = best_click.filter(|click| click.ts >= lower).map_or(organic, Click::campaign);
+                    // The credited cell is a likely cache miss; overlap it with the assist loop.
+                    prefetch_read(cd.as_ptr().wrapping_add(campaign * days + day_index).cast());
                     let mut i = 0;
                     while i < active.len() {
                         let c = active[i] as usize;
@@ -2468,7 +2471,6 @@ impl PartitionState {
                             i += 1;
                         }
                     }
-                    campaign = best_click.filter(|click| click.ts >= lower).map_or(organic, Click::campaign);
                 }
                 let total = &mut cd[campaign * days + day_index];
                 total[0] += 1;
@@ -2581,6 +2583,8 @@ struct EventBucket {
 struct EventBuckets {
     by_time: Vec<EventBucket>,
     used: Vec<usize>,
+    /// Occupied buckets as a bitmap, so `used` comes out ordered without a sort.
+    occupied: [u64; MAX_EVENT_BUCKETS.div_ceil(64)],
     purchases: Vec<(u32, usize)>,
 }
 
@@ -2600,7 +2604,7 @@ impl EventBuckets {
             if bucket.count == 0 {
                 bucket.first = time;
                 bucket.last = time;
-                self.used.push(index);
+                self.occupied[index / 64] |= 1 << (index % 64);
             } else {
                 bucket.first = bucket.first.min(time);
                 bucket.last = bucket.last.max(time);
@@ -2612,7 +2616,13 @@ impl EventBuckets {
                 bucket.purchase = self.purchases.len();
             }
         }
-        self.used.sort_unstable();
+        for (word_index, word) in self.occupied.iter_mut().enumerate() {
+            let mut bits = std::mem::take(word);
+            while bits != 0 {
+                self.used.push(word_index * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
     }
 
     fn aggregate(&self, index: usize, sums: &mut [i64], touched: &mut Vec<u32>) -> (i64, i64) {
