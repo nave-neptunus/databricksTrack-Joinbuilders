@@ -2307,7 +2307,11 @@ fn pt<I, T: Send>(items: impl ParallelIterator<Item = I>, init: impl Fn() -> T +
 
 struct PartitionState {
     cd: Vec<[i64; 4]>,
-    counts: Vec<usize>,
+    /// Timestamp of the latest click observed for a campaign.  The active
+    /// list below is the validity bit: it makes timestamp zero unambiguous
+    /// and lets attribution expire a campaign without walking every click in
+    /// its seven-day window.
+    latest_click: Vec<u32>,
     in_active: Vec<bool>,
     active: Vec<u32>,
     catsum: Vec<i64>,
@@ -2331,7 +2335,7 @@ impl PartitionState {
     fn new(campaigns: usize, days: usize, categories: usize, user: user_parquet::UserParquet) -> Self {
         Self {
             cd: vec![[0; 4]; campaigns * days],
-            counts: vec![0; campaigns],
+            latest_click: vec![0; campaigns],
             in_active: vec![false; campaigns],
             active: Vec::new(),
             catsum: vec![0; categories],
@@ -2412,7 +2416,7 @@ impl PartitionState {
         organic: usize,
     ) {
         let Self {
-            cd, counts, in_active, active, catsum, touched_categories,
+            cd, latest_click, in_active, active, catsum, touched_categories,
             event_ends, click_ends, events, clicks, gather: _, event_scratch, click_scratch, buckets,
             user, user_rows,
         } = self;
@@ -2431,27 +2435,47 @@ impl PartitionState {
                 user.append(name, row, categories.get(category as usize).copied());
                 *user_rows += 1;
             };
-            let (mut lo, mut hi, mut best_click) = (0, 0, None::<Click>);
+            // Events without clicks account for the bulk of the input.  They
+            // cannot produce assists or a non-organic winner, so avoid
+            // setting up and walking attribution state for every session.
+            // The per-partition campaign/day array is still updated directly.
+            if clicks.is_empty() {
+                let mut credit_organic = |_, session_day, revenue| {
+                    let day_index = (session_day - day0) as usize;
+                    let total = &mut cd[organic * days + day_index];
+                    total[0] += 1;
+                    total[1] += i64::from(revenue > 0);
+                    total[2] += revenue;
+                };
+                aggregate_event_sessions(
+                    events, origin, catsum, touched_categories, event_scratch, buckets,
+                    write_day, &mut credit_organic,
+                );
+                continue;
+            }
+            // A campaign contributes an assist once per session, no matter
+            // how many clicks it has in the lookback window.  Keeping only
+            // its latest consumed click is sufficient: clicks are timestamp
+            // sorted, so it is in-window exactly when it is no older than
+            // this session's start.  This replaces the old per-click counts
+            // and the retirement scan over their leading edge.
+            let (mut hi, mut best_click) = (0, None::<Click>);
             let mut attribute = |start, session_day, revenue| {
                 let time = start + LOOK as u32;
                 let day_index = (session_day - day0) as usize;
                 let lower = start;
-                while lo < hi && clicks[lo].ts < lower {
-                    counts[clicks[lo].campaign()] -= 1;
-                    lo += 1;
-                }
                 while let Some(&click) = clicks.get(hi) {
                     if click.ts > time {
                         break;
                     }
                     hi += 1;
                     if click.ts < lower {
-                        // This click has already expired before its first session.
-                        lo += 1;
+                        // This click has already expired before its first
+                        // session, and every earlier click is irrelevant.
                         continue;
                     }
                     let campaign = click.campaign();
-                    counts[campaign] += 1;
+                    latest_click[campaign] = click.ts;
                     if !in_active[campaign] {
                         in_active[campaign] = true;
                         active.push(campaign as u32);
@@ -2462,7 +2486,7 @@ impl PartitionState {
                 }
                 active.retain(|&campaign| {
                     let c = campaign as usize;
-                    if counts[c] == 0 {
+                    if latest_click[c] < lower {
                         in_active[c] = false;
                         false
                     } else {
@@ -2477,34 +2501,61 @@ impl PartitionState {
                 total[2] += revenue;
             };
 
-            if events.len() < BUCKET_MIN_LEN {
-                sort_events(events, event_scratch);
-                aggregate_sessions(
-                    events, origin, catsum, touched_categories,
-                    |event| {
-                        let time = (event >> 32) as u32;
-                        (time, time)
-                    },
-                    |event, sums, touched| (1, add_purchase(event as u32, sums, touched)),
-                    write_day, &mut attribute,
-                );
-            } else {
-                buckets.build(events);
-                aggregate_sessions(
-                    &buckets.used, origin, catsum, touched_categories,
-                    |index| {
-                        let b = &buckets.by_time[index];
-                        (b.first, b.last)
-                    },
-                    |index, sums, touched| buckets.aggregate(index, sums, touched),
-                    write_day, &mut attribute,
-                );
-            }
+            aggregate_event_sessions(
+                events, origin, catsum, touched_categories, event_scratch, buckets,
+                write_day, &mut attribute,
+            );
             for campaign in active.drain(..) {
-                counts[campaign as usize] = 0;
                 in_active[campaign as usize] = false;
             }
         }
+    }
+}
+
+/// Aggregate one person's events.  Keeping this separate lets the no-click
+/// case compile to a tiny organic-only credit callback while both paths retain
+/// the same dense event/day accumulation and user-day emission.
+#[inline]
+fn aggregate_event_sessions(
+    events: &mut [u64],
+    origin: i64,
+    catsum: &mut [i64],
+    touched: &mut Vec<u32>,
+    event_scratch: &mut Vec<u64>,
+    buckets: &mut EventBuckets,
+    write_day: impl FnMut(&UserDay, &mut [i64], &mut Vec<u32>),
+    credit: impl FnMut(u32, i64, i64),
+) {
+    if events.len() < BUCKET_MIN_LEN {
+        sort_events(events, event_scratch);
+        aggregate_sessions(
+            events,
+            origin,
+            catsum,
+            touched,
+            |event| {
+                let time = (event >> 32) as u32;
+                (time, time)
+            },
+            |event, sums, touched| (1, add_purchase(event as u32, sums, touched)),
+            write_day,
+            credit,
+        );
+    } else {
+        buckets.build(events);
+        aggregate_sessions(
+            &buckets.used,
+            origin,
+            catsum,
+            touched,
+            |index| {
+                let b = &buckets.by_time[index];
+                (b.first, b.last)
+            },
+            |index, sums, touched| buckets.aggregate(index, sums, touched),
+            write_day,
+            credit,
+        );
     }
 }
 
