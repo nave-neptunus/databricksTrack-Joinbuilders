@@ -2018,7 +2018,7 @@ macro_rules! cl_ms {
             "vpcmpeqb ymm1, ymm12, ymmword ptr [", $a, " + 32]\n",
             "vpmovmskb ", $nlout, ", ymm1\n",
             "tzcnt ", $nlout, ", ", $nlout, "\n",
-            "prefetcht0 byte ptr [", $a, " + {PFD}]\n",
+            "prefetcht0 byte ptr [", $a, " + {CL_PFD}]\n",
             "mov qword ptr [rsp + ", $slot, "], ", $b, "\n",
             "tzcnt r8d, ", $cin, "\n",
             "blsr ", $cin, ", ", $cin, "\n",
@@ -2200,7 +2200,7 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
             out("k1") _,
             T = sym T, CTS = sym CTS, CAMP = sym CAMP5R,
             KID1 = const O_KID1, UID1 = const O_UID1M,
-            CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR, PFD = const PFD,
+            CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR, CL_PFD = const 2048,
         );
     }
     (code, np, nw)
