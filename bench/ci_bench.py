@@ -8,6 +8,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 HOME = Path(sys.argv[1]).resolve()
@@ -132,8 +133,18 @@ def time_size(binaries, size, rounds):
 
 
 def stages(rows, sha):
-    keys = sorted({name for row in rows for _, name in row[sha][1]})
-    return {key: statistics.median(next((ms for ms, name in row[sha][1] if name == key), 0.0) for row in rows) for key in keys}
+    samples = defaultdict(list)
+    for row in rows:
+        previous = 0.0
+        for elapsed, label in row[sha][1]:
+            name = label.removeprefix("  ")
+            if name.startswith(("links: ", "merged: ")):
+                name = name.split(": ", 1)[0]
+            if name.startswith("events parsed ("):
+                name = "events parsed"
+            samples[name].append((elapsed - previous, elapsed))
+            previous = elapsed
+    return {name: tuple(statistics.median(values) for values in zip(*times)) for name, times in samples.items()}
 
 
 def main():
@@ -166,11 +177,21 @@ def main():
         lines += [f"## {size} ({len(rows)} interleaved rounds)", "", "| round | order | " + " | ".join(s[:8] for s in TIMING) + " |", "|---:|---|" + "---:|" * len(TIMING)]
         for row in rows:
             lines.append(f"| {row['round']} | {' → '.join(s[:8] for s in row['order'])} | " + " | ".join(f"{row[s][0]:.1f} ms" for s in TIMING) + " |")
-        lines += ["", "| SHA | median wall ms | stage laps (median ms) |", "|---|---:|---|"]
+        lines += ["", "| SHA | median wall ms |", "|---|---:|"]
         for sha in TIMING:
             med = statistics.median(row[sha][0] for row in rows)
-            stage_text = "; ".join(f"{k}: {v:.1f}" for k, v in stages(rows, sha).items()) or "(no laps)"
-            lines.append(f"| `{sha}` | {med:.1f} | {stage_text} |")
+            lines.append(f"| `{sha}` | {med:.1f} |")
+        by_sha = {sha: stages(rows, sha) for sha in TIMING}
+        stage_names = dict.fromkeys(name for sha in reversed(TIMING) for name in by_sha[sha])
+        lines += ["", "TIMING=1 median stage / cumulative milliseconds", "",
+                  "| Stage | " + " | ".join(s[:8] for s in TIMING) + " |",
+                  "|---|" + "---:|" * len(TIMING)]
+        for name in stage_names:
+            values = [
+                f"{samples[name][0]:.1f} / {samples[name][1]:.1f}" if name in samples else "—"
+                for samples in by_sha.values()
+            ]
+            lines.append(f"| {name} | " + " | ".join(values) + " |")
         lines.append("")
     (WORK / "summary.md").write_text("\n".join(lines))
     (WORK / "observations.json").write_text(json.dumps(results, indent=2))

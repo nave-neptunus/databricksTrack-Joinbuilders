@@ -1,5 +1,6 @@
 {
   "baseline": "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed",
+  "additional_gate_baselines": ["6da0386b4ca6a001a5c7f747c68f40815fc14afb"],
   "candidate": "8414b255224e9e0631ec72a9f03643d67f656ec3",
   "timing": [
     "6da0386b4ca6a001a5c7f747c68f40815fc14afb",
