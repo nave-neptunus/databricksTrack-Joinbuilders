@@ -1855,7 +1855,7 @@ fn build_links(
     let names_addr = names.as_mut_ptr() as usize;
     let shard_meta: Vec<(u32, usize)> = starts.iter().copied().zip(widths).collect();
     let mut shards: Vec<ShardLinks> = table.slots.par_chunks_mut(range_len)
-        .zip(buckets.par_iter_mut())
+        .zip(buckets.as_mut_slice().par_iter_mut())
         .zip(shard_meta.into_par_iter())
         .enumerate()
         .map(|(shard, ((slots, bucket), (start, width)))| {
@@ -1883,9 +1883,10 @@ fn build_links(
                     spilled = true;
                     break;
                 }
-                match claim_link(&mut table.slots, (end.key as usize) & table_mask, table_mask, true, &end, node, &mut names, 0, &mut spilled) {
+                let claim = claim_link(&mut table.slots, (end.key as usize) & table_mask, table_mask, true, &end, node, &mut names, 0, &mut spilled);
+                match claim {
                     LinkClaim::Fresh(at) => {
-                        slot_nodes[at >> shift].push((at as u32, node));
+                        slot_nodes[at >> (shift as usize)].push((at as u32, node));
                         next[shard] = node + 1;
                         shards[shard].flat[idx as usize].key = u64::from(node);
                     }
