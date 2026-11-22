@@ -14,9 +14,6 @@ const INVALID: u32 = u32::MAX;
 /// Seed for the 63-bit hash key of a long event ID. The full bytes are carried
 /// alongside it and compared by dedup, so a collision cannot merge events.
 const EVENT_ID_SEED: u64 = 0x1319_8a2e_0370_7344;
-/// Marks the claim that carries the full bytes of the preceding long event ID.
-/// Real ingest orders equal to this value decline the fast path.
-const CARRIER: i32 = i32::MIN;
 /// Seed for the key of a long user ID (one that has no packed short key).
 const USER_ID_SEED: u64 = 0x082e_fa98_ec4e_6c89;
 
@@ -239,6 +236,32 @@ struct Claim {
     loc: u32,
 }
 const _: () = assert!(size_of::<Claim>() == 16);
+
+/// A long event ID's claim in one record. `eref` packs the pointer and length
+/// of the full ID bytes that produced the hash `key`; dedup compares them
+/// whenever two keys are equal, so a hash collision cannot merge events.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LongClaim {
+    key: u64,
+    eref: u64,
+    ingest: i32,
+    loc: u32,
+}
+const _: () = assert!(size_of::<LongClaim>() == 24);
+
+/// One worker's claims. Long IDs live in their own streams, so short claims
+/// stay 16 bytes and no record has to be paired with its neighbor.
+struct Folds {
+    short: Streams<Claim, SHARDS>,
+    long: Streams<LongClaim, SHARDS>,
+}
+
+impl Folds {
+    fn new() -> Self {
+        Self { short: Streams::new(), long: Streams::new() }
+    }
+}
 
 const LOC_INDEX_BITS: u32 = 28 - PB;
 const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
@@ -718,6 +741,7 @@ struct Parser<'a, 'catalog, 'table> {
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Claim, SHARDS>,
+    long: Streams<LongClaim, SHARDS>,
     people: PeopleWriter<'a>,
     worker: u32,
 }
@@ -749,11 +773,11 @@ impl Parser<'_, '_, '_> {
                 NO_LOC
             };
             let shard = (pending.key >> 55) as u8 as usize;
-            self.streams.push(shard, Claim { key: pending.key, ingest: pending.ingest, loc });
             if pending.eref != 0 {
-                // The carrier is next in this very stream, so dedup can pair it
-                // with the claim above without any cross-stream bookkeeping.
-                self.streams.push(shard, Claim { key: pending.eref, ingest: CARRIER, loc: 0 });
+                let (key, eref, ingest) = (pending.key, pending.eref, pending.ingest);
+                self.long.push(shard, LongClaim { key, eref, ingest, loc });
+            } else {
+                self.streams.push(shard, Claim { key: pending.key, ingest: pending.ingest, loc });
             }
         }
         self.count = 0;
@@ -790,11 +814,6 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.declined.store(true, Relaxed);
             return;
         };
-        if order == CARRIER {
-            // This value is reserved for the full-ID carrier claim.
-            self.declined.store(true, Relaxed);
-            return;
-        }
         let mut pending = Pending::EMPTY;
         pending.key = key;
         pending.eref = eref;
@@ -855,7 +874,7 @@ fn events(
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
-) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
+) -> (Vec<Folds>, Vec<People>) {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
@@ -881,6 +900,7 @@ fn events(
                 batch: [Pending::EMPTY; 16],
                 count: 0,
                 streams: Streams::new(),
+                long: Streams::new(),
                 people: PeopleWriter::new(&mut people),
                 worker,
             };
@@ -894,7 +914,7 @@ fn events(
             }
             parser.flush();
             parser.people.finish();
-            parser.streams
+            Folds { short: parser.streams, long: parser.long }
         };
         (worker, streams, people)
     });
@@ -910,7 +930,6 @@ fn events(
     (streams, people)
 }
 
-type ClaimStream = Streams<Claim, SHARDS>;
 
 // One 16-byte cell holds the full event key, the winning ingest time and the
 // location of the payload parse already wrote into its final person partition.
@@ -960,9 +979,10 @@ impl Router {
         people[worker].get(part, index).ts.store(INVALID, Relaxed);
     }
 
-    fn route(&mut self, people: &[People], claims: &[ClaimStream], shard: usize) {
+    fn route(&mut self, people: &[People], claims: &[Folds], shard: usize) {
         let begin = std::time::Instant::now();
-        let count: usize = claims.iter().map(|fold| fold.len(shard)).sum();
+        // Every record is one logical claim, so physical counts size the table.
+        let count: usize = claims.iter().map(|fold| fold.short.len(shard) + fold.long.len(shard)).sum();
         if count == 0 {
             return;
         }
@@ -983,46 +1003,64 @@ impl Router {
         // Dedup only chooses the earliest-ingest copy and tombstones losers,
         // so there is no scatter pass and no second traversal of event data.
         for fold in claims {
-            // A long key is followed in the same stream by its full-ID carrier.
-            // Hold it until that carrier arrives, then route the pair together.
-            let mut carried: Option<Claim> = None;
-            for block in fold.chunks(shard) {
-                for (offset, entry) in block.iter().enumerate() {
+            for block in fold.short.chunks(shard) {
+                for (offset, claim) in block.iter().enumerate() {
                     if let Some(next) = block.get(offset + 8) {
-                        if next.ingest != CARRIER {
-                            crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
-                        }
+                        crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
                     }
-                    let (claim, eref) = match carried.take() {
-                        Some(claim) => (claim, entry.key),
-                        None if entry.key & SHORT_KEY == 0 => {
-                            carried = Some(*entry);
-                            continue;
-                        }
-                        None => (*entry, 0),
-                    };
                     let meta = generation | ((claim.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
                     let mut slot = claim.key as usize & mask;
                     loop {
                         let winner = self.slots[slot];
                         if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
                             self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
-                            self.refs[slot] = eref;
+                            break;
+                        }
+                        // A long ID's key has the short tag bit clear, so it
+                        // can never equal a short key; refs are read only
+                        // for long slots, which always set them.
+                        if winner.key == claim.key {
+                            let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
+                            if claim.ingest < previous {
+                                Self::tombstone(people, winner.loc);
+                                self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
+                            } else {
+                                Self::tombstone(people, claim.loc);
+                            }
+                            break;
+                        }
+                        slot = (slot + 1) & mask;
+                    }
+                }
+            }
+        }
+        for fold in claims {
+            for block in fold.long.chunks(shard) {
+                for (offset, claim) in block.iter().enumerate() {
+                    if let Some(next) = block.get(offset + 8) {
+                        crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
+                    }
+                    let meta = generation | ((claim.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
+                    let mut slot = claim.key as usize & mask;
+                    loop {
+                        let winner = self.slots[slot];
+                        if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
+                            self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
+                            self.refs[slot] = claim.eref;
                             break;
                         }
                         // Equal hashes identify one event only when the full
                         // byte strings agree. Different IDs with the same hash
                         // keep probing, just as table collisions always have.
                         if winner.key == claim.key
-                            && (eref == 0
-                                || self.refs[slot] == eref
-                                || crate::unpack_ref(self.refs[slot]) == crate::unpack_ref(eref))
+                            && (self.refs[slot] == claim.eref
+                                || crate::unpack_ref(self.refs[slot]) == crate::unpack_ref(claim.eref))
                         {
                             let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
                             if claim.ingest < previous {
                                 Self::tombstone(people, winner.loc);
                                 self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
-                                self.refs[slot] = eref;
+                                self.refs[slot] = claim.eref;
                             } else {
                                 Self::tombstone(people, claim.loc);
                             }
@@ -1088,7 +1126,7 @@ mod tests {
 
     fn place_long(
         people: &mut PeopleWriter<'_>,
-        claims: &mut [ClaimStream],
+        claims: &mut [Folds],
         key: u64,
         eref: u64,
         ingest: i32,
@@ -1099,8 +1137,7 @@ mod tests {
         let part = person as usize & (P - 1);
         let index = people.push(part, person, ts, price);
         let loc = ((part as u32) << LOC_PART_SHIFT) | index as u32;
-        claims[0].push(0, Claim { key, ingest, loc });
-        claims[0].push(0, Claim { key: eref, ingest: CARRIER, loc: 0 });
+        claims[0].long.push(0, LongClaim { key, eref, ingest, loc });
     }
 
     fn live_rows(people: &People, part: usize) -> Vec<(u32, u32)> {
@@ -1129,7 +1166,7 @@ mod tests {
         let key = 0x0123_4567_89ab_cdefu64 & (u64::MAX >> 1);
         let mut people = [People::new(32)];
         let mut writer = PeopleWriter::new(&mut people[0]);
-        let mut claims = vec![ClaimStream::new()];
+        let mut claims = vec![Folds::new()];
         place_long(&mut writer, &mut claims, key, crate::pack_ref(a).unwrap(), 10, 3, 100, 1);
         place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
         writer.finish();
@@ -1145,7 +1182,7 @@ mod tests {
         let key = crate::hs(a, EVENT_ID_SEED).0 & (u64::MAX >> 1);
         let mut people = [People::new(32)];
         let mut writer = PeopleWriter::new(&mut people[0]);
-        let mut claims = vec![ClaimStream::new()];
+        let mut claims = vec![Folds::new()];
         place_long(&mut writer, &mut claims, key, crate::pack_ref(a).unwrap(), 30, 3, 300, 3);
         place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 10, 3, 100, 1);
         place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
@@ -1158,7 +1195,7 @@ mod tests {
     fn router_keeps_earliest_invalid_and_changed_person_copies() {
         fn place(
             people: &mut PeopleWriter<'_>,
-            claims: &mut [ClaimStream],
+            claims: &mut [Folds],
             worker: u32,
             key: u64,
             ingest: i32,
@@ -1174,14 +1211,14 @@ mod tests {
                 (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
             };
             // Short keys carry SHORT_KEY in production; route only that shard here.
-            claims[worker as usize].push(0, Claim { key: key | SHORT_KEY, ingest, loc });
+            claims[worker as usize].short.push(0, Claim { key: key | SHORT_KEY, ingest, loc });
         }
 
         let mut people = [People::new(32), People::new(1)];
         let [first, second] = &mut people;
         let mut first = PeopleWriter::new(first);
         let mut second = PeopleWriter::new(second);
-        let mut claims = vec![ClaimStream::new(), ClaimStream::new()];
+        let mut claims = vec![Folds::new(), Folds::new()];
         // Exercise full lines, overflow, a partial final batch and a claim block boundary.
         for i in 0..300u64 {
             place(&mut first, &mut claims, 0, i + 1, 20, 3, 10, 1);
