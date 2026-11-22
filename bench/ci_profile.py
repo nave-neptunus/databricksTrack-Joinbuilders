@@ -15,6 +15,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SAMPLE_HEAD = re.compile(r"^\s*\d+\s+[\d.]+:\s+(\d+)\b")
 REQUEST = json.loads((ROOT / "bench/request.json").read_text())
 EVENTS = (
     "task-clock,cycles,instructions,cache-misses,LLC-load-misses,"
@@ -154,6 +155,52 @@ def perf_stat(work, evidence, data, sha):
     return metrics
 
 
+def attribute_callers(evidence, record, total):
+    """Aggregate DWARF call chains: who calls interning and the unresolved libc code."""
+    frame = re.compile(r"^\s+[0-9a-f]+\s+(.*?)\s+\(([^)]*)\)\s*$")
+    groups = {"intern": Counter(), "libc": Counter(), "person": Counter()}
+    proc = subprocess.Popen(["perf", "script", "-i", record, "-F", "tid,time,period,ip,sym,dso",
+                             "--max-stack", "12"], stdout=subprocess.PIPE, text=True)
+    def flush(period, frames):
+        if not frames:
+            return
+        leaf, dso = frames[0]
+        if "ExactIds>::intern" in leaf:
+            name = "intern"
+        elif dso.endswith("libc.so.6"):
+            name = "libc"
+        elif "Users>::person" in leaf:
+            name = "person"
+        else:
+            return
+        chain = []
+        for sym, d in frames[1:]:
+            if sym == leaf or (name == "libc" and d.endswith("libc.so.6")):
+                continue
+            chain.append(sym[:90])
+            if len(chain) == 4:
+                break
+        groups[name][(leaf[:60], *chain)] += period
+    period, frames = 0, []
+    for line in proc.stdout:
+        match = SAMPLE_HEAD.match(line)
+        if match:
+            flush(period, frames)
+            period, frames = int(match[1]), []
+            continue
+        found = frame.match(line)
+        if found:
+            frames.append((found[1], found[2]))
+    flush(period, frames)
+    proc.wait()
+    with (evidence / "callers.txt").open("w") as out:
+        for name, counter in groups.items():
+            out.write(f"== {name}: {100 * counter.total() / total:.2f}% of samples\n")
+            for chain, weight in counter.most_common(25):
+                out.write(f"{100 * weight / total:6.2f}%  " + "  <-  ".join(chain) + "\n")
+    print((evidence / "callers.txt").read_text()[:6000], flush=True)
+
+
 def summarize_samples(evidence, label, record, profile, event, detailed):
     # The producer and perf use CLOCK_MONOTONIC. The earliest consistent
     # receipt minus the Rust lap avoids positive reader scheduling delays.
@@ -215,6 +262,7 @@ def summarize_samples(evidence, label, record, profile, event, detailed):
                             "--stdio", "-i", record], stdout=report, check=True)
         print("\n".join((evidence / "perf-report.txt").read_text().splitlines()[:150]),
               flush=True)
+        attribute_callers(evidence, record, total)
         with (evidence / "perf-srcline.txt").open("w") as report:
             subprocess.run(["perf", "report", "--no-children", "--percent-limit", "0",
                             "--stdio", "--sort", "symbol,srcline", "-i", record],

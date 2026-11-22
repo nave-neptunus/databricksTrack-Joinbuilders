@@ -69,7 +69,7 @@ jobs:
           retention-days: 7
 
       - name: Profile v5 seed 17 at 60M
-        if: ${{ !cancelled() && env.PROFILE_ROOT != '' }}
+        if: ${{ false }}
         shell: bash
         run: |
           set -euo pipefail
