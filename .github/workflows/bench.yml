@@ -1,236 +1,89 @@
-name: g7 x86 benchmark
+name: g7 v5 60M Intel benchmark
 
 on:
   push:
-    branches: [g7/bench-run, g7/bench-run2]
-
-env:
-  DATA_SEED: "3"
+    branches: [g7/bench-v5]
 
 jobs:
-  # Each x86 image is compiled once; benchmark jobs load these immutable images.
-  build-images:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { label: baseline, ref: ed40599 }
-          - { label: core-purchase, ref: 88a2088 }
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - name: Build ${{ matrix.ref }} once for linux/amd64
-        env:
-          REF: ${{ matrix.ref }}
-          LABEL: ${{ matrix.label }}
-          COMBINED: ${{ matrix.combined }}
-          FAST_FEATURES: ${{ matrix.fast_features }}
-        run: |
-          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          if [ "$COMBINED" = "true" ]; then
-            # Bench-only synthetic merge; neither implementation branch is pushed.
-            git config user.name bench-ci
-            git config user.email bench-ci@local.invalid
-            git switch -C g7/bench-stack1-lanes8 ed40599
-            git merge --no-edit 6fafb87
-            git merge --no-edit 96572eb
-            SHA=$(git rev-parse HEAD)
-          else
-            SHA=$(git rev-parse "$REF^{commit}")
-          fi
-          echo "Building $SHA as g7-bench-$LABEL"
-          if [ -n "$FAST_FEATURES" ]; then
-            work=$(mktemp -d)
-            git archive --format=tar "$SHA" | tar -x -C "$work"
-            sed -i '/^WORKDIR \/src$/a ARG FAST_FEATURES=""' "$work/Dockerfile"
-            sed -i 's/cargo build --release --target x86_64-unknown-linux-musl/cargo build --release --target x86_64-unknown-linux-musl $FAST_FEATURES/' "$work/Dockerfile"
-            docker build --platform linux/amd64 --build-arg FAST_FEATURES="$FAST_FEATURES" --load --tag "g7-bench-$LABEL" "$work"
-          else
-            git archive --format=tar "$SHA" | docker build --platform linux/amd64 --load --tag "g7-bench-$LABEL" -
-          fi
-          docker save "g7-bench-$LABEL" | zstd -T0 -3 -o "$RUNNER_TEMP/g7-bench-$LABEL.tar.zst"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: image-${{ matrix.label }}
-          path: ${{ runner.temp }}/g7-bench-${{ matrix.label }}.tar.zst
-          retention-days: 1
-
   benchmark:
-    needs: build-images
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { label: core-purchase, candidate_ref: 88a2088, image: core-purchase, setting: '', run_tests: 'false', pairs: '8' }
-          # XL_ENDREL=1 is default conditional behavior; 2 actually forces release.
-          # 5f08834 only fixes test data; 74d051a is the identical engine timed below.
-    env:
-      BASELINE_REF: ${{ matrix.baseline_ref || 'ed40599' }}
-      CANDIDATE_REF: ${{ matrix.candidate_ref }}
-      CANDIDATE_LABEL: ${{ matrix.candidate_label }}
-      CANDIDATE_ENV: ${{ matrix.setting }}
-      BASELINE_IMAGE: g7-bench-${{ matrix.baseline_image || 'baseline' }}
-      CANDIDATE_IMAGE: g7-bench-${{ matrix.image }}
-      PAIRS: ${{ matrix.pairs || '10' }}
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Intel AVX-512 capability and thread count
+      - name: Require Intel AVX-512 and pin eight vCPUs
         run: |
           lscpu
-          free -h
-          df -h /
           if ! grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || ! grep -qw avx512f /proc/cpuinfo; then
             echo 'Intel AVX512F=no; refusing non-representative run' >&2
             exit 1
           fi
-          echo 'Intel AVX512F=yes'
-          echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
-          printf 'THP: '; cat /sys/kernel/mm/transparent_hugepage/enabled
-      - name: Fetch pinned benchmark support
-        id: generator
+          have=$(nproc)
+          if [ "$have" -ge 8 ]; then use=8; else use=$have; fi
+          echo "NCPU=$use" >> "$GITHUB_ENV"
+          echo "RUNNER_VCPUS=$have" >> "$GITHUB_ENV"
+      - name: Fetch fixtures and comparator only
         run: |
           git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
-          echo "tree=$(git rev-parse origin/ci-bench:generator)" >> "$GITHUB_OUTPUT"
-          git checkout origin/ci-bench -- generator fixtures scripts
-      - name: Run candidate unit tests on this Intel AVX-512 runner
-        if: matrix.run_tests == 'true'
-        env:
-          TEST_REF: ${{ matrix.test_ref || matrix.candidate_ref }}
-          KNOWN_TEST_FAILURE: ${{ matrix.known_test_failure }}
-        run: |
-          run_test() {
-            ref="$1"
-            testdir="$RUNNER_TEMP/candidate-test-$ref"
-            mkdir -p "$testdir"
-            git archive --format=tar "$ref" | tar -x -C "$testdir"
-            (cd "$testdir" && cargo test --locked)
-          }
-          if [ "$KNOWN_TEST_FAILURE" = "true" ]; then
-            mkdir -p "$HOME/g7-bench/logs"
-            set +e
-            run_test ed40599 >"$HOME/g7-bench/logs/baseline-cargo-test.txt" 2>&1
-            base_status=$?
-            run_test "$TEST_REF" >"$HOME/g7-bench/logs/candidate-cargo-test.txt" 2>&1
-            candidate_status=$?
-            set -e
-            test "$base_status" -ne 0
-            test "$candidate_status" -ne 0
-            grep -q 'ck_vec_matches_scalar' "$HOME/g7-bench/logs/baseline-cargo-test.txt"
-            grep -q 'ck_vec_matches_scalar' "$HOME/g7-bench/logs/candidate-cargo-test.txt"
-            echo "confirmed inherited ck_vec_matches_scalar test-data failure in baseline and candidate"
-          else
-            run_test "$TEST_REF"
-          fi
-      - name: Restore 20M corpus cache
-        id: corpus
-        uses: actions/cache@v4
-        with:
-          path: ~/big20
-          key: big20-${{ runner.os }}-seed${{ env.DATA_SEED }}-${{ steps.generator.outputs.tree }}
-      - run: python3 -m pip install --quiet polars
-      - name: Generate 20M corpus on a cache miss
-        if: steps.corpus.outputs.cache-hit != 'true'
+          git checkout origin/ci-bench -- fixtures scripts bench/ci_bench.py
+      - name: Build v5 generator and create seed-17 60M corpus
         run: |
           cargo build --release --locked --manifest-path generator/Cargo.toml
-          generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
-      - name: Prepare image directory
-        run: mkdir -p "$RUNNER_TEMP/images"
-      - uses: actions/download-artifact@v4
-        with:
-          name: image-baseline
-          path: ${{ runner.temp }}/images/baseline
-      - uses: actions/download-artifact@v4
-        with:
-          name: image-${{ matrix.image }}
-          path: ${{ runner.temp }}/images/candidate
-      - name: Load baseline and candidate
+          generator/target/release/generate --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/big60" --threads "$NCPU"
+          du -sh "$HOME/big60"
+      - name: Build baseline and candidates
         run: |
-          for archive in "$RUNNER_TEMP"/images/*/*.tar.zst; do zstd -dc "$archive" | docker load; done
-          docker image ls --format '{{.Repository}}:{{.Tag}}'
-      - name: Gate and 10 alternating warm pairs (${{ matrix.label }})
-        run: python3 bench/ci_bench.py "$HOME/big20" "$HOME/g7-bench" 2>&1 | tee "$HOME/g7-bench.log"
-      - if: always()
-        run: cat "$HOME/g7-bench/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: result-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |-
-            ~/g7-bench.log
-            ~/g7-bench/summary.md
-            ~/g7-bench/observations.json
-            ~/g7-bench/logs/**
-          retention-days: 7
-
-  profile-baseline:
-    if: false
-    needs: build-images
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - name: Intel AVX-512 capability and thread count
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          for spec in \
+            baseline:ed40599 \
+            s60-ev3a-lpt:c26ce00f384baad7461ec9232a3cf618c6c40344 \
+            s60-cx-reserve:d60f04e3f237d058288910dba29374ee86bd54e8 \
+            s60-uf-parent:285050fa5798b7c452f959160015174a32e2abe6 \
+            io-readahead:4b419d7f1ad8ceff04160f21f3d0e76db72bac17 \
+            io-readahead-s1:8dade0009da3851f675f0b4a48fed7b27586ff0e \
+            stack1:96572eb5bd532675e025554369d69f4266f03685
+          do
+            label=${spec%%:*}; sha=${spec#*:}
+            git archive --format=tar "$sha" | docker build --platform linux/amd64 --load --tag "g7-v5-$label" -
+          done
+      - name: Baseline v5 fast-path report
         run: |
-          lscpu
-          if ! grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || ! grep -qw avx512f /proc/cpuinfo; then
-            echo 'Intel AVX512F=no; refusing non-representative profile' >&2
-            exit 1
-          fi
-          echo "NCPU=$(nproc)" >> "$GITHUB_ENV"
-          printf 'THP: '; cat /sys/kernel/mm/transparent_hugepage/enabled
-      - name: Fetch pinned benchmark support
-        id: generator
-        run: |
-          git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
-          echo "tree=$(git rev-parse origin/ci-bench:generator)" >> "$GITHUB_OUTPUT"
-          git checkout origin/ci-bench -- generator fixtures scripts
-      - name: Restore 20M corpus cache
-        id: corpus
-        uses: actions/cache@v4
-        with:
-          path: ~/big20
-          key: big20-${{ runner.os }}-seed${{ env.DATA_SEED }}-${{ steps.generator.outputs.tree }}
-      - run: python3 -m pip install --quiet polars
-      - name: Generate 20M corpus on a cache miss
-        if: steps.corpus.outputs.cache-hit != 'true'
-        run: |
-          cargo build --release --locked --manifest-path generator/Cargo.toml
-          generator/target/release/generate --seed "$DATA_SEED" --events 20000000 --clicks 5000000 --output "$HOME/big20"
-      - uses: actions/download-artifact@v4
-        with:
-          name: image-baseline
-          path: ${{ runner.temp }}/perf-image
-      - name: Extract the static fast-path binary from the image
-        run: |
-          zstd -dc "$RUNNER_TEMP"/perf-image/*.tar.zst | docker load
-          docker create --name g7-perf-source g7-bench-baseline
-          docker cp g7-perf-source:/pipeline "$RUNNER_TEMP/pipeline"
-          docker rm g7-perf-source
-          chmod 0755 "$RUNNER_TEMP/pipeline"
-      - name: Perf stat and call-graph profile of a warm direct run
+          mkdir -p "$HOME/v5-baseline/out" "$HOME/v5-baseline/scratch"
+          chmod 777 "$HOME/v5-baseline/out" "$HOME/v5-baseline/scratch"
+          start=$(date +%s%N)
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --memory 24g --memory-swap 24g --user 1000:1000 -v "$HOME/big60:/data:ro" -v "$HOME/v5-baseline/out:/output" -v "$HOME/v5-baseline/scratch:/scratch" -e "NCPU=$NCPU" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e XL_TIMING=1 g7-v5-baseline 2>"$HOME/v5-baseline/stderr"
+          end=$(date +%s%N)
+          awk -v a="$start" -v b="$end" 'BEGIN {printf "baseline_container_seconds=%.6f\n", (b-a)/1000000000}' > "$HOME/v5-baseline/report.txt"
+          sed -n 's/.*exit at \([0-9.]*\) ms.*/baseline_engine_ms=\1/p' "$HOME/v5-baseline/stderr" >> "$HOME/v5-baseline/report.txt"
+          if grep -qi fallback "$HOME/v5-baseline/stderr"; then echo 'baseline_fast_path=FALLBACK' >> "$HOME/v5-baseline/report.txt"; else echo 'baseline_fast_path=NO_FALLBACK' >> "$HOME/v5-baseline/report.txt"; fi
+          cat "$HOME/v5-baseline/report.txt"
+      - name: Eight alternating 60M pairs and exact gates
         run: |
           set -o pipefail
-          sudo apt-get update
-          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
-          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
-          mkdir -p "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch" "$RUNNER_TEMP/perf-results"
-          find "$HOME/big20" -type f -exec cat {} + >/dev/null
-          export NCPU DATA_DIR="$HOME/big20" OUTPUT_DIR="$RUNNER_TEMP/perf-output" SCRATCH_DIR="$RUNNER_TEMP/perf-scratch" XL_TIMING=1
-          perf stat -e cycles,instructions,branch-misses,cache-misses,LLC-load-misses,dTLB-load-misses -o "$RUNNER_TEMP/perf-results/perf-stat.txt" "$RUNNER_TEMP/pipeline" 2>"$RUNNER_TEMP/perf-results/pipeline-stat.stderr"
-          find "$HOME/big20" -type f -exec cat {} + >/dev/null
-          sudo rm -rf "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch"
-          mkdir -p "$RUNNER_TEMP/perf-output" "$RUNNER_TEMP/perf-scratch"
-          perf record -g --call-graph=fp -o "$RUNNER_TEMP/perf-results/perf.data" "$RUNNER_TEMP/pipeline" 2>"$RUNNER_TEMP/perf-results/pipeline-record.stderr"
-          perf report --no-children --percent-limit 1 --stdio -i "$RUNNER_TEMP/perf-results/perf.data" > "$RUNNER_TEMP/perf-results/perf-report.txt"
+          for spec in \
+            s60-ev3a-lpt:c26ce00f384baad7461ec9232a3cf618c6c40344 \
+            s60-cx-reserve:d60f04e3f237d058288910dba29374ee86bd54e8 \
+            s60-uf-parent:285050fa5798b7c452f959160015174a32e2abe6 \
+            io-readahead:4b419d7f1ad8ceff04160f21f3d0e76db72bac17 \
+            io-readahead-s1:8dade0009da3851f675f0b4a48fed7b27586ff0e \
+            stack1:96572eb5bd532675e025554369d69f4266f03685
+          do
+            label=${spec%%:*}; sha=${spec#*:}
+            work="$HOME/v5-$label"; mkdir -p "$work"
+            BASELINE_REF=ed40599 CANDIDATE_REF="$sha" CANDIDATE_LABEL="$sha" BASELINE_IMAGE=g7-v5-baseline CANDIDATE_IMAGE="g7-v5-$label" PAIRS=8 NCPU="$NCPU" python3 bench/ci_bench.py "$HOME/big60" "$work" 2>&1 | tee "$work.log"
+          done
+      - if: always()
+        run: |
+          cat "$HOME/v5-baseline/report.txt" >> "$GITHUB_STEP_SUMMARY" || true
+          for report in "$HOME"/v5-*/summary.md; do test -f "$report" && cat "$report" >> "$GITHUB_STEP_SUMMARY"; done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perf-baseline-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/perf-results/**
+          name: v5-60m-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |-
+            ~/v5-baseline/**
+            ~/v5-*.log
+            ~/v5-*/summary.md
+            ~/v5-*/observations.json
+            ~/v5-*/logs/**
           retention-days: 7
