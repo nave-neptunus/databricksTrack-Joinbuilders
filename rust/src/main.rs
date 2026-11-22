@@ -1045,9 +1045,28 @@ impl<'a> Users<'a> {
         // and one partial block per worker.
         let first = npersons.div_ceil(P) * P;
         let ids = first + cap + (rayon::current_num_threads() + 1) * P;
-        let v: Vec<u64> = vec![0; ids];
-        let names = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU64, ids) };
-        std::mem::forget(v);
+        // This table is large (the link-table capacity plus every new person)
+        // and all workers write it during the event scan.  Keep it in its own
+        // anonymous mapping so Linux may back it with transparent huge pages
+        // instead of faulting thousands of allocator pages concurrently.
+        let names: &'static [AtomicU64] = match ids
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|bytes| memmap2::MmapMut::map_anon(bytes).ok())
+        {
+            Some(mapping) => {
+                #[cfg(target_os = "linux")]
+                let _ = mapping.advise(memmap2::Advice::HugePage);
+                // Input mappings and this process-wide id table both intentionally
+                // live until process exit. `names` contains atomics with u64's layout.
+                let mapping: &'static mut memmap2::MmapMut = Box::leak(Box::new(mapping));
+                unsafe { std::slice::from_raw_parts(mapping.as_ptr() as *const AtomicU64, ids) }
+            }
+            // Keep the original allocator path as a safe capacity fallback.
+            None => {
+                let values: &'static mut [u64] = Box::leak(vec![0; ids].into_boxed_slice());
+                unsafe { std::slice::from_raw_parts(values.as_ptr() as *const AtomicU64, ids) }
+            }
+        };
         Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names }
     }
 
