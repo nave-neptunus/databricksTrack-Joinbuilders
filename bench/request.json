@@ -2,6 +2,7 @@
   "baseline": "c3ecbd97207be0881c76ef87d01e594a61ab28be",
   "candidate": "3955db06d268b878db0c572c1d6e55ce30421e0e",
   "timing": [
+    "a23a613430a9827543b526d08a3a81745114a1e3",
     "c3ecbd97207be0881c76ef87d01e594a61ab28be",
     "3955db06d268b878db0c572c1d6e55ce30421e0e"
   ],
