@@ -739,7 +739,7 @@ struct Parser<'a, 'catalog, 'table> {
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Claim, SHARDS>,
-    people: PeopleWriter<'a>,
+    people: Option<PeopleWriter<'a>>,
     worker: u32,
 }
 
@@ -815,7 +815,7 @@ impl Parser<'_, '_, '_> {
                     .users
                     .person(pending.uid, pending.chk, pending.name, &mut self.ids, self.declined);
                 let part = person as usize & (P - 1);
-                let index = self.people.push(part, person, pending.ts, pending.price);
+                let index = self.people.as_mut().unwrap().push(part, person, pending.ts, pending.price);
                 if index >= INDEX_MASK as usize {
                     self.declined.store(true, Relaxed);
                     continue;
@@ -965,15 +965,16 @@ fn resolve_events(
         let too_many = worker >= 1usize << (32 - LOC_WORKER_SHIFT);
         if too_many { declined.store(true, Relaxed); }
         let mut people = People::new(if too_many { 0 } else { reservation });
-        let mut parser = Parser { input, users, declined, window_seconds: input.start.div_euclid(1000), window_ms: (input.end - input.start) as u64, dates: Dates::default(), ids: (0, 0), batch: [Pending::EMPTY; 16], count: 0, streams: Streams::new(), people: PeopleWriter::new(&mut people), worker: worker as u32 };
+        let mut parser = Parser { input, users, declined, window_seconds: input.start.div_euclid(1000), window_ms: (input.end - input.start) as u64, dates: Dates::default(), ids: (0, 0), batch: [Pending::EMPTY; 16], count: 0, streams: Streams::new(), people: Some(PeopleWriter::new(&mut people)), worker: worker as u32 };
         for pending in pending {
             parser.batch[parser.count] = pending;
             parser.count += 1;
             if parser.count == parser.batch.len() { parser.flush(); }
         }
         parser.flush();
-        parser.people.finish();
-        (parser.streams, people)
+        parser.people.take().unwrap().finish();
+        let streams = parser.streams;
+        (streams, people)
     }).collect();
     let mut streams = Vec::with_capacity(output.len());
     let mut people = Vec::with_capacity(output.len());
