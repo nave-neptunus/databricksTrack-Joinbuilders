@@ -197,6 +197,10 @@ impl Shard {
         }
     }
 
+    pub fn reserve_bytes(&mut self, bytes: usize) {
+        self.keys.bytes.reserve(bytes);
+    }
+
     #[inline]
     fn lookup(&self, id: Id<'_>, hash: u64) -> Option<u32> {
         let mut index = *self.table.get(&hash)?;

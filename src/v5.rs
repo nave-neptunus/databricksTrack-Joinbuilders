@@ -861,11 +861,14 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
             let total: usize = parsed.iter().map(|p| p.claims.0.count(shard)).sum();
             filter.reset(total);
             let mut collisions = 0usize;
+            let mut n_long = 0usize;
             for p in parsed {
                 p.claims.0.for_each(shard, |part| {
                     for row in part {
                         if row.w0 & ID_ODD == 0 {
                             collisions += filter.record(row.w0) as usize;
+                        } else {
+                            n_long += 1;
                         }
                     }
                 });
@@ -874,9 +877,10 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
             // Every repeated bit has at least two claims. Two slots per
             // additional claim bound the exact table size, even on collisions.
             short.reset(2 * collisions);
-            let mut long = Shard::with_capacity(total / 8);
+            let mut long = Shard::with_capacity(n_long);
+            long.reserve_bytes(n_long * 24);
             long_slots.clear();
-            long_slots.reserve(total / 8);
+            long_slots.reserve(n_long);
             for p in parsed {
                 p.claims.0.for_each(shard, |part| {
                     for (i, row) in part.iter().enumerate() {
@@ -921,6 +925,7 @@ fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Par
         .map(|p| p.clicks[stripe].lock().unwrap().len())
         .sum();
     let mut keys = Shard::with_capacity(count);
+    keys.reserve_bytes(count * 24);
     for p in parsed {
         let part = std::mem::take(&mut *p.clicks[stripe].lock().unwrap());
         for (i, row) in part.iter().enumerate() {
