@@ -401,51 +401,22 @@ trait EventSink<'a> {
 }
 
 // The common event row spans three AVX2 vectors. Read each vector once for
-// newlines, commas, and quote syntax. Every load stays inside the mapped chunk.
+// newlines, commas, and quote syntax. Longer rows can use one more vector.
+// Every load stays inside the mapped chunk.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2,bmi2")]
 unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     use std::arch::x86_64::*;
 
-    let mask =
-        |value, byte| _mm256_movemask_epi8(_mm256_cmpeq_epi8(value, _mm256_set1_epi8(byte))) as u32;
-    while bytes.len() >= 96 {
-        let (a, b) = unsafe {
-            let ptr = bytes.as_ptr();
-            (
-                _mm256_loadu_si256(ptr.cast()),
-                _mm256_loadu_si256(ptr.add(32).cast()),
-            )
-        };
-        if mask(a, b'\n' as i8) | mask(b, b'\n' as i8) != 0 {
-            let n = memchr::memchr(b'\n', &bytes[..64]).unwrap();
-            if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
-                sink.row(&bytes[..n], fields);
-            }
-            bytes = &bytes[n + 1..];
-            continue;
-        }
-        let c = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(64).cast()) };
-        let newline = mask(c, b'\n' as i8);
-        if newline == 0 {
-            let n = memchr::memchr(b'\n', &bytes[96..]).map_or(bytes.len(), |n| n + 96);
-            if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
-                sink.row(&bytes[..n], fields);
-            }
-            bytes = &bytes[(n + 1).min(bytes.len())..];
-            continue;
-        }
-        let n = newline.trailing_zeros();
-        let clip = (1u32 << n) - 1;
-        let line = &bytes[..64 + n as usize];
-        let join = |byte| {
-            u128::from(mask(a, byte))
-                | (u128::from(mask(b, byte)) << 32)
-                | (u128::from(mask(c, byte) & clip) << 64)
-        };
-        let commas = join(b',' as i8);
+    // Safety: the caller provides BMI2 and masks clipped to the line.
+    #[inline(always)]
+    unsafe fn decode<'a>(
+        line: &'a [u8],
+        commas: u128,
+        quotes: u128,
+        sink: &mut impl EventSink<'a>,
+    ) {
         if commas.count_ones() == 6 {
-            let quotes = join(b'"' as i8);
             let quote_flags = if quotes == 0 {
                 Some(0)
             } else if commas & 1 != 0 {
@@ -460,8 +431,10 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
                 let extract = |positions: u128| {
                     let lo = positions as u64;
                     let hi = (positions >> 64) as u64;
-                    _pext_u64(quotes as u64, lo)
-                        | (_pext_u64((quotes >> 64) as u64, hi) << lo.count_ones())
+                    unsafe {
+                        _pext_u64(quotes as u64, lo)
+                            | (_pext_u64((quotes >> 64) as u64, hi) << lo.count_ones())
+                    }
                 };
                 let wrapped = extract(opens);
                 // Matching field flags enforce pairs. Counting both endpoints
@@ -489,6 +462,63 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
                 );
             }
         }
+    }
+
+    let mask =
+        |value, byte| _mm256_movemask_epi8(_mm256_cmpeq_epi8(value, _mm256_set1_epi8(byte))) as u32;
+    while bytes.len() >= 96 {
+        let (a, b) = unsafe {
+            let ptr = bytes.as_ptr();
+            (
+                _mm256_loadu_si256(ptr.cast()),
+                _mm256_loadu_si256(ptr.add(32).cast()),
+            )
+        };
+        if mask(a, b'\n' as i8) | mask(b, b'\n' as i8) != 0 {
+            let n = memchr::memchr(b'\n', &bytes[..64]).unwrap();
+            if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
+                sink.row(&bytes[..n], fields);
+            }
+            bytes = &bytes[n + 1..];
+            continue;
+        }
+        let c = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(64).cast()) };
+        let newline = mask(c, b'\n' as i8);
+        if newline == 0 {
+            if bytes.len() >= 128 {
+                let d = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(96).cast()) };
+                let newline = mask(d, b'\n' as i8);
+                if newline != 0 {
+                    let n = newline.trailing_zeros();
+                    let clip = (1u32 << n) - 1;
+                    let line = &bytes[..96 + n as usize];
+                    let join = |byte| {
+                        u128::from(mask(a, byte))
+                            | (u128::from(mask(b, byte)) << 32)
+                            | (u128::from(mask(c, byte)) << 64)
+                            | (u128::from(mask(d, byte) & clip) << 96)
+                    };
+                    unsafe { decode(line, join(b',' as i8), join(b'"' as i8), sink) };
+                    bytes = &bytes[line.len() + 1..];
+                    continue;
+                }
+            }
+            let n = memchr::memchr(b'\n', &bytes[96..]).map_or(bytes.len(), |n| n + 96);
+            if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
+                sink.row(&bytes[..n], fields);
+            }
+            bytes = &bytes[(n + 1).min(bytes.len())..];
+            continue;
+        }
+        let n = newline.trailing_zeros();
+        let clip = (1u32 << n) - 1;
+        let line = &bytes[..64 + n as usize];
+        let join = |byte| {
+            u128::from(mask(a, byte))
+                | (u128::from(mask(b, byte)) << 32)
+                | (u128::from(mask(c, byte) & clip) << 64)
+        };
+        unsafe { decode(line, join(b',' as i8), join(b'"' as i8), sink) };
         bytes = &bytes[line.len() + 1..];
     }
     event_rows(bytes, |line, fields| sink.row(line, fields));
@@ -504,53 +534,101 @@ fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     event_rows(bytes, |line, fields| sink.row(line, fields));
 }
 
-/// Click rows usually fit in two vectors. Decode their separators and quote
-/// endpoints together, retaining the generic scanner for short/long rows and tails.
+/// Click rows usually fit in two vectors. A third vector covers longer rows
+/// when the chunk has enough bytes for a full load.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2,bmi2")]
 unsafe fn fused_click_rows<'a>(mut bytes: &'a [u8], row: &mut impl FnMut(&'a [u8], [&'a [u8]; 4])) {
     use std::arch::x86_64::*;
-    let mask = |value, byte| _mm256_movemask_epi8(_mm256_cmpeq_epi8(value, _mm256_set1_epi8(byte))) as u32;
-    while bytes.len() >= 64 {
-        let a = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast()) };
-        let b = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(32).cast()) };
-        let newlines = u64::from(mask(a, b'\n' as i8)) | (u64::from(mask(b, b'\n' as i8)) << 32);
-        if newlines == 0 {
-            let n = memchr::memchr(b'\n', &bytes[64..]).map_or(bytes.len(), |n| n + 64);
-            if let Some(fields) = crate::row_fields::<4>(&bytes[..n]) { row(&bytes[..n], fields); }
-            bytes = &bytes[(n + 1).min(bytes.len())..];
-            continue;
-        }
-        let n = newlines.trailing_zeros() as usize;
-        let line = &bytes[..n];
-        let clip = (1u64 << n) - 1;
-        let join = |byte| (u64::from(mask(a, byte)) | (u64::from(mask(b, byte)) << 32)) & clip;
-        let commas = join(b',' as i8);
+    // Safety: the caller provides BMI2 and masks clipped to the line.
+    #[inline(always)]
+    unsafe fn decode<'a, const WIDE: bool>(
+        line: &'a [u8],
+        commas: u128,
+        quotes: u128,
+        row: &mut impl FnMut(&'a [u8], [&'a [u8]; 4]),
+    ) {
         if commas.count_ones() == 3 {
-            let quotes = join(b'"' as i8);
             if commas & 1 != 0 {
-                if let Some(fields) = crate::row_fields::<4>(line) { row(line, fields); }
+                if let Some(fields) = crate::row_fields::<4>(line) {
+                    row(line, fields);
+                }
             } else {
                 let opens = (commas << 1) | 1;
-                let closes = (commas | (1u64 << n)) >> 1;
-                let wrapped = _pext_u64(quotes, opens);
-                if quotes & !(opens | closes) == 0 && wrapped == _pext_u64(quotes, closes)
-                    && quotes.count_ones() == wrapped.count_ones() * 2 {
+                let closes = (commas | (1u128 << line.len())) >> 1;
+                let extract = |positions: u128| {
+                    let lo = positions as u64;
+                    let hi = (positions >> 64) as u64;
+                    let low = unsafe { _pext_u64(quotes as u64, lo) };
+                    if WIDE {
+                        low | (unsafe { _pext_u64((quotes >> 64) as u64, hi) } << lo.count_ones())
+                    } else {
+                        low
+                    }
+                };
+                let wrapped = extract(opens);
+                if quotes & !(opens | closes) == 0
+                    && wrapped == extract(closes)
+                    && quotes.count_ones() == wrapped.count_ones() * 2
+                {
                     let mut cuts = [0usize; 5];
                     let mut remaining = commas;
                     for cut in &mut cuts[1..4] {
                         *cut = remaining.trailing_zeros() as usize + 1;
                         remaining &= remaining - 1;
                     }
-                    cuts[4] = n + 1;
-                    row(line, std::array::from_fn(|i| {
-                        let trim = ((wrapped >> i) & 1) as usize;
-                        // Matched endpoints and quote count ensure each trim is in bounds.
-                        unsafe { line.get_unchecked(cuts[i] + trim..cuts[i + 1] - 1 - trim) }
-                    }));
+                    cuts[4] = line.len() + 1;
+                    row(
+                        line,
+                        std::array::from_fn(|i| {
+                            let trim = ((wrapped >> i) & 1) as usize;
+                            // Matched endpoints and quote count ensure each trim is in bounds.
+                            unsafe { line.get_unchecked(cuts[i] + trim..cuts[i + 1] - 1 - trim) }
+                        }),
+                    );
                 }
             }
         }
+    }
+
+    let mask =
+        |value, byte| _mm256_movemask_epi8(_mm256_cmpeq_epi8(value, _mm256_set1_epi8(byte))) as u32;
+    while bytes.len() >= 64 {
+        let a = unsafe { _mm256_loadu_si256(bytes.as_ptr().cast()) };
+        let b = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(32).cast()) };
+        let newlines = u64::from(mask(a, b'\n' as i8)) | (u64::from(mask(b, b'\n' as i8)) << 32);
+        if newlines == 0 {
+            if bytes.len() >= 96 {
+                let c = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(64).cast()) };
+                let newline = mask(c, b'\n' as i8);
+                if newline != 0 {
+                    let n = newline.trailing_zeros();
+                    let clip = (1u32 << n) - 1;
+                    let line = &bytes[..64 + n as usize];
+                    let join = |byte| {
+                        u128::from(mask(a, byte))
+                            | (u128::from(mask(b, byte)) << 32)
+                            | (u128::from(mask(c, byte) & clip) << 64)
+                    };
+                    unsafe { decode::<true>(line, join(b',' as i8), join(b'"' as i8), row) };
+                    bytes = &bytes[line.len() + 1..];
+                    continue;
+                }
+            }
+            let n = memchr::memchr(b'\n', &bytes[64..]).map_or(bytes.len(), |n| n + 64);
+            if let Some(fields) = crate::row_fields::<4>(&bytes[..n]) {
+                row(&bytes[..n], fields);
+            }
+            bytes = &bytes[(n + 1).min(bytes.len())..];
+            continue;
+        }
+        let n = newlines.trailing_zeros() as usize;
+        let line = &bytes[..n];
+        let clip = (1u64 << n) - 1;
+        let join = |byte| {
+            (u128::from(mask(a, byte)) | (u128::from(mask(b, byte)) << 32)) & u128::from(clip)
+        };
+        unsafe { decode::<false>(line, join(b',' as i8), join(b'"' as i8), row) };
         bytes = &bytes[n + 1..];
     }
     crate::mask_rows::<4>(bytes, row);
@@ -1079,7 +1157,21 @@ mod tests {
                 input.extend(corrupt);
             }
         }
-        for text in ["\n", ",,,\n", "\",u,c,t\n", "c,\",c,t\n", "c,u,\",t\n", "c,u,c,\"\n", "c,u,c,\"\"\n", "c,,c,t\n", "c,u,c,\"t\"x\n", "c,u,c,t,extra\n", "c,u,c,t\r\n", "c,u,c,t"] {
+        for text in [
+            "\"c0123456789\",\"u0123456789abcdef0123456789abcdef\",c_123,2028-02-29T12:01:02Z\n",
+            "\n",
+            ",,,\n",
+            "\",u,c,t\n",
+            "c,\",c,t\n",
+            "c,u,\",t\n",
+            "c,u,c,\"\n",
+            "c,u,c,\"\"\n",
+            "c,,c,t\n",
+            "c,u,c,\"t\"x\n",
+            "c,u,c,t,extra\n",
+            "c,u,c,t\r\n",
+            "c,u,c,t",
+        ] {
             input.extend_from_slice(text.as_bytes());
         }
         let mut expected = Vec::new();
@@ -1140,6 +1232,44 @@ mod tests {
     }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    type EventRows<'a> = Vec<(&'a [u8], [&'a [u8]; 7])>;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn scalar_event_rows(input: &[u8]) -> EventRows<'_> {
+        let mut expected = Vec::new();
+        crate::for_lines(input, |line| {
+            if let Some(values) = crate::fields::<7>(line) {
+                expected.push((line, values));
+            }
+        });
+        expected
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    fn fused_event_rows_for_test(input: &[u8]) -> EventRows<'_> {
+        struct Collect<'a>(EventRows<'a>);
+        impl<'a> EventSink<'a> for Collect<'a> {
+            fn row(&mut self, line: &'a [u8], values: impl Fields<'a>) {
+                self.0.push((
+                    line,
+                    [
+                        values.field::<0>(),
+                        values.field::<1>(),
+                        values.field::<2>(),
+                        values.field::<3>(),
+                        values.field::<4>(),
+                        values.field::<5>(),
+                        values.field::<6>(),
+                    ],
+                ));
+            }
+        }
+        let mut actual = Collect(Vec::new());
+        scan_event_rows(input, &mut actual);
+        actual.0
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn fused_row_scanner_matches_scalar_quote_validation() {
         let fields = [
@@ -1173,31 +1303,56 @@ mod tests {
             input.extend_from_slice(b"too,short,\"\"\n\n");
         }
         input.extend_from_slice(b"e9,u9,1,2026-10-01T00:00:00Z,view,p9,");
-        let mut expected = Vec::new();
-        crate::for_lines(&input, |line| {
-            if let Some(values) = crate::fields::<7>(line) {
-                expected.push((line, values));
-            }
-        });
-        struct Collect<'a>(Vec<(&'a [u8], [&'a [u8]; 7])>);
-        impl<'a> EventSink<'a> for Collect<'a> {
-            fn row(&mut self, line: &'a [u8], values: impl Fields<'a>) {
-                self.0.push((
-                    line,
-                    [
-                        values.field::<0>(),
-                        values.field::<1>(),
-                        values.field::<2>(),
-                        values.field::<3>(),
-                        values.field::<4>(),
-                        values.field::<5>(),
-                        values.field::<6>(),
-                    ],
-                ));
+        assert_eq!(fused_event_rows_for_test(&input), scalar_event_rows(&input));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn fused_row_scanner_long_rows_match_scalar() {
+        let long_event = "e0123456789abcdef0123456789abcdef";
+        let long_user = "u0123456789abcdef0123456789abcdef";
+        let mut input = Vec::new();
+        for (event, user) in [
+            (long_event, long_user),
+            (long_event, "u"),
+            ("e", long_user),
+        ] {
+            for width in 0..60 {
+                let payload = "p".repeat(width);
+                let fields = [
+                    event,
+                    user,
+                    "1791158400000",
+                    "2026-10-05T00:00:00Z",
+                    "view",
+                    payload.as_str(),
+                    "",
+                ];
+                for wraps in 0..128 {
+                    let start = input.len();
+                    for (i, field) in fields.iter().enumerate() {
+                        if i != 0 {
+                            input.push(b',');
+                        }
+                        if wraps & (1 << i) != 0 {
+                            input.push(b'"');
+                        }
+                        input.extend_from_slice(field.as_bytes());
+                        if wraps & (1 << i) != 0 {
+                            input.push(b'"');
+                        }
+                    }
+                    input.push(b'\n');
+                    for position in [23, 70, 100, 120] {
+                        let mut corrupt = input[start..].to_vec();
+                        let at = position.min(corrupt.len() - 2);
+                        corrupt[at] = b'"';
+                        input.extend(corrupt);
+                    }
+                }
             }
         }
-        let mut actual = Collect(Vec::new());
-        scan_event_rows(&input, &mut actual);
-        assert_eq!(actual.0, expected);
+        input.extend_from_slice(b"too,short,\"\"\n\n");
+        assert_eq!(fused_event_rows_for_test(&input), scalar_event_rows(&input));
     }
 }
