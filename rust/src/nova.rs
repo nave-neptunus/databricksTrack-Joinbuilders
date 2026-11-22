@@ -1019,7 +1019,7 @@ impl Router {
     }
 }
 
-pub(super) fn run_events(
+pub(super) fn run_events<C: Send>(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
     users: &Users<'_>,
@@ -1028,7 +1028,8 @@ pub(super) fn run_events(
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
     estimated_rows: usize,
-) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
+    parse_clicks: impl FnOnce() -> C + Send,
+) -> Option<(u32, Vec<&'static [u8]>, Vec<People>, C)> {
     let (claims, people) = events(work, read_ahead, users, interner, input, declined, estimated_rows);
     if declined.load(Relaxed) {
         return None;
@@ -1042,27 +1043,29 @@ pub(super) fn run_events(
     if declined.load(Relaxed) {
         return None;
     }
-    crate::pt_ordered(
-        SHARDS,
-        Router::new,
-        |mut router, shard| {
-            router.route(&people, &claims, shard);
-            router
+    // Event parsing finished populating Users. Dedup only touches the event
+    // payloads, so click parsing can now resolve users while we tombstone.
+    let ((), clicks) = rayon::join(
+        || {
+            let routers = crate::pt((0..SHARDS).into_par_iter(), Router::new, |mut router, shard| {
+                router.route(&people, &claims, shard);
+                router
+            });
+            if std::env::var_os("TIMING").is_some() {
+                for router in routers {
+                    eprintln!("ROUTER tombstone={:.1}", router.route_ns as f64 / 1e6);
+                }
+            }
+            lap("  dedup tombstoned");
+            drop(claims);
+            lap("events dedup + validate");
         },
-    )
-    .into_iter()
-    .for_each(|router| {
-        if std::env::var_os("TIMING").is_some() {
-            eprintln!("ROUTER tombstone={:.1}", router.route_ns as f64 / 1e6);
-        }
-    });
+        parse_clicks,
+    );
     if declined.load(Relaxed) {
         return None;
     }
-    lap("  dedup tombstoned");
-    drop(claims);
-    lap("events dedup + validate");
-    Some((local_count, names, people))
+    Some((local_count, names, people, clicks))
 }
 
 #[cfg(test)]
