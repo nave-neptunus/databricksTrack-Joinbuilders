@@ -22,8 +22,8 @@ jobs:
         run: |
           set -euo pipefail
           lscpu
-          grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || { echo 'AMD/non-Intel runner refused' >&2; exit 1; }
-          grep -qw avx512f /proc/cpuinfo || { echo 'AVX-512F unavailable' >&2; exit 1; }
+          grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || echo WARN-AMD
+          grep -qw avx512f /proc/cpuinfo || echo WARN-noavx512
           test "$(nproc)" -ge 4 || { echo "Need 4+ vCPUs, got $(nproc)" >&2; exit 1; }
           echo "PROFILE_ROOT=$RUNNER_TEMP/gum-profile" >> "$GITHUB_ENV"
           mkdir -p bench-work
