@@ -344,6 +344,24 @@ struct Pending {
     price: u32,
 }
 
+const LONG_CACHE_SIZE: usize = 1024;
+
+/// Exact cache of interned long user IDs. A hit compares the full bytes.
+#[derive(Clone, Copy)]
+struct LongUser {
+    bytes: &'static [u8],
+    uid: u64,
+}
+
+#[inline]
+fn long_cache_index(b: &[u8]) -> usize {
+    let n = b.len();
+    let head = u64::from_le_bytes(b[..8].try_into().unwrap());
+    let tail = u64::from_le_bytes(b[n - 8..].try_into().unwrap());
+    let h = (head ^ tail.rotate_left(29) ^ n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h >> 54) as usize & (LONG_CACHE_SIZE - 1)
+}
+
 impl Pending {
     const EMPTY: Self = Self {
         key: 0,
@@ -686,6 +704,7 @@ struct Parser<'a, 'catalog, 'table> {
     window_ms: u64,
     dates: Dates,
     ids: (u32, u32),
+    long_users: [LongUser; LONG_CACHE_SIZE],
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Claim, SHARDS>,
@@ -780,7 +799,25 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.price = value | (category << 24);
             }
-            let uid = user_key(user).unwrap_or_else(|| self.interner.intern(user));
+            let uid = match user_key(user) {
+                Some(uid) => uid,
+                None if user.len() < 8 => self.interner.intern(user),
+                // A hit compares every byte of the stored ID.
+                None => {
+                    let slot = long_cache_index(user);
+                    let entry = self.long_users[slot];
+                    if entry.bytes == user {
+                        entry.uid
+                    } else {
+                        let uid = self.interner.intern(user);
+                        // SAFETY: inputs are memory-mapped and leaked for the whole
+                        // run; the interner already stores these slices as 'static.
+                        let bytes: &'static [u8] = unsafe { std::mem::transmute(user) };
+                        self.long_users[slot] = LongUser { bytes, uid };
+                        uid
+                    }
+                }
+            };
             // Keep a direct reference to the full ID for the name. This avoids
             // decoding short keys later (and an allocation per person).
             let Some(r) = crate::pack_ref(user) else {
@@ -832,6 +869,7 @@ fn events(
                 window_ms: (input.end - input.start) as u64,
                 dates: Dates::default(),
                 ids: (0, 0),
+                long_users: [LongUser { bytes: &[], uid: 0 }; LONG_CACHE_SIZE],
                 batch: [Pending::EMPTY; 16],
                 count: 0,
                 streams: Streams::new(),
