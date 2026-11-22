@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import statistics
+import re
 from pathlib import Path
 
 import ci_bench as bench
@@ -14,7 +15,7 @@ shared_target = bench.WORK / 'target-shared'
 def build_variant(label, config, test=False):
     source = bench.source_for(config['sha'])
     env = dict(os.environ, RUSTFLAGS='-C target-cpu=x86-64-v3', CARGO_TARGET_DIR=str(shared_target))
-    command = ['cargo', 'test' if test else 'build', '--release', '--locked', '--manifest-path', str(source / 'rust/Cargo.toml')]
+    command = ['cargo', 'test' if test else 'build', '--release', '--locked', '--no-default-features', '--manifest-path', str(source / 'rust/Cargo.toml')]
     if config['features']:
         command += ['--features', ','.join(config['features'])]
     bench.call(command, env=env)
@@ -64,6 +65,26 @@ try:
 finally:
     os.environ.pop('NOVA')
 shutil.rmtree(reference)
+# Sequential hex IDs exercise table clustering while the exact control supplies
+# the answer after the identity spelling and canonical representatives change.
+sequential = bench.HOME / 'v5-sequential-hex'
+shutil.copytree(heldout, sequential)
+names = {}
+pattern = re.compile(rb'(?<![A-Za-z0-9])u[0-9a-f]{32}(?![A-Za-z0-9])')
+def rename(match):
+    original = match.group()
+    if original not in names:
+        names[original] = f'u{len(names) + 1:032x}'.encode()
+    return names[original]
+for path in sorted(sequential.rglob('*.csv')):
+    path.write_bytes(pattern.sub(rename, path.read_bytes()))
+print(f'Sequential hexadecimal identities {len(names)}', flush=True)
+reference, _, _ = bench.run(binaries['control'], sequential, 'sequential-control')
+for label in ('hex-users', 'combined1024', 'combined2048'):
+    output, _, _ = bench.run(binaries[label], sequential, f'sequential-{label}')
+    bench.parquet_equal(output, reference, f'{label} sequential hex IDs')
+    shutil.rmtree(output)
+shutil.rmtree(reference)
 
 if bench.GATE_FAILURES:
     raise SystemExit('gate failed: ' + '; '.join(bench.GATE_FAILURES))
@@ -92,3 +113,24 @@ for label, config in variants.items():
 print('\n'.join(lines))
 if bench.GATE_FAILURES:
     raise SystemExit('timing run declined: ' + '; '.join(bench.GATE_FAILURES))
+
+# Build the submitted image with its actual defaults and exercise its CMD under
+# read-only runtime mounts. The public benchmark binaries use explicit features.
+source = bench.source_for(variants['combined1024']['sha'])
+bench.call(['docker', 'build', '--tag', 'gum-rewrite:ci', str(source)])
+output, scratch = bench.WORK / 'docker-output', bench.WORK / 'docker-scratch'
+for directory in (output, scratch):
+    directory.mkdir()
+    directory.chmod(0o777)
+bench.call(['docker', 'run', '--rm', '--network', 'none', '--read-only',
+            '--cpus', os.environ.get('RUNNER_VCPUS', '4'), '--memory', '24g',
+            '--pids-limit', '4096', '--user', '1000:1000',
+            '--tmpfs', '/tmp:size=64m', '-e', 'NCPU=8',
+            '-v', f'{heldout}:/data:ro', '-v', f'{output}:/output',
+            '-v', f'{scratch}:/scratch', 'gum-rewrite:ci'])
+reference, _, _ = bench.run(binaries['control'], heldout, 'docker-reference')
+bench.parquet_equal(output, reference, 'production Docker CMD heldout seed 23')
+if bench.GATE_FAILURES:
+    raise SystemExit('Docker gate failed: ' + '; '.join(bench.GATE_FAILURES))
+with (bench.WORK / 'summary.md').open('a') as report:
+    report.write('\nProduction Docker CMD MATCH on heldout seed 23 with read-only root and uid 1000.\n')

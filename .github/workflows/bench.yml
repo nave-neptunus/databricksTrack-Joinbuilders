@@ -42,6 +42,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 bench/rewrite_sweep.py "$HOME" "$GITHUB_WORKSPACE/bench-work"
+      - name: Sample the combined candidate
+        continue-on-error: true
+        run: bash bench/profile_rewrite.sh
       - name: Publish benchmark evidence
         if: always()
         shell: bash
