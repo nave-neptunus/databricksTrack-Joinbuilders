@@ -386,6 +386,7 @@ fn main() {
         links::sort_bench(g);
         unsafe { sys::_exit(0) };
     }
+    out::prepare_output(&outdir);
     {
         let gr: &G = g;
         run_par(nt, |tid| parse::stage1(gr, tid));

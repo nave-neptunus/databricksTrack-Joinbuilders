@@ -383,7 +383,7 @@ fn clear_stale(dir: &Path) {
     }
 }
 
-pub fn stage5(g: &mut G, outdir: &str) {
+pub fn prepare_output(outdir: &str) {
     let ud = Path::new(outdir).join("user_daily");
     let cd = Path::new(outdir).join("campaign_daily");
     if std::fs::create_dir_all(&ud).is_err() || std::fs::create_dir_all(&cd).is_err() {
@@ -391,6 +391,11 @@ pub fn stage5(g: &mut G, outdir: &str) {
     }
     clear_stale(&ud);
     clear_stale(&cd);
+}
+
+pub fn stage5(g: &mut G, outdir: &str) {
+    let ud = Path::new(outdir).join("user_daily");
+    let cd = Path::new(outdir).join("campaign_daily");
     let mut cats_off = vec![0u32];
     let mut cats_data = Vec::new();
     for c in &g.cats {
@@ -488,11 +493,6 @@ pub fn stage45(g: &mut G, outdir: &str) {
     crate::complex::stage4_pre(g);
     let ud = Path::new(outdir).join("user_daily");
     let cd = Path::new(outdir).join("campaign_daily");
-    if std::fs::create_dir_all(&ud).is_err() || std::fs::create_dir_all(&cd).is_err() {
-        die("cannot create the output folders");
-    }
-    clear_stale(&ud);
-    clear_stale(&cd);
     let mut cats_off = vec![0u32];
     let mut cats_data = Vec::new();
     for c in &g.cats {
