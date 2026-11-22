@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 use crate::sys::{fallback, U64Map};
@@ -8,6 +9,7 @@ use crate::sys::{fallback, U64Map};
 const BITS: u32 = 6;
 pub const SHARDS: usize = 1 << BITS;
 const LONG: u64 = 1 << 63;
+const SHORT_MASK: u64 = (1 << 48) - 1;
 const NONE: u32 = u32::MAX;
 
 const fn codes() -> [u8; 256] {
@@ -52,7 +54,7 @@ fn unpack(mut key: u64, prefix: u8, buf: &mut [u8; 9]) -> &[u8] {
         let code = (key >> 42) as usize;
         buf[n] = DIGITS[code - 1];
         n += 1;
-        key = (key << 6) & ((1 << 48) - 1);
+        key = (key << 6) & SHORT_MASK;
     }
     &buf[..n]
 }
@@ -309,6 +311,84 @@ impl Names {
     }
 }
 
+#[repr(align(128))]
+struct AtomicStripe {
+    slots: Box<[AtomicU64]>,
+    next: AtomicU32,
+}
+
+pub struct PackedDictionary([AtomicStripe; SHARDS]);
+
+impl PackedDictionary {
+    pub fn new(capacity: usize) -> Self {
+        let slots = (2 * capacity.div_ceil(SHARDS)).next_power_of_two().max(64);
+        Self(std::array::from_fn(|_| AtomicStripe {
+            slots: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            next: AtomicU32::new(0),
+        }))
+    }
+
+    // Each word holds the entire packed ID and a 1-based local index.
+    // Claim an empty slot with the packed ID before publishing its index.
+    pub fn intern(&self, key: u64, hash: u64) -> u32 {
+        let stripe = shard(hash);
+        let table = &self.0[stripe];
+        let mask = table.slots.len() - 1;
+        let start = hash as usize & mask;
+        let mut slot = start;
+        loop {
+            let cell = &table.slots[slot];
+            let mut word = cell.load(Relaxed);
+            if word == 0 {
+                match cell.compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        let local = table.next.fetch_add(1, Relaxed) + 1;
+                        if local > u16::MAX as u32 {
+                            fallback("packed user shard exceeds index capacity");
+                        }
+                        cell.store(key | (local as u64) << 48, Relaxed);
+                        return Names::index(stripe, local - 1);
+                    }
+                    Err(current) => word = current,
+                }
+            }
+            if word & SHORT_MASK == key {
+                while word >> 48 == 0 {
+                    std::hint::spin_loop();
+                    word = cell.load(Relaxed);
+                }
+                return Names::index(stripe, (word >> 48) as u32 - 1);
+            }
+            slot = (slot + 1) & mask;
+            if slot == start {
+                fallback("packed user shard is full");
+            }
+        }
+    }
+
+    pub fn into_names(self) -> PackedNames {
+        PackedNames(self.0.map(|stripe| {
+            let mut keys = vec![0; stripe.next.into_inner() as usize];
+            for slot in stripe.slots {
+                let word = slot.into_inner();
+                if word != 0 {
+                    keys[(word >> 48) as usize - 1] = word & SHORT_MASK;
+                }
+            }
+            keys
+        }))
+    }
+}
+
+pub struct PackedNames([Vec<u64>; SHARDS]);
+
+impl PackedNames {
+    pub fn bytes<'a>(&self, index: u32, prefix: u8, buf: &'a mut [u8; 9]) -> &'a [u8] {
+        let key = self.0[index as usize & (SHARDS - 1)][(index >> BITS) as usize];
+        unpack(key, prefix, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +432,37 @@ mod tests {
         }
         assert_eq!(pack(b"uABC", b'u'), None);
         assert_eq!(pack(b"u000000001", b'u'), None);
+    }
+
+    #[test]
+    fn concurrent_packed_interning_publishes_one_index_per_key() {
+        let dictionary = PackedDictionary::new(64);
+        let a = pack(b"u000123ab", b'u').unwrap();
+        let b = pack(b"u000123ac", b'u').unwrap();
+        let (a_index, b_index) = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let a_index = dictionary.intern(a, 42);
+                        let b_index = dictionary.intern(b, 42);
+                        for _ in 0..100 {
+                            assert_eq!(dictionary.intern(a, 42), a_index);
+                            assert_eq!(dictionary.intern(b, 42), b_index);
+                        }
+                        (a_index, b_index)
+                    })
+                })
+                .collect();
+            let answers: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            assert!(answers.iter().all(|answer| *answer == answers[0]));
+            answers[0]
+        });
+        assert_ne!(a_index, b_index);
+        let names = dictionary.into_names();
+        assert_eq!(names.bytes(a_index, b'u', &mut [0; 9]), b"u000123ab");
+        assert_eq!(names.bytes(b_index, b'u', &mut [0; 9]), b"u000123ac");
     }
 }

@@ -294,7 +294,7 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
     let Lookups { prod, cats, camp, channels, nc } = lk_handle.join().unwrap_or_else(|_| fallback("lookup thread"));
     lap("lookups");
     let ecap = ((ev_bytes / 64 + 4096 + BSIZE - 1) & !(BSIZE - 1)) as u64;
-    let ucap = (((ecap as usize / 16 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)) as u64).min(1 << 26);
+    let ucap = (((ecap as usize / 12 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)) as u64).min(1 << 26);
     let nb = (ecap as usize) >> BB;
     let nub = (ucap as usize) >> UB;
     let blk = 2usize << 20;
@@ -809,7 +809,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     let (prod, cats) = lookups.take();
     let row_cap = *rowcap.get();
     let ecap = ((ev_bytes / 64 + 4096 + BSIZE - 1) & !(BSIZE - 1)) as u64;
-    let ucap = (((ecap as usize / 16 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)) as u64).min(1 << 26);
+    let ucap = (((ecap as usize / 12 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)) as u64).min(1 << 26);
     let nb = (ecap as usize) >> BB;
     let nub = (ucap as usize) >> UB;
     let blk = 2usize << 20;
@@ -884,7 +884,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
 
 fn part_counts(ev_bytes: usize) -> (usize, usize) {
     let ecap = (ev_bytes / 64 + 4096 + BSIZE - 1) & !(BSIZE - 1);
-    let ucap = ((ecap / 16 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)).min(1 << 26);
+    let ucap = ((ecap / 12 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)).min(1 << 26);
     (ecap >> BB, ucap >> UB)
 }
 

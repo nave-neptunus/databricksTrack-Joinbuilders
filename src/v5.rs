@@ -3,7 +3,10 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::ids::{self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard, SHARDS};
+use crate::ids::{
+    self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, PackedDictionary, PackedNames,
+    Shard, SHARDS,
+};
 use crate::iface::*;
 use crate::{
     core, k_ref, parse, setup, sys, Kind, Rec, BB, BSIZE, CBOUND, DAY_MS, G, ING_MAX, K, PBOUND, UB,
@@ -16,7 +19,8 @@ pub struct Dictionaries {
 
 pub struct UserNames {
     linked: Names,
-    unlinked: Names,
+    short: PackedNames,
+    long: Names,
     boundary: u32,
 }
 
@@ -25,14 +29,20 @@ impl UserNames {
         if index < self.boundary {
             self.linked.bytes(index, prefix, buf)
         } else {
-            self.unlinked.bytes(index - self.boundary, prefix, buf)
+            let index = index - self.boundary;
+            if index & 1 == 0 {
+                self.short.bytes(index >> 1, prefix, buf)
+            } else {
+                self.long.bytes(index >> 1, prefix, buf)
+            }
         }
     }
 }
 
 struct Users {
     linked: FrozenDictionary,
-    unlinked: Dictionary,
+    short: PackedDictionary,
+    long: Dictionary,
     linked_short: [sys::U64Map; SHARDS],
     roots: Vec<u32>,
     boundary: u32,
@@ -53,7 +63,8 @@ impl Users {
         });
         Self {
             linked,
-            unlinked: Dictionary::new(),
+            short: PackedDictionary::new((g.ucap as usize - boundary as usize) / 2),
+            long: Dictionary::new(),
             linked_short: maps.map(|m| m.into_inner().unwrap().unwrap()),
             roots,
             boundary,
@@ -70,11 +81,12 @@ impl Users {
                 .map(|index| self.roots[index as usize]),
         };
         linked.unwrap_or_else(|| {
-            self.unlinked
-                .intern(id, hash)
-                .0
-                .checked_add(self.boundary)
-                .unwrap_or_else(|| sys::fallback("IDs exceed user index capacity"))
+            let index = match id {
+                Id::Short(key) => self.short.intern(key, hash) as u64 * 2,
+                Id::Long(_) => self.long.intern(id, hash).0 as u64 * 2 + 1,
+            };
+            u32::try_from(index + self.boundary as u64)
+                .unwrap_or_else(|_| sys::fallback("IDs exceed user index capacity"))
         })
     }
 
@@ -89,7 +101,8 @@ impl Users {
     fn into_names(self) -> UserNames {
         UserNames {
             linked: self.linked.into_names(),
-            unlinked: self.unlinked.into_names(),
+            short: self.short.into_names(),
+            long: self.long.into_names(),
             boundary: self.boundary,
         }
     }
