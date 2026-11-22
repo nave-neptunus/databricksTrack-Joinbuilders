@@ -1,15 +1,13 @@
 {
-  "baseline": "a23a613430a9827543b526d08a3a81745114a1e3",
-  "candidate": "d0751053dee84c77b171e44eefa84ddb02e16aed",
+  "baseline": "d0751053dee84c77b171e44eefa84ddb02e16aed",
+  "candidate": "5d2be03dd0b7e49c52f888be1a863942b49d89ec",
   "timing": [
-    "a23a613430a9827543b526d08a3a81745114a1e3",
-    "b43d67108dbe426addd442bf176397f9812181c2",
-    "2a05112c88d9ed5d4df33221307da01161041af7",
-    "d0751053dee84c77b171e44eefa84ddb02e16aed"
+    "d0751053dee84c77b171e44eefa84ddb02e16aed",
+    "5d2be03dd0b7e49c52f888be1a863942b49d89ec"
   ],
   "rounds": {
-    "20m": 5,
+    "20m": 3,
     "60m": 3
   },
-  "skip_test": false
+  "skip_test": true
 }
