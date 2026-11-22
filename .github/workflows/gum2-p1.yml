@@ -1,0 +1,77 @@
+name: gum2 P1 vs baseline (Intel AVX-512)
+
+on:
+  push:
+    branches: [gum2/p1-parse]
+  workflow_dispatch:
+
+jobs:
+  p1-gate-and-time:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      BASE_SHA: 80f9e55
+      P1_SHA: 5801b8f
+      NCPU: "8"
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Require an Intel AVX-512 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          lscpu
+          grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || { echo 'runner is not GenuineIntel' >&2; exit 1; }
+          grep -qwm1 avx512f /proc/cpuinfo || { echo 'runner lacks avx512f' >&2; exit 1; }
+          df -h .
+
+      - name: Install compare dependency
+        run: python3 -m pip install --disable-pip-version-check polars
+
+      - name: Build baseline and P1 release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-C target-cpu=x86-64-v3"
+          mkdir -p "$HOME/bins"
+          for pair in "base:$BASE_SHA" "p1:$P1_SHA"; do
+            name=${pair%%:*}; sha=${pair##*:}
+            git worktree add --detach "$HOME/src-$name" "$sha"
+            test "$(git -C "$HOME/src-$name" rev-parse --short=7 HEAD)" = "$sha"
+            cargo build --release --locked --manifest-path "$HOME/src-$name/rust/Cargo.toml" --target-dir "$HOME/target-$name"
+            cp "$HOME/target-$name/release/rproto" "$HOME/bins/$name"
+          done
+          ls -l "$HOME/bins"
+
+      - name: Build generator
+        run: cargo build --release --locked --manifest-path generator/Cargo.toml
+
+      - name: Dataset 20M (seed 3), compare, time
+        shell: bash
+        run: |
+          set -euo pipefail
+          generator/target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output "$HOME/d20" --threads "$NCPU"
+          python3 .github/workflows/gum2-p1-bench.py "$HOME/d20" 20M "$HOME/bins" "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/p1-results"
+          rm -rf "$HOME/d20"
+
+      - name: Dataset 60M (seed 17), compare, time
+        shell: bash
+        run: |
+          set -euo pipefail
+          generator/target/release/generate --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/d60" --threads "$NCPU"
+          python3 .github/workflows/gum2-p1-bench.py "$HOME/d60" 60M "$HOME/bins" "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/p1-results"
+          rm -rf "$HOME/d60"
+
+      - name: Publish table
+        if: always()
+        shell: bash
+        run: |
+          cat p1-results/table-*.md 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" > p1-results/table.md || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gum2-p1-table-${{ github.run_id }}
+          path: p1-results/
+          retention-days: 14
