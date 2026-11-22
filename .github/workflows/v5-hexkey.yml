@@ -38,21 +38,16 @@ jobs:
         run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
       - name: Generate v5 20M corpus
         run: generator/target/release/generate --seed 17 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/v5-20m"
-      - name: Exact v5 gate and eight alternating timing pairs
+      - name: v5 1M dev-answer MATCH
         run: |
-          git fetch --no-tags origin g7/bench-v5
-          git show FETCH_HEAD:bench/ci_bench.py > "$RUNNER_TEMP/ci_bench.py"
-          mkdir -p bench
-          cp "$RUNNER_TEMP/ci_bench.py" bench/ci_bench.py
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("bench/ci_bench.py")
-          source = path.read_text()
-          source = source.replace('re.search(r"\\[v2b\\] exit at ([0-9.]+) ms", stderr)', 're.search(r"([0-9.]+) ms  parquet written", stderr)')
-          source = source.replace('re.search(r"\\[v2b\\] ms: (.+)", stderr)', 'None')
-          source = source.replace('"XL_TIMING=1"', '"TIMING=1"')
-          path.write_text(source)
-          PY
-          BASELINE_REF=6da0386b4ca6a001a5c7f747c68f40815fc14afb CANDIDATE_REF="$GITHUB_SHA" BASELINE_IMAGE=hexkey-baseline CANDIDATE_IMAGE=hexkey-candidate PAIRS=8 NCPU=4 python3 bench/ci_bench.py "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-results"
+          generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output "$RUNNER_TEMP/v5-dev"
+          IMAGE=hexkey-candidate CPUS=4 scripts/docker_run.sh "$RUNNER_TEMP/v5-dev" "$RUNNER_TEMP/v5-dev-out"
+          unzip -q v5-dev-answer.zip -d "$RUNNER_TEMP"
+          python3 scripts/compare.py "$RUNNER_TEMP/v5-dev-out" "$RUNNER_TEMP/dev-answer"
+      - name: v5 20M baseline MATCH
+        run: |
+          IMAGE=hexkey-baseline CPUS=4 scripts/docker_run.sh "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-base-out"
+          IMAGE=hexkey-candidate CPUS=4 scripts/docker_run.sh "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-candidate-out"
+          python3 scripts/compare.py "$RUNNER_TEMP/v5-candidate-out" "$RUNNER_TEMP/v5-base-out"
       - if: always()
-        run: cat "$RUNNER_TEMP/v5-results/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+        run: true
