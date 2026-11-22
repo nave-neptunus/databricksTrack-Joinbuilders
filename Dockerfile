@@ -23,5 +23,6 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
 FROM scratch
 COPY --from=build /pipeline /pipeline
 COPY --from=fallback /fallback /fallback
+ENV XL_NOHUGE=1
 USER 1000:1000
 CMD ["/pipeline"]
