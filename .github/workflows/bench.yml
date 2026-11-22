@@ -2,7 +2,7 @@ name: gum v5 Intel gate and timing
 
 on:
   push:
-    branches: [ci/gum]
+    branches: [ci/gum-evrow-abl]
   workflow_dispatch:
 
 jobs:
@@ -33,15 +33,13 @@ jobs:
           unzip -q bench/assets/generator.zip -d "$HOME/gum-v5-generator"
           cargo build --release --locked --manifest-path "$HOME/gum-v5-generator/generator/Cargo.toml"
           # The supplied public dev-answer is the documented seed-1 dev set.
-          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 1 --events 1000000 --clicks 250000 --output "$HOME/v5-dev" --threads "$NCPU"
           "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads "$NCPU"
-          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/v5-60m" --threads "$NCPU"
-          du -sh "$HOME/v5-dev" "$HOME/v5-20m" "$HOME/v5-60m"
+          du -sh "$HOME/v5-20m"
       - name: Gate candidate and interleave timing rounds
         shell: bash
         run: |
           set -euo pipefail
-          python3 bench/ci_bench.py "$HOME" "$GITHUB_WORKSPACE/bench-work"
+          python3 bench/abl_bench.py "$HOME" "$GITHUB_WORKSPACE/bench-work"
       - name: Publish benchmark evidence
         if: always()
         shell: bash
