@@ -74,7 +74,11 @@ jobs:
         run: |
           f=$(ls bench-work/20m/perf-srcline.txt 2>/dev/null | head -1)
           echo "file=$f"
-          sed -E 's/%//' "$f" | awk 'NF>=2 && $1+0>0 {s[$NF]+=$1} END {for (k in s) printf "%.2f %s\n", s[k], k}' | grep -E "main.rs:(2[2-6][0-9][0-9])|user_parquet.rs|mod.rs|slice" | sort -rn | head -90
+          ls -la bench-work/20m | head -20
+          awk 'NF>=3 {print $1, $NF}' "$f" | head -60
+          echo ---- main.rs lines
+          awk 'NF>=3 {print $1, $NF}' "$f" | sed 's/%//' | awk '{s[$2]+=$1} END {for (k in s) printf "%.2f %s\n", s[k], k}' | sort -rn | grep -E "main.rs|user_parquet" | head -80 || true
+          true
 
       - name: Profile v5 seed 17 at 60M
         if: ${{ false }}
