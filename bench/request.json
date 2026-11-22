@@ -3,11 +3,11 @@
   "additional_gate_baselines": [
     "6da0386b4ca6a001a5c7f747c68f40815fc14afb"
   ],
-  "candidate": "e152ce214f11686328f67593b263d6377e158f48",
+  "candidate": "2056ae91ff5d76502fecab63545b2d6bc5b91ef3",
   "timing": [
     "6da0386b4ca6a001a5c7f747c68f40815fc14afb",
     "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed",
-    "e152ce214f11686328f67593b263d6377e158f48"
+    "2056ae91ff5d76502fecab63545b2d6bc5b91ef3"
   ],
   "rounds": {"20m": 5, "60m": 3}
 }
