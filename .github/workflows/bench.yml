@@ -2,7 +2,7 @@ name: gum v5 Intel gate and timing
 
 on:
   push:
-    branches: [ci/gum]
+    branches: [ci/gum-evrow]
   workflow_dispatch:
 
 jobs:
@@ -50,5 +50,8 @@ jobs:
         if: always()
         with:
           name: gum-v5-intel-${{ github.run_id }}-${{ github.run_attempt }}
-          path: bench-work/
+          path: |
+            bench-work/summary.md
+            bench-work/observations.json
+            bench-work/logs/
           retention-days: 7
