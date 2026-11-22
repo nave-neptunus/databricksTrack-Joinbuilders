@@ -1,9 +1,9 @@
 {
-  "baseline": "5e262d2e7cbeb6ee80a875119d4e32eed10ac8de",
-  "candidate": "daa85dd7b27c9387dcb366b2244772ec77e6f01a",
+  "baseline": "a23a613430a9827543b526d08a3a81745114a1e3",
+  "candidate": "6af0fd2b6f8bfe3a6fdfb0a809e018f855367c6b",
   "timing": [
-    "5e262d2e7cbeb6ee80a875119d4e32eed10ac8de",
-    "daa85dd7b27c9387dcb366b2244772ec77e6f01a"
+    "a23a613430a9827543b526d08a3a81745114a1e3",
+    "6af0fd2b6f8bfe3a6fdfb0a809e018f855367c6b"
   ],
   "rounds": {
     "20m": 5,
@@ -12,8 +12,8 @@
   "cold": {
     "rounds": {"20m": 3, "60m": 3},
     "variants": [
-      {"label": "base", "sha": "5e262d2e7cbeb6ee80a875119d4e32eed10ac8de"},
-      {"label": "overlap", "sha": "daa85dd7b27c9387dcb366b2244772ec77e6f01a"}
+      {"label": "base", "sha": "a23a613430a9827543b526d08a3a81745114a1e3"},
+      {"label": "overlap", "sha": "6af0fd2b6f8bfe3a6fdfb0a809e018f855367c6b"}
     ]
   }
 }

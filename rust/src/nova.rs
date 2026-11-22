@@ -17,6 +17,8 @@ const EVENT_ID_SEED: u64 = 0x1319_8a2e_0370_7344;
 /// Marks the claim that carries the full bytes of the preceding long event ID.
 /// Real ingest orders equal to this value decline the fast path.
 const CARRIER: i32 = i32::MIN;
+/// Seed for the key of a long user ID (one that has no packed short key).
+const USER_ID_SEED: u64 = 0x082e_fa98_ec4e_6c89;
 
 /// Each payload byte below contributes seven exact bits. Its eighth bit is
 /// available for shape metadata. Prefix, length and all tail bytes round-trip.
@@ -57,6 +59,22 @@ fn permute_short(key: u64) -> u64 {
 #[inline]
 pub(super) fn user_key(uid: &[u8]) -> Option<u64> {
     short_key(uid, b'u').map(permute_short)
+}
+
+/// Key and check of any user ID, with no shared state. Short IDs use the
+/// reversible packed key. A long ID uses a 63-bit hash (top bit clear, so it
+/// never meets a packed key) and an independent 32-bit check. Equal keys with
+/// different checks, or different bytes in the link table, decline the fast
+/// path, so a hash collision can never merge two people.
+#[inline]
+pub(super) fn user_ident(uid: &[u8]) -> (u64, u32) {
+    match user_key(uid) {
+        Some(key) => (key, 0),
+        None => {
+            let (key, check) = crate::hs(uid, USER_ID_SEED);
+            (key & (u64::MAX >> 1), check)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -351,6 +369,7 @@ struct Pending {
     name: u64,
     ts: u32,
     price: u32,
+    chk: u32,
 }
 
 impl Pending {
@@ -362,6 +381,7 @@ impl Pending {
         name: 0,
         ts: INVALID,
         price: 0,
+        chk: 0,
     };
 }
 
@@ -690,7 +710,6 @@ pub(super) struct EventInput<'a> {
 struct Parser<'a, 'catalog, 'table> {
     input: &'a EventInput<'catalog>,
     users: &'a Users<'table>,
-    interner: &'a crate::ExactIds,
     declined: &'a AtomicBool,
     window_seconds: i64,
     window_ms: u64,
@@ -714,7 +733,7 @@ impl Parser<'_, '_, '_> {
             let loc = if pending.ts != INVALID {
                 let person = self
                     .users
-                    .person(pending.uid, 0, pending.name, &mut self.ids, self.declined);
+                    .person(pending.uid, pending.chk, pending.name, &mut self.ids, self.declined);
                 let part = person as usize & (P - 1);
                 let index = self.people.push(part, person, pending.ts, pending.price);
                 if index >= INDEX_MASK as usize {
@@ -808,7 +827,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.price = value | (category << 24);
             }
-            let uid = user_key(user).unwrap_or_else(|| self.interner.intern(user));
+            let (uid, chk) = user_ident(user);
             // Keep a direct reference to the full ID for the name. This avoids
             // decoding short keys later (and an allocation per person).
             let Some(r) = crate::pack_ref(user) else {
@@ -819,6 +838,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.users.prefetch(uid);
             pending.ts = relative as u32;
             pending.uid = uid;
+            pending.chk = chk;
         }
         self.batch[self.count] = pending;
         self.count += 1;
@@ -832,7 +852,6 @@ fn events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
     users: &Users<'_>,
-    interner: &crate::ExactIds,
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
@@ -854,7 +873,6 @@ fn events(
             let mut parser = Parser {
                 input,
                 users,
-                interner,
                 declined,
                 window_seconds: input.start.div_euclid(1000),
                 window_ms: (input.end - input.start) as u64,
@@ -1023,14 +1041,13 @@ pub(super) fn run_events<C: Send>(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
     users: &Users<'_>,
-    interner: &crate::ExactIds,
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
     estimated_rows: usize,
     parse_clicks: impl FnOnce() -> C + Send,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>, C)> {
-    let (claims, people) = events(work, read_ahead, users, interner, input, declined, estimated_rows);
+    let (claims, people) = events(work, read_ahead, users, input, declined, estimated_rows);
     if declined.load(Relaxed) {
         return None;
     }
@@ -1093,6 +1110,17 @@ mod tests {
         people.records(part).into_iter().flatten()
             .filter_map(|r| r.live().map(|ts| (ts, r.price)))
             .collect()
+    }
+
+    #[test]
+    fn long_user_ids_hash_disjoint_from_short_keys() {
+        let long = b"u_0123456789abcdef0123456789abcdef";
+        let (key, check) = user_ident(long);
+        assert_eq!(key & SHORT_KEY, 0);
+        assert_eq!((key, check), user_ident(long));
+        assert_ne!(user_ident(b"u_0123456789abcdef0123456789abcdeg"), (key, check));
+        let (short, zero) = user_ident(b"u_12");
+        assert_eq!((short & SHORT_KEY, zero), (SHORT_KEY, 0));
     }
 
     #[test]
