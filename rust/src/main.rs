@@ -4,6 +4,8 @@
 // The mixed-ID engine packs common short IDs and interns other IDs by their full
 // bytes. The fixed-shape Nova engine remains available with NOVA=1.
 mod nova;
+mod scatter;
+use scatter::{CL_STAGE, ClRec, PARTS, Scatter, part_of};
 mod slow;
 mod user_parquet;
 
@@ -1996,19 +1998,13 @@ fn fast(nova: bool) -> bool {
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
     let parse_clicks = || {
         let cch = LazyChunks::new(&ckb, 4 << 20);
-        let parse_chunk = |mut acc: Box<nova::Streams<Click, P>>, ci| {
+        let click_bytes: usize = ckb.iter().map(|b| b.len()).sum();
+        let rows = nova::rows_per_slice(click_bytes / 40, rayon::current_num_threads());
+        // P1: parse and validate into per-worker scatters by hash(uid). No table is touched.
+        let parse_chunk = |mut acc: Box<Scatter<ClRec, CL_STAGE>>, ci| {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
             let mut dates = nova::Dates::default();
-            let mut batch = Vec::with_capacity(64);
-            let mut flush = |batch: &mut Vec<PendingClick>| {
-                for PendingClick { mut click, key, check } in batch.drain(..) {
-                    // A user id not in the table has no valid event, so no session to credit.
-                    let Some(person) = users.find(key, check, &coll) else { continue };
-                    click.person = person;
-                    acc.push(person as usize & (P - 1), click);
-                }
-            };
             nova::click_rows(chunk, |_, [cid, user, cmp, ts]| {
                 if cid.is_empty() || user.is_empty() {
                     return;
@@ -2023,23 +2019,18 @@ fn fast(nova: bool) -> bool {
                     coll.store(true, Relaxed);
                     return;
                 };
-                let (key, check) = if nova {
+                let (ukey, uchk) = if nova {
                     nova::user_ident(user)
                 } else {
                     ids.user(user)
                 };
-                users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
-                batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
-                if batch.len() == 64 {
-                    flush(&mut batch);
-                }
+                acc.push(part_of(ukey), ClRec { tag, ukey, uchk, ts });
             });
-            flush(&mut batch);
             acc
         };
-        let init = || Box::new(nova::Streams::new());
-        let clicks = if nova {
+        let init = || Box::new(Scatter::new(rows));
+        let mut scatters = if nova {
             // Work-stealable chunks share the pool with event dedup. Claim chunk
             // indices in order to stay behind the read-ahead workers.
             let next = std::sync::atomic::AtomicUsize::new(0);
@@ -2049,6 +2040,29 @@ fn fast(nova: bool) -> bool {
         } else {
             pt_ordered(cch.len(), init, parse_chunk)
         };
+        for scatter in &mut scatters {
+            scatter.finish();
+        }
+        lap("clicks scattered");
+        // Stub for stages 4-7: copies of a click are identical, so a duplicate can change
+        // neither the chosen click nor the set of assisting campaigns (no dedup needed).
+        // Route each record to its person's partition for the current session stage.
+        let clicks = pt((0..PARTS).into_par_iter(), || Box::new(nova::Streams::<Click, P>::new()), |mut acc, part| {
+            for scatter in &scatters {
+                for rows in scatter.records(part) {
+                    for (i, rec) in rows.iter().enumerate() {
+                        if let Some(ahead) = rows.get(i + 8) {
+                            users.prefetch(ahead.ukey);
+                        }
+                        // A user id not in the table has no valid event, so no session to credit.
+                        let Some(person) = users.find(rec.ukey, rec.uchk, &coll) else { continue };
+                        acc.push(person as usize & (P - 1), Click { tag: rec.tag, person, ts: rec.ts });
+                    }
+                }
+            }
+            acc
+        });
+        std::mem::forget(scatters);
         lap("clicks parsed");
         clicks
     };

@@ -1,5 +1,6 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
+use crate::scatter::{EV_STAGE, EvRec, PARTS, Scatter, part_of};
 use crate::{DAY, EvP, LazyChunks, P, PB, People, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
@@ -389,33 +390,6 @@ unsafe fn copy_people(src: *const EvP, dst: *mut EvP, count: usize) {
     unsafe { std::ptr::copy_nonoverlapping(src, dst, count) };
 }
 
-#[derive(Clone, Copy)]
-struct Pending {
-    key: u64,
-    // Nonzero for long event IDs: a packed reference to the full ID bytes.
-    // The dedup router verifies these bytes when two hash keys are equal.
-    eref: u64,
-    ingest: i32,
-    uid: u64,
-    name: u64,
-    ts: u32,
-    price: u32,
-    chk: u32,
-}
-
-impl Pending {
-    const EMPTY: Self = Self {
-        key: 0,
-        eref: 0,
-        ingest: 0,
-        uid: 0,
-        name: 0,
-        ts: INVALID,
-        price: 0,
-        chk: 0,
-    };
-}
-
 trait Fields<'a> {
     fn field<const I: usize>(&self) -> &'a [u8];
 
@@ -738,69 +712,33 @@ pub(super) struct EventInput<'a> {
     pub(super) end: i64,
 }
 
-struct Parser<'a, 'catalog, 'table> {
+/// P1 parser: turns each event row into one `EvRec` scattered by hash(uid).
+/// It reads no shared table and uses no atomics per row. Field splitting comes
+/// from `scan_event_rows`, whose SIMD paths hand any row they do not fully
+/// understand to the scalar reference parser, so malformed rows are dropped by
+/// exactly the same rules as before.
+struct RecordParser<'a, 'catalog> {
     input: &'a EventInput<'catalog>,
-    users: &'a Users<'table>,
     declined: &'a AtomicBool,
     window_seconds: i64,
     window_ms: u64,
     dates: Dates,
-    ids: (u32, u32),
-    batch: [Pending; 16],
-    count: usize,
-    streams: Streams<Claim, SHARDS>,
-    long: Streams<LongClaim, SHARDS>,
-    people: PeopleWriter<'a>,
-    worker: u32,
+    out: &'a mut Scatter<EvRec, EV_STAGE>,
 }
 
-impl Parser<'_, '_, '_> {
+impl RecordParser<'_, '_> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
         scan_event_rows(bytes, self);
     }
-
-    #[inline]
-    fn flush(&mut self) {
-        for pending in &self.batch[..self.count] {
-            let loc = if pending.ts != INVALID {
-                let person = self
-                    .users
-                    .person(pending.uid, pending.chk, pending.name, &mut self.ids, self.declined);
-                let part = person as usize & (P - 1);
-                let index = self.people.push(part, person, pending.ts, pending.price);
-                if index >= INDEX_MASK as usize {
-                    self.declined.store(true, Relaxed);
-                    continue;
-                }
-                (self.worker << LOC_WORKER_SHIFT)
-                    | ((part as u32) << LOC_PART_SHIFT)
-                    | index as u32
-            } else {
-                // Invalid copies still compete for the earliest ingest, but
-                // they have no payload to keep or tombstone.
-                NO_LOC
-            };
-            let shard = shard_of(pending.key);
-            if pending.eref != 0 {
-                let (key, eref, ingest) = (pending.key, pending.eref, pending.ingest);
-                self.long.push(shard, LongClaim { key, eref, ingest, loc });
-            } else {
-                self.streams.push(shard, Claim { key: pending.key, ingest: pending.ingest, loc });
-            }
-        }
-        self.count = 0;
-    }
 }
 
-impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
+impl<'a> EventSink<'a> for RecordParser<'_, '_> {
     #[inline]
     fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
         let id = fields.field::<0>();
         if id.is_empty() {
             return;
         }
-        // The parser can release its input chunk after this call. No
-        // captured identities reference the source buffer.
         // Short event IDs use the reversible packed key. Long, suffixed IDs
         // use a 63-bit hash and carry a reference to their full bytes; dedup
         // verifies those bytes before treating two keys as the same event.
@@ -822,10 +760,9 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.declined.store(true, Relaxed);
             return;
         };
-        let mut pending = Pending::EMPTY;
-        pending.key = key;
-        pending.eref = eref;
-        pending.ingest = order;
+        let mut rec = EvRec { ekey: key, eref, ukey: 0, name: 0, ingest: order, ts: INVALID, price: 0, uchk: 0 };
+        // A claim without a payload has no user: spread it by event key.
+        let mut part = part_of(key);
         'valid: {
             let user = fields.field::<1>();
             if user.is_empty() || fields.empty::<5>() {
@@ -843,6 +780,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             if relative >= self.window_ms || seconds * 1000 - time > DAY {
                 break 'valid;
             }
+            let mut price = 0;
             if purchase {
                 let Some(value) = parse_price(fields.field::<6>()) else {
                     break 'valid;
@@ -852,34 +790,73 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .products
                     .get(fields.field::<5>())
                     .unwrap_or(&self.input.unknown);
-                pending.price = value | (category << 24);
+                price = value | (category << 24);
             }
-            let (uid, chk) = user_ident(user);
+            let (ukey, uchk) = user_ident(user);
             // Keep a direct reference to the full ID for the name. This avoids
             // decoding short keys later (and an allocation per person).
-            let Some(r) = crate::pack_ref(user) else {
+            let Some(name) = crate::pack_ref(user) else {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
-            pending.name = r;
-            self.users.prefetch(uid);
-            pending.ts = relative as u32;
-            pending.uid = uid;
-            pending.chk = chk;
+            rec.name = name;
+            rec.ukey = ukey;
+            rec.uchk = uchk;
+            rec.price = price;
+            rec.ts = relative as u32;
+            part = part_of(ukey);
         }
-        self.batch[self.count] = pending;
-        self.count += 1;
-        if self.count == self.batch.len() {
-            self.flush();
-        }
+        self.out.push(part, rec);
     }
 }
 
-fn events(
+/// Rows per (producer, partition) arena slice for an estimated row count.
+pub(super) fn rows_per_slice(estimated_rows: usize, producers: usize) -> usize {
+    let rows = estimated_rows.div_ceil(PARTS * producers.max(1));
+    rows + rows / 4
+}
+
+/// Stage 3 (P1): parse events into per-worker scatters by hash(uid).
+fn scatter_events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
-    users: &Users<'_>,
     input: &EventInput<'_>,
+    declined: &AtomicBool,
+    estimated_rows: usize,
+) -> Vec<Scatter<EvRec, EV_STAGE>> {
+    let next = AtomicUsize::new(0);
+    let rows = rows_per_slice(estimated_rows, rayon::current_num_threads());
+    rayon::broadcast(|_| {
+        let mut out = Scatter::new(rows);
+        let mut parser = RecordParser {
+            input,
+            declined,
+            window_seconds: input.start.div_euclid(1000),
+            window_ms: (input.end - input.start) as u64,
+            dates: Dates::default(),
+            out: &mut out,
+        };
+        loop {
+            let index = next.fetch_add(1, Relaxed);
+            if index >= work.len() {
+                break;
+            }
+            read_ahead.wait(work.raw(index));
+            parser.parse_chunk(work.get(index));
+        }
+        out.finish();
+        out
+    })
+}
+
+/// Stub for stages 4-7 of the redesign: until P2 exists, resolve each record
+/// against the shared person table and place it exactly where the previous
+/// parser did, so today's dedup, sessionize and write stages run unchanged.
+/// Workers take whole uid-hash partitions, so the table lookups of one
+/// partition stay close together.
+fn resolve_events(
+    scatters: &[Scatter<EvRec, EV_STAGE>],
+    users: &Users<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
 ) -> (Vec<Folds>, Vec<People>) {
@@ -897,32 +874,49 @@ fn events(
         }
         let mut people = People::new(if too_many { 0 } else { reservation });
         let streams = {
-            let mut parser = Parser {
-                input,
-                users,
-                declined,
-                window_seconds: input.start.div_euclid(1000),
-                window_ms: (input.end - input.start) as u64,
-                dates: Dates::default(),
-                ids: (0, 0),
-                batch: [Pending::EMPTY; 16],
-                count: 0,
-                streams: Streams::new(),
-                long: Streams::new(),
-                people: PeopleWriter::new(&mut people),
-                worker,
-            };
+            let mut writer = PeopleWriter::new(&mut people);
+            let mut short = Streams::<Claim, SHARDS>::new();
+            let mut long = Streams::<LongClaim, SHARDS>::new();
+            let mut ids = (0u32, 0u32);
             loop {
-                let index = next.fetch_add(1, Relaxed);
-                if index >= work.len() {
+                let part = next.fetch_add(1, Relaxed);
+                if part >= PARTS {
                     break;
                 }
-                read_ahead.wait(work.raw(index));
-                parser.parse_chunk(work.get(index));
+                for scatter in scatters {
+                    for rows in scatter.records(part) {
+                        for (i, rec) in rows.iter().enumerate() {
+                            if let Some(ahead) = rows.get(i + 8) {
+                                if ahead.ts != INVALID {
+                                    users.prefetch(ahead.ukey);
+                                }
+                            }
+                            let loc = if rec.ts != INVALID {
+                                let person = users.person(rec.ukey, rec.uchk, rec.name, &mut ids, declined);
+                                let part = person as usize & (P - 1);
+                                let index = writer.push(part, person, rec.ts, rec.price);
+                                if index >= INDEX_MASK as usize {
+                                    declined.store(true, Relaxed);
+                                    continue;
+                                }
+                                (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
+                            } else {
+                                // Invalid copies still compete for the earliest
+                                // ingest, but have no payload to keep or tombstone.
+                                NO_LOC
+                            };
+                            let shard = shard_of(rec.ekey);
+                            if rec.eref != 0 {
+                                long.push(shard, LongClaim { key: rec.ekey, eref: rec.eref, ingest: rec.ingest, loc });
+                            } else {
+                                short.push(shard, Claim { key: rec.ekey, ingest: rec.ingest, loc });
+                            }
+                        }
+                    }
+                }
             }
-            parser.flush();
-            parser.people.finish();
-            Folds { short: parser.streams, long: parser.long }
+            writer.finish();
+            Folds { short, long }
         };
         (worker, streams, people)
     });
@@ -938,6 +932,22 @@ fn events(
     (streams, people)
 }
 
+fn events(
+    work: &LazyChunks<'_>,
+    read_ahead: &ReadAhead,
+    users: &Users<'_>,
+    input: &EventInput<'_>,
+    declined: &AtomicBool,
+    estimated_rows: usize,
+) -> (Vec<Folds>, Vec<People>) {
+    let scatters = scatter_events(work, read_ahead, input, declined, estimated_rows);
+    lap("  events scattered");
+    let result = resolve_events(&scatters, users, declined, estimated_rows);
+    lap("  events resolved");
+    // The process exits right after the run; skip unmapping the arenas.
+    std::mem::forget(scatters);
+    result
+}
 
 // One 16-byte cell holds the full event key, the winning ingest time and the
 // location of the payload parse already wrote into its final person partition.
@@ -1155,6 +1165,97 @@ mod tests {
         people.records(part).into_iter().flatten()
             .filter_map(|r| r.live().map(|ts| (ts, r.price)))
             .collect()
+    }
+
+    fn leak(b: &[u8]) -> &'static [u8] {
+        Box::leak(b.to_vec().into_boxed_slice())
+    }
+
+    fn event(ekey: u64, eref: &[u8], user: &[u8], ingest: i32, ts: u32, price: u32) -> EvRec {
+        let (ukey, uchk) = user_ident(user);
+        let eref = if eref.is_empty() { 0 } else { crate::pack_ref(leak(eref)).unwrap() };
+        EvRec { ekey, eref, ukey, name: crate::pack_ref(leak(user)).unwrap(), ingest, ts, price, uchk }
+    }
+
+    /// Run records through the P1 stub and today's dedup, and return the live
+    /// (person name, ts, price) rows, sorted.
+    fn run_stub(recs: &[EvRec], force_part: Option<usize>) -> (Vec<(Vec<u8>, u32, u32)>, bool) {
+        let mut tab = crate::Tab::new(16);
+        let users = Users::new(&mut tab, 0, 0);
+        let declined = AtomicBool::new(false);
+        let mut scatter = Scatter::<EvRec, EV_STAGE>::new(4);
+        for r in recs {
+            scatter.push(force_part.unwrap_or_else(|| part_of(r.ukey)), *r);
+        }
+        scatter.finish();
+        let (claims, people) = resolve_events(&[scatter], &users, &declined, recs.len());
+        for shard in 0..SHARDS {
+            Router::new().route(&people, &claims, shard);
+        }
+        let (_, names) = person_names(&users, &[]).unwrap();
+        let mut live = Vec::new();
+        for p in &people {
+            for part in 0..P {
+                for r in p.records(part).into_iter().flatten() {
+                    if let Some(ts) = r.live() {
+                        live.push((names[r.person as usize].to_vec(), ts, r.price));
+                    }
+                }
+            }
+        }
+        live.sort();
+        (live, declined.load(Relaxed))
+    }
+
+    #[test]
+    fn stub_keeps_forced_long_event_id_collisions_apart_and_dedups_equal_bytes() {
+        // Two different long event IDs forced onto one key, plus a true duplicate of the first.
+        let key = 0x0123_4567_89ab_cdefu64 & (u64::MAX >> 1);
+        let u = b"u_0123456789abcdef0123456789abcdef";
+        let recs = [
+            event(key, b"e_alpha_long_identifier", u, 20, 100, 1),
+            event(key, b"e_bravo_long_identifier", u, 20, 200, 2),
+            event(key, b"e_alpha_long_identifier", u, 10, 100, 1),
+        ];
+        // The same rows scattered into one partition or by uid must agree.
+        for force in [Some(17), None] {
+            let (live, declined) = run_stub(&recs, force);
+            assert!(!declined);
+            assert_eq!(live, vec![(u.to_vec(), 100, 1), (u.to_vec(), 200, 2)]);
+        }
+    }
+
+    #[test]
+    fn stub_keeps_forced_short_id_collisions_apart() {
+        // Different short users and event IDs forced into one scatter partition, and a
+        // short user differing from another only in the case of its prefix.
+        let recs = [
+            event(permute_short(short_key(b"e1", b'e').unwrap()), b"", b"u1234567", 5, 10, 1),
+            event(permute_short(short_key(b"E1", b'e').unwrap()), b"", b"U1234567", 5, 20, 2),
+            event(permute_short(short_key(b"e2", b'e').unwrap()), b"", b"u1234567", 5, 30, 3),
+            // Same event ID as the first with a later ingest: the first copy wins.
+            event(permute_short(short_key(b"e1", b'e').unwrap()), b"", b"u1234567", 9, 40, 4),
+        ];
+        let (live, declined) = run_stub(&recs, Some(3));
+        assert!(!declined);
+        assert_eq!(live, vec![
+            (b"U1234567".to_vec(), 20, 2),
+            (b"u1234567".to_vec(), 10, 1),
+            (b"u1234567".to_vec(), 30, 3),
+        ]);
+    }
+
+    #[test]
+    fn stub_declines_when_two_long_user_ids_share_a_key_with_different_checks() {
+        let mut a = event(1, b"", b"u_0123456789abcdef0123456789abcdef", 5, 10, 1);
+        let mut b = event(2, b"", b"u_0123456789abcdef0123456789abcdeg", 5, 10, 1);
+        // Force one user key and different independent checks.
+        a.ukey = 0x55;
+        b.ukey = 0x55;
+        a.uchk = 1;
+        b.uchk = 2;
+        let (_, declined) = run_stub(&[a, b], Some(0));
+        assert!(declined, "a hash collision must decline the fast path, never merge people");
     }
 
     #[test]
