@@ -337,6 +337,8 @@ unsafe fn copy_people(src: *const EvP, dst: *mut EvP, count: usize) {
 #[derive(Clone, Copy)]
 struct Pending {
     key: u64,
+    // Nonzero for long event IDs: the packed reference to the full bytes.
+    eref: u64,
     ingest: i32,
     uid: u64,
     name: u64,
@@ -365,6 +367,7 @@ fn long_cache_index(b: &[u8]) -> usize {
 impl Pending {
     const EMPTY: Self = Self {
         key: 0,
+        eref: 0,
         ingest: 0,
         uid: 0,
         name: 0,
@@ -742,6 +745,13 @@ impl Parser<'_, '_, '_> {
                 (pending.key >> 55) as u8 as usize,
                 Claim { key: pending.key, ingest: pending.ingest, loc },
             );
+            if pending.eref != 0 {
+                // The next claim in the same stream carries the full-ID reference.
+                self.streams.push(
+                    (pending.key >> 55) as u8 as usize,
+                    Claim { key: pending.eref, ingest: CARRIER, loc: 0 },
+                );
+            }
         }
         self.count = 0;
     }
@@ -757,9 +767,17 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         // The parser can release its input chunk after this call. No
         // captured identities reference the source buffer.
         // Short event IDs use the reversible packed key; v5's suffixed IDs
-        // are interned by their full bytes and stay exact.
-        let key = short_key(id, b'e').map(permute_short)
-            .unwrap_or_else(|| self.interner.intern(id));
+        // are keyed by a 63-bit hash; dedup compares the bytes on equal keys.
+        let (key, eref) = match short_key(id, b'e') {
+            Some(key) => (permute_short(key), 0),
+            None => {
+                let Some(eref) = crate::pack_ref(id) else {
+                    self.declined.store(true, Relaxed);
+                    return;
+                };
+                (crate::hs(id, 0x1319_8a2e_0370_7344).0 & (u64::MAX >> 1), eref)
+            }
+        };
         let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
             self.declined.store(true, Relaxed);
             return;
@@ -770,6 +788,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         };
         let mut pending = Pending::EMPTY;
         pending.key = key;
+        pending.eref = eref;
         pending.ingest = order;
         'valid: {
             let user = fields.field::<1>();
@@ -910,6 +929,8 @@ type ClaimStream = Streams<Claim, SHARDS>;
 const META_GEN_SHIFT: u32 = 24;
 const META_INGEST_MASK: u32 = (1 << META_GEN_SHIFT) - 1;
 const INGEST_BIAS: i32 = 1 << 21;
+/// Marks the reference-carrying claim that follows each long-ID claim.
+const CARRIER: i32 = i32::MIN;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -921,6 +942,8 @@ struct Slot {
 
 struct Router {
     slots: Vec<Slot>,
+    // Full-ID reference of the long event ID that owns each slot (0 = short).
+    refs: Vec<u64>,
     generation: u32,
     route_ns: u64,
     table_percent: usize,
@@ -930,6 +953,7 @@ impl Router {
     fn new() -> Self {
         Self {
             slots: Vec::new(),
+            refs: Vec::new(),
             generation: 0,
             route_ns: 0,
             table_percent: std::env::var("BREAKER_TABLE_PERCENT").ok().and_then(|s| s.parse().ok()).unwrap_or(200).max(110),
@@ -957,6 +981,7 @@ impl Router {
         let mask = (count * self.table_percent / 100).next_power_of_two() - 1;
         if self.slots.len() < mask + 1 {
             self.slots.resize(mask + 1, Slot::default());
+            self.refs.resize(mask + 1, 0);
         }
         self.generation += 1;
         if self.generation == 1 << (32 - META_GEN_SHIFT) {
@@ -969,24 +994,42 @@ impl Router {
         // Dedup only chooses the earliest-ingest copy and tombstones losers,
         // so there is no scatter pass and no second traversal of event data.
         for fold in claims {
+            let mut long: Option<Claim> = None;
             for block in fold.chunks(shard) {
-                for (offset, claim) in block.iter().enumerate() {
+                for (offset, entry) in block.iter().enumerate() {
                     if let Some(next) = block.get(offset + 8) {
-                        crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
+                        if next.ingest != CARRIER {
+                            crate::prefetch_read(self.slots.as_ptr().wrapping_add(next.key as usize & mask).cast());
+                        }
                     }
+                    let (claim, eref) = match long.take() {
+                        Some(claim) => (claim, entry.key),
+                        None if entry.key & SHORT_KEY == 0 => {
+                            long = Some(*entry);
+                            continue;
+                        }
+                        None => (*entry, 0),
+                    };
                     let meta = generation | ((claim.ingest + INGEST_BIAS) as u32 & META_INGEST_MASK);
                     let mut slot = claim.key as usize & mask;
                     loop {
                         let winner = self.slots[slot];
                         if winner.meta >> META_GEN_SHIFT != generation >> META_GEN_SHIFT {
                             self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
+                            self.refs[slot] = eref;
                             break;
                         }
-                        if winner.key == claim.key {
+                        // Equal hashes name one event only if the full IDs agree.
+                        if winner.key == claim.key
+                            && (eref == 0
+                                || self.refs[slot] == eref
+                                || crate::unpack_ref(self.refs[slot]) == crate::unpack_ref(eref))
+                        {
                             let previous = (winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS;
                             if claim.ingest < previous {
                                 Self::tombstone(people, winner.loc);
                                 self.slots[slot] = Slot { key: claim.key, meta, loc: claim.loc };
+                                self.refs[slot] = eref;
                             } else {
                                 Self::tombstone(people, claim.loc);
                             }
@@ -1052,6 +1095,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn router_separates_long_ids_with_equal_hashes() {
+        fn long(claims: &mut ClaimStream, bytes: &'static [u8], ingest: i32) {
+            // One shared hash key: only the full bytes tell the IDs apart.
+            let key = 77u64;
+            claims.push(0, Claim { key, ingest, loc: NO_LOC });
+            claims.push(0, Claim { key: crate::pack_ref(bytes).unwrap(), ingest: CARRIER, loc: 0 });
+        }
+        let people: Vec<People> = Vec::new();
+        let mut claims = vec![ClaimStream::new()];
+        long(&mut claims[0], b"e000000000000000000000000000000001", 5);
+        long(&mut claims[0], b"e000000000000000000000000000000002", 3);
+        long(&mut claims[0], b"e000000000000000000000000000000001", 1);
+        let mut router = Router::new();
+        router.route(&people, &claims, 0);
+        // Both distinct IDs hold a winner; the repeated ID replaced its first copy.
+        let mut winners: Vec<(u64, i32)> = router
+            .slots
+            .iter()
+            .zip(&router.refs)
+            .filter(|(slot, _)| slot.meta >> META_GEN_SHIFT != 0)
+            .map(|(slot, r)| (*r, (slot.meta & META_INGEST_MASK) as i32 - INGEST_BIAS))
+            .collect();
+        winners.sort_by_key(|w| w.1);
+        assert_eq!(winners.len(), 2);
+        assert_eq!(winners.iter().map(|w| w.1).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[test]
     fn router_keeps_earliest_invalid_and_changed_person_copies() {
         fn place(
             people: &mut PeopleWriter<'_>,
@@ -1070,7 +1141,7 @@ mod tests {
                 let index = people.push(part, person, ts, price);
                 (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
             };
-            claims[worker as usize].push((key >> 55) as u8 as usize, Claim { key, ingest, loc });
+            claims[worker as usize].push((key >> 55) as u8 as usize, Claim { key: key | SHORT_KEY, ingest, loc });
         }
 
         let mut people = [People::new(32), People::new(1)];
