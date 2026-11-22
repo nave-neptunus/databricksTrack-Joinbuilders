@@ -6,6 +6,8 @@
 mod nova;
 mod slow;
 mod user_parquet;
+#[cfg(feature = "hex-users")]
+mod hex_users;
 
 use ahash::AHashMap as HashMap;
 use rayon::prelude::*;
@@ -738,11 +740,28 @@ struct ExactIds {
     // Keys borrow directly from the memory-mapped inputs, which live for the
     // whole run. Interning a long ID therefore needs no allocation or copy.
     shards: Vec<std::sync::Mutex<HashMap<&'static [u8], u64>>>,
+    #[cfg(feature = "hex-users")]
+    hex: hex_users::HexUsers,
 }
 
 impl ExactIds {
     fn new() -> Self {
-        Self { shards: (0..256).map(|_| std::sync::Mutex::new(HashMap::default())).collect() }
+        Self::with_user_capacity(1024)
+    }
+
+    fn with_user_capacity(_users: usize) -> Self {
+        Self {
+            shards: (0..256).map(|_| std::sync::Mutex::new(HashMap::default())).collect(),
+            #[cfg(feature = "hex-users")]
+            hex: hex_users::HexUsers::new((_users / 4).max(256)),
+        }
+    }
+
+    fn overflowed(&self) -> bool {
+        #[cfg(feature = "hex-users")]
+        { self.hex.overflowed() }
+        #[cfg(not(feature = "hex-users"))]
+        { false }
     }
 
     fn intern_in(&self, shard: usize, bytes: &[u8]) -> u64 {
@@ -753,6 +772,8 @@ impl ExactIds {
         let ordinal = (map.len() as u64 * 256) + shard as u64 + 1;
         // Odd multiplication permutes the positive 63-bit ordinals. Allocating
         // enough distinct entries to exhaust this space exceeds addressable RAM.
+        #[cfg(feature = "hex-users")]
+        let ordinal = ordinal << 1;
         let id = ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (u64::MAX >> 1);
         // SAFETY: every ID slice comes from an input that is memory-mapped and
         // leaked for the whole process; the map is dropped only at process exit.
@@ -762,6 +783,10 @@ impl ExactIds {
     }
 
     fn intern(&self, bytes: &[u8]) -> u64 {
+        #[cfg(feature = "hex-users")]
+        if let Some(id) = self.hex.intern(bytes) {
+            return id;
+        }
         let shard = hs(bytes, 0x243f_6a88_85a3_08d3).0 as u8;
         self.intern_in(shard as usize, bytes)
     }
@@ -1984,7 +2009,7 @@ fn fast(nova: bool) -> bool {
         ra.wait(b);
     }
     lap("  links read");
-    let ids = ExactIds::new();
+    let ids = ExactIds::with_user_capacity(est_users);
     let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, &ids, nova) else {
         return false;
     };
@@ -2184,7 +2209,7 @@ fn fast(nova: bool) -> bool {
         },
     );
     lap("clicks parsed");
-    if coll.load(Relaxed) {
+    if coll.load(Relaxed) || ids.overflowed() {
         return false;
     }
 
@@ -2782,5 +2807,21 @@ mod mixed_id_tests {
         assert_ne!(a, b);
         assert_eq!(a, ids.intern_in(5, first));
         assert_ne!(a, nova::user_key(b"u12345678").unwrap());
+    }
+
+    #[cfg(feature = "hex-users")]
+    #[test]
+    fn hex_generic_and_short_user_handles_are_disjoint() {
+        let ids = ExactIds::new();
+        let hex = ids.intern(b"u0000000000000000000000000000000a");
+        let generic = ids.intern(b"u0000000000000000000000000000000A");
+        let short = nova::user_key(b"u12345678").unwrap();
+        assert_ne!(hex, generic);
+        assert_ne!(hex, short);
+        assert_ne!(generic, short);
+        assert_eq!(hex & 1, 1);
+        assert_eq!(generic & 1, 0);
+        assert_eq!(hex >> 63, 0);
+        assert_eq!(short >> 63, 1);
     }
 }

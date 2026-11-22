@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+hex-users = []
 # Nova's claim streams and dedup routers share this compile-time count. Larger
 # values keep each router table closer to cache at the cost of more stream
 # metadata and shorter per-shard work.
