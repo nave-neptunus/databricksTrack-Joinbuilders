@@ -773,13 +773,51 @@ impl ExactIds {
 
 /// Open-addressing map from a 64-bit key (plus check) to a u32 value.
 struct Tab {
-    slots: Vec<(u64, u64)>, // (key, (chk << 32) | val); key 0 = empty
+    slots: HugeSlots, // (key, (chk << 32) | val); key 0 = empty
     mask: usize,
+}
+
+/// Zeroed (u64, u64) cells in an anonymous mapping advised for transparent huge
+/// pages: the link table is probed at random, so 4 KiB pages cost both page
+/// faults and TLB misses.  Falls back to the allocator if mmap fails.
+enum HugeSlots {
+    Map(memmap2::MmapMut, usize),
+    Heap(Vec<(u64, u64)>),
+}
+impl HugeSlots {
+    fn zeroed(cap: usize) -> Self {
+        match cap.checked_mul(16).and_then(|bytes| memmap2::MmapMut::map_anon(bytes).ok()) {
+            Some(map) => {
+                #[cfg(target_os = "linux")]
+                let _ = map.advise(memmap2::Advice::HugePage);
+                HugeSlots::Map(map, cap)
+            }
+            None => HugeSlots::Heap(vec![(0, 0); cap]),
+        }
+    }
+}
+impl std::ops::Deref for HugeSlots {
+    type Target = [(u64, u64)];
+    fn deref(&self) -> &[(u64, u64)] {
+        match self {
+            // Anonymous mappings are page-aligned and zero-filled; (u64, u64) has no invalid bit patterns.
+            HugeSlots::Map(map, cap) => unsafe { std::slice::from_raw_parts(map.as_ptr() as *const (u64, u64), *cap) },
+            HugeSlots::Heap(v) => v,
+        }
+    }
+}
+impl std::ops::DerefMut for HugeSlots {
+    fn deref_mut(&mut self) -> &mut [(u64, u64)] {
+        match self {
+            HugeSlots::Map(map, cap) => unsafe { std::slice::from_raw_parts_mut(map.as_mut_ptr() as *mut (u64, u64), *cap) },
+            HugeSlots::Heap(v) => v,
+        }
+    }
 }
 impl Tab {
     fn new(n: usize) -> Tab {
         let cap = (n * 2).next_power_of_two().max(16);
-        Tab { slots: vec![(0, 0); cap], mask: cap - 1 }
+        Tab { slots: HugeSlots::zeroed(cap), mask: cap - 1 }
     }
     #[inline]
     #[allow(dead_code)]
