@@ -7,6 +7,14 @@ use std::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 256;
+const SHARD_BITS: u32 = SHARDS.trailing_zeros();
+
+/// The shard is the top `SHARD_BITS` mixed bits below the short-ID tag bit.
+/// A long ID's claim and its carrier are pushed to the same stream.
+#[inline]
+fn shard_of(key: u64) -> usize {
+    (key >> (63 - SHARD_BITS)) as usize & (SHARDS - 1)
+}
 const BLOCK_BYTES: usize = 4096;
 const SLAB_BYTES: usize = 16 << 20;
 const SHORT_KEY: u64 = 1 << 63;
@@ -748,7 +756,7 @@ impl Parser<'_, '_, '_> {
                 // they have no payload to keep or tombstone.
                 NO_LOC
             };
-            let shard = (pending.key >> 55) as u8 as usize;
+            let shard = shard_of(pending.key);
             self.streams.push(shard, Claim { key: pending.key, ingest: pending.ingest, loc });
             if pending.eref != 0 {
                 // The carrier is next in this very stream, so dedup can pair it
