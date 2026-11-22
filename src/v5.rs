@@ -3,7 +3,7 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::ids::{Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard};
+use crate::ids::{self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard, SHARDS};
 use crate::iface::*;
 use crate::{
     core, k_ref, parse, setup, sys, Kind, Rec, BB, BSIZE, CBOUND, DAY_MS, G, ING_MAX, K, PBOUND, UB,
@@ -176,11 +176,10 @@ fn event_shard(hash: u64) -> usize {
 struct Scan<'a> {
     g: &'a G,
     users: &'a Users,
-    clicks: &'a Dictionary,
     user_keys: [u64; USER_CACHE],
     user_values: [u32; USER_CACHE],
     events: [Vec<Event>; EVENT_SHARDS],
-    us: &'a mut parse::Part,
+    clicks: [Vec<Click>; SHARDS],
     ev: Box<EvBatch>,
     ck: Box<CkBatch>,
     base: usize,
@@ -194,6 +193,18 @@ struct Event {
     id: u64,
     w0: u64,
     user_ingest: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Click {
+    id: u64,
+    key: u64,
+    user: u32,
+}
+
+struct Parsed {
+    events: [Mutex<Vec<Event>>; EVENT_SHARDS],
+    clicks: [Mutex<Vec<Click>>; SHARDS],
 }
 
 impl Scan<'_> {
@@ -252,11 +263,7 @@ impl Scan<'_> {
             w0 = rel << 33 | (r.price as u64) << 9 | cat << 4;
         }
         let hash = id_at(g, r.eid, self.base).hash();
-        let id = if r.eid & ID_ODD == 0 {
-            r.eid
-        } else {
-            r.eid + ((self.base as u64) << 8)
-        };
+        let id = self.absolute_id(r.eid);
         self.events[event_shard(hash)].push(Event {
             id,
             w0,
@@ -276,13 +283,18 @@ impl Scan<'_> {
         {
             return;
         }
-        let key = id_at(g, r.cid, self.base);
-        let (click, is_new) = self.clicks.intern(key, key.hash());
-        if is_new {
-            let user = self.person(r.uid) as u64;
-            let w0 = (user & ((1 << UB) - 1)) << 43 | click as u64;
-            let w1 = rel << 32 | (r.campaign as u64) << 4;
-            self.us.push((user >> UB) as usize, w0, w1);
+        let hash = id_at(g, r.cid, self.base).hash();
+        let id = self.absolute_id(r.cid);
+        let user = self.person(r.uid);
+        let key = rel << 32 | (r.campaign as u64) << 4;
+        self.clicks[ids::shard(hash)].push(Click { id, key, user });
+    }
+
+    fn absolute_id(&self, id: u64) -> u64 {
+        if id & ID_ODD == 0 {
+            id
+        } else {
+            id + ((self.base as u64) << 8)
         }
     }
 }
@@ -315,7 +327,7 @@ impl ClickSink for Scan<'_> {
     }
 }
 
-fn scan(g: &G, users: &Users, clicks: &Dictionary) -> Vec<[Mutex<Vec<Event>>; EVENT_SHARDS]> {
+fn scan(g: &G, users: &Users) -> Vec<Parsed> {
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
@@ -333,11 +345,10 @@ fn scan(g: &G, users: &Users, clicks: &Dictionary) -> Vec<[Mutex<Vec<Event>>; EV
         let mut s = Scan {
             g,
             users,
-            clicks,
             user_keys: [0; USER_CACHE],
             user_values: [0; USER_CACHE],
             events: std::array::from_fn(|_| Vec::new()),
-            us: &mut t.us,
+            clicks: std::array::from_fn(|_| Vec::new()),
             ev: EvBatch::new(),
             ck: CkBatch::new(),
             base: 0,
@@ -362,10 +373,12 @@ fn scan(g: &G, users: &Users, clicks: &Dictionary) -> Vec<[Mutex<Vec<Event>>; EV
                 Kind::Lk => unreachable!(),
             }
         }
-        s.us.finish();
         t.n_ev_rows = s.n_ev;
         t.n_ck_rows = s.n_ck;
-        *workers[tid].lock().unwrap() = Some(s.events.map(Mutex::new));
+        *workers[tid].lock().unwrap() = Some(Parsed {
+            events: s.events.map(Mutex::new),
+            clicks: s.clicks.map(Mutex::new),
+        });
     });
     workers
         .into_iter()
@@ -384,17 +397,28 @@ fn update_event(slot: &mut Event, row: Event) {
     }
 }
 
-fn dedup(g: &G, parsed: &[[Mutex<Vec<Event>>; EVENT_SHARDS]]) -> Vec<Vec<Mutex<Vec<Rec>>>> {
+fn dedup(g: &G, parsed: &[Parsed]) -> (Vec<Vec<Mutex<Vec<Rec>>>>, Names) {
+    let click_names: [Mutex<Option<Shard>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
     let next = AtomicUsize::new(0);
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     sys::run_par(g.nt, |tid| {
+        let clicks = &mut g.t(tid).us;
         let mut people: Vec<Vec<Rec>> = (0..g.nub).map(|_| Vec::new()).collect();
         loop {
             let shard = next.fetch_add(1, Ordering::Relaxed);
             if shard >= EVENT_SHARDS {
-                break;
+                let stripe = shard - EVENT_SHARDS;
+                if stripe >= SHARDS {
+                    break;
+                }
+                let keys = dedup_clicks(g, parsed, stripe, clicks);
+                *click_names[stripe].lock().unwrap() = Some(keys);
+                continue;
             }
-            let total = parsed.iter().map(|p| p[shard].lock().unwrap().len()).sum();
+            let total = parsed
+                .iter()
+                .map(|p| p.events[shard].lock().unwrap().len())
+                .sum();
             let mut short =
                 HashMap::<u64, u32, BuildHasherDefault<IdentityHasher>>::with_capacity_and_hasher(
                     total,
@@ -404,7 +428,7 @@ fn dedup(g: &G, parsed: &[[Mutex<Vec<Event>>; EVENT_SHARDS]]) -> Vec<Vec<Mutex<V
             let mut slots = Vec::<Event>::with_capacity(total);
             let mut long_slots = Vec::<Event>::with_capacity(total / 8);
             for p in parsed {
-                let part = std::mem::take(&mut *p[shard].lock().unwrap());
+                let part = std::mem::take(&mut *p.events[shard].lock().unwrap());
                 for row in part {
                     let id = id_at(g, row.id, 0);
                     let hash = id.hash();
@@ -435,12 +459,37 @@ fn dedup(g: &G, parsed: &[[Mutex<Vec<Event>>; EVENT_SHARDS]]) -> Vec<Vec<Mutex<V
                 }
             }
         }
+        clicks.finish();
         *workers[tid].lock().unwrap() = Some(people.into_iter().map(Mutex::new).collect());
     });
-    workers
+    let people = workers
         .into_iter()
         .map(|w| w.into_inner().unwrap().unwrap())
-        .collect()
+        .collect();
+    let names = Names::from_shards(click_names.map(|w| w.into_inner().unwrap().unwrap()));
+    (people, names)
+}
+
+fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Part) -> Shard {
+    let count = parsed
+        .iter()
+        .map(|p| p.clicks[stripe].lock().unwrap().len())
+        .sum();
+    let mut keys = Shard::with_capacity(count);
+    for p in parsed {
+        let part = std::mem::take(&mut *p.clicks[stripe].lock().unwrap());
+        for row in part {
+            let id = id_at(g, row.id, 0);
+            let (local, is_new) = keys.intern(id, id.hash());
+            if is_new {
+                let click = Names::index(stripe, local);
+                let user = row.user as u64;
+                let w0 = (user & ((1 << UB) - 1)) << 43 | click as u64;
+                clicks.push((user >> UB) as usize, w0, row.key);
+            }
+        }
+    }
+    keys
 }
 
 // Express consumes contiguous runs in event-slot order. Assign those slots
@@ -506,16 +555,15 @@ fn order_events(g: &G, people: &[Vec<Mutex<Vec<Rec>>>]) {
 
 pub fn stage1(g: &mut G) {
     let users = Users::new(g);
-    let clicks = Dictionary::new();
     sys::lap("link_ids");
-    let parsed = scan(g, &users, &clicks);
+    let parsed = scan(g, &users);
     sys::lap("scan_ids");
-    let people = dedup(g, &parsed);
+    let (people, clicks) = dedup(g, &parsed);
     sys::lap("dedup_ids");
     order_events(g, &people);
     sys::lap("order_events");
     g.ids = Some(Dictionaries {
         users: users.into_names(),
-        clicks: clicks.into_names(),
+        clicks,
     });
 }

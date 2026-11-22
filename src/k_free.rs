@@ -879,7 +879,6 @@ unsafe fn ids2v(xa: __m128i, sa: &IdShape, xb: __m128i, sb: &IdShape) -> (__m128
         let blocks = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000));
         let ids = _mm_or_si128(_mm_srli_epi64::<8>(_mm_slli_epi64::<32>(blocks)), _mm_srli_epi64::<32>(blocks));
         (_mm_or_si128(ids, ld(sb.orv.as_ptr() as *const u8)), bad)
-
     }
 }
 
@@ -900,7 +899,6 @@ unsafe fn ids2j(xa: __m128i, xb: __m128i, r: &JidRow) -> (__m256i, __m256i) {
         let blocks = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_1000));
         let ids = _mm256_or_si256(_mm256_srli_epi64::<8>(_mm256_slli_epi64::<32>(blocks)), _mm256_srli_epi64::<32>(blocks));
         (_mm256_or_si256(ids, ld2(r.orv.as_ptr() as *const u8)), cls)
-
     }
 }
 
@@ -2487,5 +2485,61 @@ mod slow {
             campaign: parse_campaign(val(2)),
             ts: parse_ts(val(3)),
         });
+    }
+}
+
+#[cfg(test)]
+mod packed_id_tests {
+    use super::*;
+
+    fn field(bytes: &[u8], quoted: bool) -> ([u8; 16], usize) {
+        let q = usize::from(quoted);
+        let n = bytes.len() + 2 * q;
+        let mut field = [0; 16];
+        field[16 - n + q..16 - q].copy_from_slice(bytes);
+        if quoted {
+            field[16 - n] = b'"';
+            field[15] = b'"';
+        }
+        (field, n)
+    }
+
+    #[test]
+    fn packed_simd_ids_match_checked_scalar_keys() {
+        let events = id_shapes(b'e', 0, 8, false);
+        let users = id_shapes(b'u', 8, 0, true);
+        let eid = b"e001a2b3z";
+        let uid = b"u0123abcd";
+        for a in 2..=eid.len() {
+            for b in 2..=uid.len() {
+                for quoted in [false, true] {
+                    let (raw_e, ne) = field(&eid[..a], quoted);
+                    let (raw_u, nu) = field(&uid[..b], quoted);
+                    let q = usize::from(quoted);
+                    let (e, u, bad) = unsafe {
+                        ids2(
+                            ld(raw_e.as_ptr()),
+                            &events[ne * 2 + q],
+                            ld(raw_u.as_ptr()),
+                            &users[nu * 2 + q],
+                        )
+                    };
+                    assert!(!unsafe { nz(bad) });
+                    assert_eq!(Some(e), crate::ids::pack(&eid[..a], b'e'));
+                    assert_eq!(Some(u), crate::ids::pack(&uid[..b], b'u'));
+                }
+            }
+        }
+        let (raw_e, ne) = field(b"e123ABC", false);
+        let (raw_u, nu) = field(b"u1", false);
+        let (_, _, bad) = unsafe {
+            ids2(
+                ld(raw_e.as_ptr()),
+                &events[ne * 2],
+                ld(raw_u.as_ptr()),
+                &users[nu * 2],
+            )
+        };
+        assert!(unsafe { nz(bad) });
     }
 }

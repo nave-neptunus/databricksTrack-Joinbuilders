@@ -260,13 +260,21 @@ impl FrozenDictionary {
     }
 
     pub fn into_names(self) -> Names {
-        Names(self.0.map(|shard| shard.keys))
+        Names::from_shards(self.0)
     }
 }
 
 pub struct Names([Keys; SHARDS]);
 
 impl Names {
+    pub fn from_shards(shards: [Shard; SHARDS]) -> Self {
+        Self(shards.map(|shard| shard.keys))
+    }
+
+    pub fn index(shard: usize, local: u32) -> u32 {
+        (local << BITS) | shard as u32
+    }
+
     fn id(&self, index: u32) -> Id<'_> {
         self.0[index as usize & (SHARDS - 1)].id(index >> BITS)
     }
