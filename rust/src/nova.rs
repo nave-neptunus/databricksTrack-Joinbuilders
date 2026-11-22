@@ -166,7 +166,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     /// stream and runs this on a Rayon worker after every consumer is done.
     pub(super) fn release(mut self) {
         for slab in &self.slabs {
-            let _ = slab.advise(memmap2::Advice::DontNeed);
+            unsafe { let _ = slab.unchecked_advise(memmap2::UncheckedAdvice::DontNeed); }
         }
         self.slabs.clear();
         self.blocks = std::array::from_fn(|_| Vec::new());

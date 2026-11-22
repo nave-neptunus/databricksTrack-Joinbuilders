@@ -1203,7 +1203,7 @@ impl People {
     /// the process teardown path has to walk them on one thread.
     fn release(mut self) {
         if let Some(mapping) = &self.storage {
-            let _ = mapping.advise(memmap2::Advice::DontNeed);
+            unsafe { let _ = mapping.unchecked_advise(memmap2::UncheckedAdvice::DontNeed); }
         }
         self.storage = None;
         self.overflow = Box::new(std::array::from_fn(|_| Vec::new()));
