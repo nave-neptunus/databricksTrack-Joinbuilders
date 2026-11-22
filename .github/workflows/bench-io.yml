@@ -1,0 +1,31 @@
+name: gum cold IO sweep
+on:
+  push:
+    branches: [ci/gum-evmem-io]
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Require Intel
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || { echo 'AMD/non-Intel runner refused' >&2; exit 1; }
+          grep -qw avx512f /proc/cpuinfo || { echo 'no AVX-512F' >&2; exit 1; }
+      - name: Generate v5 20M
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q bench/assets/generator.zip -d "$HOME/g"
+          cargo build --release --locked --manifest-path "$HOME/g/generator/Cargo.toml"
+          "$HOME/g/generator/target/release/generate" --seed 17 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads 4
+          du -sh "$HOME/v5-20m"
+      - name: Sweep
+        shell: bash
+        run: python3 bench/io_sweep.py "$HOME" "$GITHUB_WORKSPACE/sweep-work" 5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed
+      - name: Summary
+        if: always()
+        run: if test -f sweep-work/summary.md; then cat sweep-work/summary.md >> "$GITHUB_STEP_SUMMARY"; fi
