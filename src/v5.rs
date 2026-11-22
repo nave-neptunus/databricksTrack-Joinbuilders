@@ -428,6 +428,21 @@ impl PersonEvents {
 }
 
 #[inline]
+fn prefetch_event(parsed: &[Parsed], loc: u32) {
+    if loc == NO_PAYLOAD {
+        return;
+    }
+    let worker = (loc >> PERSON_WORKER_SHIFT) as usize;
+    let block = ((loc & PERSON_WORKER_MASK) >> PERSON_BLOCK_SHIFT) as usize;
+    let index = loc as usize & (PERSON_BLOCK_ROWS - 1);
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let row = parsed[worker].people.blocks[block].rows.add(index);
+        _mm_prefetch::<_MM_HINT_T0>(row.cast());
+    }
+}
+
+#[inline]
 fn event_at(parsed: &[Parsed], loc: u32) -> Option<&PersonEvent> {
     if loc == NO_PAYLOAD {
         return None;
@@ -874,10 +889,15 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                                 if let Some(next) = part.get(i + 10) {
                                     short.prefetch(next.w0);
                                 }
+                                if let Some(next) = part.get(i + 4) {
+                                    if next.w0 & ID_ODD == 0 && filter.needs_lookup(next.w0) {
+                                        prefetch_event(parsed, CopyLocation::unpack(next.w1).loc);
+                                    }
+                                }
                                 short.copy(parsed, row.w0, CopyLocation::unpack(row.w1));
                             }
                         } else {
-                            if let Some(next) = part.get(i + 8) {
+                            if let Some(next) = part.get(i + 32) {
                                 prefetch_id(g, next.w0);
                             }
                             let copy = CopyLocation::unpack(row.w1);
