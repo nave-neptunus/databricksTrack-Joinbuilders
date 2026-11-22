@@ -1727,7 +1727,7 @@ fn claim_link(
 
 #[inline]
 unsafe fn link_end_at(ptrs: &[usize], chunk: u32, index: u32) -> *mut LinkEnd {
-    (ptrs[chunk as usize] as *mut LinkEnd).add(index as usize)
+    unsafe { (ptrs[chunk as usize] as *mut LinkEnd).add(index as usize) }
 }
 
 fn insert_shard(
@@ -1877,7 +1877,14 @@ fn build_links(
     let names_addr = names.as_mut_ptr() as usize;
     // Take the shard lists out so the insert does not hold a shared reference
     // to the endpoint records it writes.
-    let ix: Vec<[Vec<u32>; LINK_SHARDS]> = parsed.iter_mut().map(|chunk| std::mem::take(&mut chunk.ix)).collect();
+    // [Vec<u32>; 64] has no Default on this toolchain, so swap each list out.
+    let ix: Vec<[Vec<u32>; LINK_SHARDS]> = parsed.iter_mut().map(|chunk| {
+        let mut taken = std::array::from_fn(|_| Vec::new());
+        for (dst, src) in taken.iter_mut().zip(chunk.ix.iter_mut()) {
+            std::mem::swap(dst, src);
+        }
+        taken
+    }).collect();
     let ptrs: Vec<usize> = parsed.iter_mut().map(|chunk| chunk.ends.as_mut_ptr() as usize).collect();
     let shard_meta: Vec<(u32, usize)> = starts.iter().copied().zip(widths).collect();
     let mut inserted: Vec<ShardInsert> = table.slots.par_chunks_mut(range_len)
