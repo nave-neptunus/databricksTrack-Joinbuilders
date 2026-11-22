@@ -19,8 +19,9 @@ jobs:
         run: |
           set -euo pipefail
           lscpu
-          grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || { echo 'AMD/non-Intel runner refused' >&2; exit 1; }
-          grep -qw avx512f /proc/cpuinfo || { echo 'AVX-512F unavailable' >&2; exit 1; }
+          # Correctness gates run on any x86-64-v3 runner. Timing is only scorer-like on Intel.
+          grep -qw avx2 /proc/cpuinfo && grep -qw bmi2 /proc/cpuinfo || { echo 'AVX2/BMI2 unavailable' >&2; exit 1; }
+          if grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo; then echo RUNNER_VENDOR=intel >> "$GITHUB_ENV"; else echo RUNNER_VENDOR=amd >> "$GITHUB_ENV"; echo '::warning::AMD runner: correctness gate is valid, TIMING IS INDICATIVE ONLY (not scorer-like)'; fi
           test "$(nproc)" -ge 4 || { echo "need 4+ vCPUs, got $(nproc)" >&2; exit 1; }; echo "RUNNER_VCPUS=$(nproc)" >> "$GITHUB_ENV"
           echo NCPU=8 >> "$GITHUB_ENV"
       - name: Install exact-check dependency
