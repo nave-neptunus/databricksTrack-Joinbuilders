@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Reproducible x86 gate for gum v5; request.json names every tested SHA."""
-import hashlib
 import json
 import os
 import re
@@ -14,8 +13,12 @@ from pathlib import Path
 HOME = Path(sys.argv[1]).resolve()
 WORK = Path(sys.argv[2]).resolve()
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+from run_fixtures import SCHEMAS, load_actual
+
 REQUEST = json.loads((ROOT / "bench/request.json").read_text())
 BASE, CAND, TIMING, ROUNDS = (REQUEST[k] for k in ("baseline", "candidate", "timing", "rounds"))
+GATE_BASELINES = [BASE, *REQUEST.get("additional_gate_baselines", [])]
 NCPU = os.environ.get("NCPU", "8")
 WORK.mkdir(parents=True, exist_ok=True)
 GATE_FAILURES = []
@@ -52,7 +55,9 @@ def build(sha):
 
 def cargo_test(sha):
     source, target = source_for(sha), WORK / "target-test" / sha
-    call(["cargo", "test", "--locked", "--manifest-path", str(source / "rust/Cargo.toml")], env=dict(os.environ, CARGO_TARGET_DIR=str(target)))
+    # AVX2/BMI2 scanner tests are cfg(target_feature) gated: build them like the image does.
+    env = dict(os.environ, RUSTFLAGS="-C target-cpu=x86-64-v3", CARGO_TARGET_DIR=str(target))
+    call(["cargo", "test", "--release", "--locked", "--manifest-path", str(source / "rust/Cargo.toml")], env=env)
 
 
 def fresh(path):
@@ -92,13 +97,19 @@ def compare(actual, expected, label):
     return ok
 
 
-def bytes_equal(left, right, label):
-    def files(folder):
-        return {p.relative_to(folder): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(folder.rglob("*.parquet"))}
-    ok = files(left) == files(right)
-    print(f"{label}: {'BYTE-MATCH' if ok else 'BYTE-DIFFER'}", flush=True)
+def parquet_equal(left, right, label):
+    ok = True
+    for table, schema in SCHEMAS.items():
+        # The scorer permits arbitrary file boundaries and row order. Keep
+        # every row, including repeated rows, in the canonical comparison.
+        actual = load_actual(left / table, schema).sort(list(schema))
+        expected = load_actual(right / table, schema).sort(list(schema))
+        matches = actual.equals(expected, null_equal=True)
+        print(f"{label} {table}: {actual.height} vs {expected.height} rows, "
+              f"{'MATCH' if matches else 'DIFFER'}", flush=True)
+        ok = ok and matches
     if not ok:
-        GATE_FAILURES.append(f"{label}: parquet bytes differ")
+        GATE_FAILURES.append(f"{label}: canonical parquet rows differ")
     return ok
 
 
@@ -128,23 +139,30 @@ def stages(rows, sha):
 def main():
     if len(set(TIMING)) != 3 or BASE not in TIMING or CAND not in TIMING:
         raise SystemExit("request must name baseline, candidate, and one comparison SHA")
+    if len(GATE_BASELINES) != len(set(GATE_BASELINES)) or CAND in GATE_BASELINES or not set(GATE_BASELINES) <= set(TIMING):
+        raise SystemExit("gate baselines must be distinct, non-candidate SHAs listed in timing")
     for sha in TIMING:
         call(["git", "cat-file", "-e", f"{sha}^{{commit}}"])
     if not REQUEST.get('skip_test'):
         cargo_test(CAND)
     binaries = {sha: build(sha) for sha in TIMING}
     fixture_gate(binaries[CAND])
-    dev, _, _ = run(binaries[CAND], HOME / "v5-dev", "candidate-1m")
+    dev, _, _ = run(binaries[CAND], HOME / "v5-dev", "candidate-1m", timing=True)
     expected = WORK / "dev-answer"
     call(["unzip", "-q", str(ROOT / "bench/assets/dev-answer.zip"), "-d", str(expected)])
     compare(dev, expected / "dev-answer", "1M candidate vs dev-answer")
-    for size in ("20m", "60m"):
-        base, _, _ = run(binaries[BASE], HOME / f"v5-{size}", f"baseline-{size}")
-        candidate, _, _ = run(binaries[CAND], HOME / f"v5-{size}", f"candidate-{size}")
-        bytes_equal(candidate, base, f"{size} candidate vs baseline")
+    for size, data in (("1m", "v5-dev"), ("20m", "v5-20m"), ("60m", "v5-60m")):
+        corpus = HOME / data
+        candidate = dev
+        if size != "1m":
+            candidate, _, _ = run(binaries[CAND], corpus, f"candidate-{size}", timing=True)
+        for sha in GATE_BASELINES:
+            baseline, _, _ = run(binaries[sha], corpus, f"baseline-{size}-{sha[:8]}", timing=True)
+            parquet_equal(candidate, baseline, f"{size} candidate vs {sha}")
     results = {size: time_size(binaries, size, int(ROUNDS[size])) for size in ("20m", "60m")}
     gate = "PASS" if not GATE_FAILURES else "FAIL — " + "; ".join(GATE_FAILURES)
-    lines = ["# gum v5 Intel gate and timing", "", f"- baseline: `{BASE}`", f"- candidate: `{CAND}`", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
+    baselines = ", ".join(f"`{sha}`" for sha in GATE_BASELINES)
+    lines = ["# gum v5 Intel gate and timing", "", f"- gate baselines: {baselines}", f"- candidate: `{CAND}`", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
     for size, rows in results.items():
         lines += [f"## {size} ({len(rows)} interleaved rounds)", "", "| round | order | " + " | ".join(s[:8] for s in TIMING) + " |", "|---:|---|" + "---:|" * len(TIMING)]
         for row in rows:
