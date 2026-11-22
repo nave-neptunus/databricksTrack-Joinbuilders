@@ -344,6 +344,19 @@ struct Pending {
     price: u32,
 }
 
+const PERSON_CACHE_SIZE: usize = 1024;
+
+#[derive(Clone, Copy, Default)]
+struct CachedPerson {
+    uid: u64,
+    person: u32,
+}
+
+#[inline]
+fn person_cache_index(uid: u64) -> usize {
+    uid as usize & (PERSON_CACHE_SIZE - 1)
+}
+
 impl Pending {
     const EMPTY: Self = Self {
         key: 0,
@@ -686,6 +699,7 @@ struct Parser<'a, 'catalog, 'table> {
     window_ms: u64,
     dates: Dates,
     ids: (u32, u32),
+    person_cache: [CachedPerson; PERSON_CACHE_SIZE],
     batch: [Pending; 16],
     count: usize,
     streams: Streams<Claim, SHARDS>,
@@ -702,9 +716,19 @@ impl Parser<'_, '_, '_> {
     fn flush(&mut self) {
         for pending in &self.batch[..self.count] {
             let loc = if pending.ts != INVALID {
-                let person = self
-                    .users
-                    .person(pending.uid, 0, pending.name, &mut self.ids, self.declined);
+                let person = if pending.name == 0 {
+                    // Cache hits carry the resolved person in place of the UID.
+                    pending.uid as u32
+                } else {
+                    let person = self.users.person(
+                        pending.uid, 0, pending.name, &mut self.ids, self.declined,
+                    );
+                    self.person_cache[person_cache_index(pending.uid)] = CachedPerson {
+                        uid: pending.uid,
+                        person,
+                    };
+                    person
+                };
                 let part = person as usize & (P - 1);
                 let index = self.people.push(part, person, pending.ts, pending.price);
                 if index >= INDEX_MASK as usize {
@@ -781,16 +805,20 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                 pending.price = value | (category << 24);
             }
             let uid = user_key(user).unwrap_or_else(|| self.interner.intern(user));
-            // Keep a direct reference to the full ID for the name. This avoids
-            // decoding short keys later (and an allocation per person).
-            let Some(r) = crate::pack_ref(user) else {
-                self.declined.store(true, Relaxed);
-                break 'valid;
-            };
-            pending.name = r;
-            self.users.prefetch(uid);
+            let cached = self.person_cache[person_cache_index(uid)];
+            if cached.uid == uid {
+                pending.uid = u64::from(cached.person);
+            } else {
+                // New users need a reference to their full name for output.
+                let Some(name) = crate::pack_ref(user) else {
+                    self.declined.store(true, Relaxed);
+                    break 'valid;
+                };
+                pending.name = name;
+                pending.uid = uid;
+                self.users.prefetch(uid);
+            }
             pending.ts = relative as u32;
-            pending.uid = uid;
         }
         self.batch[self.count] = pending;
         self.count += 1;
@@ -832,6 +860,7 @@ fn events(
                 window_ms: (input.end - input.start) as u64,
                 dates: Dates::default(),
                 ids: (0, 0),
+                person_cache: [CachedPerson::default(); PERSON_CACHE_SIZE],
                 batch: [Pending::EMPTY; 16],
                 count: 0,
                 streams: Streams::new(),
