@@ -741,8 +741,16 @@ struct ExactIds {
 }
 
 impl ExactIds {
-    fn new() -> Self {
-        Self { shards: (0..256).map(|_| std::sync::Mutex::new(HashMap::default())).collect() }
+    const SHARDS: usize = 4096;
+
+    /// `expected` is a rough count of long IDs, used to pre-size every shard.
+    fn new(expected: usize) -> Self {
+        let each = expected / Self::SHARDS;
+        Self {
+            shards: (0..Self::SHARDS)
+                .map(|_| std::sync::Mutex::new(HashMap::with_capacity(each)))
+                .collect(),
+        }
     }
 
     fn intern_in(&self, shard: usize, bytes: &[u8]) -> u64 {
@@ -750,7 +758,7 @@ impl ExactIds {
         if let Some(&id) = map.get(bytes) {
             return id;
         }
-        let ordinal = (map.len() as u64 * 256) + shard as u64 + 1;
+        let ordinal = (map.len() as u64 * Self::SHARDS as u64) + shard as u64 + 1;
         // Odd multiplication permutes the positive 63-bit ordinals. Allocating
         // enough distinct entries to exhaust this space exceeds addressable RAM.
         let id = ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (u64::MAX >> 1);
@@ -762,8 +770,8 @@ impl ExactIds {
     }
 
     fn intern(&self, bytes: &[u8]) -> u64 {
-        let shard = hs(bytes, 0x243f_6a88_85a3_08d3).0 as u8;
-        self.intern_in(shard as usize, bytes)
+        let shard = hs(bytes, 0x243f_6a88_85a3_08d3).0 as usize & (Self::SHARDS - 1);
+        self.intern_in(shard, bytes)
     }
 
     fn user(&self, bytes: &[u8]) -> (u64, u32) {
@@ -1984,7 +1992,7 @@ fn fast(nova: bool) -> bool {
         ra.wait(b);
     }
     lap("  links read");
-    let ids = ExactIds::new();
+    let ids = ExactIds::new(estimated_rows / 6);
     let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, &ids, nova) else {
         return false;
     };
@@ -2774,7 +2782,7 @@ mod mixed_id_tests {
 
     #[test]
     fn long_ids_in_one_bucket_are_compared_in_full() {
-        let ids = ExactIds::new();
+        let ids = ExactIds::new(0);
         let first = b"u0000000000000000000000000000000a";
         let second = b"u0000000000000000000000000000000A";
         let a = ids.intern_in(5, first);
