@@ -1,0 +1,67 @@
+name: Nova old-format Intel benchmark
+
+on:
+  push:
+    branches: [gum-nova]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse non-Intel runners
+        run: |
+          grep -qm1 GenuineIntel /proc/cpuinfo || { echo 'refusing AMD/non-Intel runner' >&2; exit 1; }
+          grep -qw avx512f /proc/cpuinfo || { echo 'refusing runner without AVX-512' >&2; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { toolchain: stable }
+      - name: Build old-format generator and image
+        run: |
+          cargo build --release --locked --manifest-path generator/Cargo.toml
+          docker build --platform linux/amd64 --load --tag nova-old .
+      - name: Generate old-format 20M corpus
+        run: generator/target/release/generate --seed 17 --events 20000000 --clicks 5000000 --threads 4 --output "$RUNNER_TEMP/old-20m"
+      - name: Warm and time default versus Nova
+        env:
+          DATA: ${{ runner.temp }}/old-20m
+          WORK: ${{ runner.temp }}/nova-old
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          run() {
+            label="$1"; nova="$2"; out="$WORK/out-$label"; scratch="$WORK/scratch-$label"
+            rm -rf "$out" "$scratch"; mkdir -p "$out" "$scratch"; chmod 777 "$out" "$scratch"
+            if [ "$nova" = 1 ]; then extra=(-e NOVA=1); else extra=(); fi
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --cpus 4 --memory 24g --memory-swap 24g --user 1000:1000 -v "$DATA:/data:ro" -v "$out:/output" -v "$scratch:/scratch" -e NCPU=4 -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e TIMING=1 "${extra[@]}" nova-old 2>"$WORK/$label.stderr"
+            sed -n 's/^ *\([0-9.]*\) ms  parquet written$/\1/p' "$WORK/$label.stderr" | tail -1 >>"$WORK/$label.ms"
+          }
+          run warm-default 0; run warm-nova 1
+          for pair in 1 2 3 4; do
+            if [ $((pair % 2)) -eq 0 ]; then run "nova-$pair" 1; run "default-$pair" 0; else run "default-$pair" 0; run "nova-$pair" 1; fi
+          done
+          python3 - <<'PY' | tee "$WORK/summary.md"
+          from pathlib import Path
+          from statistics import median
+          work = Path(__import__('os').environ['WORK'])
+          default = [float((work / f'default-{i}.ms').read_text()) for i in range(1, 5)]
+          nova = [float((work / f'nova-{i}.ms').read_text()) for i in range(1, 5)]
+          print('# Nova old-format Intel benchmark')
+          print(f'default engine median: {median(default):.1f} ms')
+          print(f'Nova engine median: {median(nova):.1f} ms')
+          print(f'Nova speedup: {median(default) / median(nova):.3f}x')
+          print(f'Nova saving: {median(default) - median(nova):+.1f} ms')
+          print('default samples:', ', '.join(f'{x:.1f}' for x in default))
+          print('Nova samples:', ', '.join(f'{x:.1f}' for x in nova))
+          PY
+          cat "$WORK/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nova-old-benchmark-${{ github.run_id }}
+          path: ${{ runner.temp }}/nova-old
+          retention-days: 7
