@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::ids::{
@@ -216,7 +216,8 @@ fn id_at(g: &G, id: u64, base: usize) -> Id<'_> {
 }
 
 const USER_CACHE: usize = 16384;
-const EVENT_SHARDS: usize = 256;
+const EVENT_SHARDS: usize = 1024;
+const NO_PAYLOAD: u32 = u32::MAX;
 
 #[inline]
 fn event_shard(hash: u64) -> usize {
@@ -228,7 +229,10 @@ struct Scan<'a> {
     users: &'a Users,
     user_keys: [u64; USER_CACHE],
     user_values: [u32; USER_CACHE],
-    events: [Vec<Event>; EVENT_SHARDS],
+    claims: Vec<Vec<Claim>>,
+    people: Vec<Vec<PersonEvent>>,
+    locations: Locations,
+    worker: u32,
     clicks: [Vec<Click>; SHARDS],
     ev: Box<EvBatch>,
     ck: Box<CkBatch>,
@@ -238,16 +242,64 @@ struct Scan<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Event {
-    // Long IDs have their exact mmap offset and byte count in the scanner token.
+struct Claim {
+    // Long IDs use the exact mmap span. Short IDs are packed byte codes.
     id: u64,
-    payload: Payload,
+    copy: CopyLocation,
 }
 
 #[derive(Clone, Copy)]
-struct Payload {
-    w0: u64,
-    user_ingest: u64,
+struct CopyLocation {
+    ingest: u32,
+    loc: u32,
+}
+
+struct PersonEvent {
+    w0: AtomicU64,
+    user: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Locations {
+    index_bits: u32,
+    bucket_bits: u32,
+}
+
+impl Locations {
+    fn new(g: &G) -> Self {
+        let worker_bits = g.nt.next_power_of_two().trailing_zeros();
+        let bucket_bits = g.nub.next_power_of_two().trailing_zeros();
+        // Keep at least one high bit even when there is one worker and bucket.
+        let index_bits = (32 - worker_bits - bucket_bits).min(31);
+        Self {
+            index_bits,
+            bucket_bits,
+        }
+    }
+
+    #[inline]
+    fn pack(self, worker: u32, bucket: usize, index: usize) -> u32 {
+        if index >= 1usize << self.index_bits {
+            sys::fallback("person bucket exceeds event locator capacity");
+        }
+        let loc = (worker << self.bucket_bits | bucket as u32) << self.index_bits | index as u32;
+        if loc == NO_PAYLOAD {
+            sys::fallback("event locator exceeds capacity");
+        }
+        loc
+    }
+
+    #[inline]
+    fn event(self, parsed: &[Parsed], loc: u32) -> Option<&PersonEvent> {
+        if loc == NO_PAYLOAD {
+            return None;
+        }
+        let index = loc & ((1 << self.index_bits) - 1);
+        let loc = loc >> self.index_bits;
+        let bucket = loc & ((1 << self.bucket_bits) - 1);
+        let worker = loc >> self.bucket_bits;
+        Some(&parsed[worker as usize].people[bucket as usize][index as usize])
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -258,7 +310,8 @@ struct Click {
 }
 
 struct Parsed {
-    events: [Mutex<Vec<Event>>; EVENT_SHARDS],
+    claims: Vec<Mutex<Vec<Claim>>>,
+    people: Vec<Vec<PersonEvent>>,
     clicks: [Mutex<Vec<Click>>; SHARDS],
 }
 
@@ -307,23 +360,30 @@ impl Scan<'_> {
             && r.product != PROD_EMPTY
             && (r.kind != KIND_PURCHASE || r.price != 0)
             && r.ingest.wrapping_sub(r.ts) <= DAY_MS;
-        let (mut w0, mut user) = (u64::MAX, 0);
+        let mut loc = NO_PAYLOAD;
         if valid {
-            user = self.person(r.uid);
+            let user = self.person(r.uid);
             let cat = if r.price == 0 {
                 0
             } else {
                 g.prod[(r.product as usize).min(PBOUND)] as u64
             };
-            w0 = rel << 33 | (r.price as u64) << 9 | cat << 4;
+            let w0 = rel << 33 | (r.price as u64) << 9 | cat << 4;
+            let bucket = (user as usize) >> UB;
+            let rows = &mut self.people[bucket];
+            loc = self.locations.pack(self.worker, bucket, rows.len());
+            rows.push(PersonEvent {
+                w0: AtomicU64::new(w0),
+                user,
+            });
         }
         let hash = id_at(g, r.eid, self.base).hash();
         let id = self.absolute_id(r.eid);
-        self.events[event_shard(hash)].push(Event {
+        self.claims[event_shard(hash)].push(Claim {
             id,
-            payload: Payload {
-                w0,
-                user_ingest: (user as u64) << 21 | ingest / 1000,
+            copy: CopyLocation {
+                ingest: (ingest / 1000) as u32,
+                loc,
             },
         });
     }
@@ -421,7 +481,7 @@ fn scan_reserve(g: &G, kind: Kind, stripes: usize) -> usize {
     (bytes / average).div_ceil(stripes * g.nt) * 5 / 4
 }
 
-fn scan(g: &G, users: &Users) -> Vec<Parsed> {
+fn scan(g: &G, users: &Users, locations: Locations) -> Vec<Parsed> {
     let event_reserve = scan_reserve(g, Kind::Ev, EVENT_SHARDS);
     let click_reserve = scan_reserve(g, Kind::Ck, SHARDS);
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
@@ -443,7 +503,12 @@ fn scan(g: &G, users: &Users) -> Vec<Parsed> {
             users,
             user_keys: [0; USER_CACHE],
             user_values: [0; USER_CACHE],
-            events: std::array::from_fn(|_| Vec::with_capacity(event_reserve)),
+            claims: (0..EVENT_SHARDS)
+                .map(|_| Vec::with_capacity(event_reserve))
+                .collect(),
+            people: (0..g.nub).map(|_| Vec::new()).collect(),
+            locations,
+            worker: tid as u32,
             clicks: std::array::from_fn(|_| Vec::with_capacity(click_reserve)),
             ev: EvBatch::new(),
             ck: CkBatch::new(),
@@ -472,7 +537,8 @@ fn scan(g: &G, users: &Users) -> Vec<Parsed> {
         t.n_ev_rows = s.n_ev;
         t.n_ck_rows = s.n_ck;
         *workers[tid].lock().unwrap() = Some(Parsed {
-            events: s.events.map(Mutex::new),
+            claims: s.claims.into_iter().map(Mutex::new).collect(),
+            people: s.people,
             clicks: s.clicks.map(Mutex::new),
         });
     });
@@ -483,23 +549,36 @@ fn scan(g: &G, users: &Users) -> Vec<Parsed> {
 }
 
 #[inline]
-fn update_event(slot: &mut Payload, row: Payload) {
-    let old_ing = slot.user_ingest & ING_MAX;
-    let new_ing = row.user_ingest & ING_MAX;
-    if new_ing < old_ing {
-        *slot = row;
-    } else if new_ing == old_ing && (slot.w0 != row.w0 || slot.user_ingest != row.user_ingest) {
-        sys::fallback("equal-ingest copies disagree");
+fn choose(winner: &mut CopyLocation, copy: CopyLocation, locations: Locations, parsed: &[Parsed]) {
+    let loser = if copy.ingest < winner.ingest {
+        let loser = winner.loc;
+        *winner = copy;
+        loser
+    } else {
+        if copy.ingest == winner.ingest && winner.loc != copy.loc {
+            let value = |loc| {
+                locations
+                    .event(parsed, loc)
+                    .map(|row| (row.w0.load(Ordering::Relaxed), row.user))
+            };
+            if value(winner.loc) != value(copy.loc) {
+                sys::fallback("equal-ingest copies disagree");
+            }
+        }
+        copy.loc
+    };
+    if let Some(row) = locations.event(parsed, loser) {
+        row.w0.store(u64::MAX, Ordering::Relaxed);
     }
 }
 
-fn dedup(g: &G, parsed: &[Parsed]) -> (Vec<Vec<Mutex<Vec<Rec>>>>, Names) {
+fn dedup(g: &G, parsed: &[Parsed], locations: Locations) -> Names {
     let click_names: [Mutex<Option<Shard>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
     let next = AtomicUsize::new(0);
-    let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     sys::run_par(g.nt, |tid| {
         let clicks = &mut g.t(tid).us;
-        let mut people: Vec<Vec<Rec>> = (0..g.nub).map(|_| Vec::new()).collect();
+        let mut short = HashMap::<u64, CopyLocation, BuildHasherDefault<IdentityHasher>>::default();
+        let mut long_slots = Vec::<CopyLocation>::new();
         loop {
             let shard = next.fetch_add(1, Ordering::Relaxed);
             if shard >= EVENT_SHARDS {
@@ -511,59 +590,45 @@ fn dedup(g: &G, parsed: &[Parsed]) -> (Vec<Vec<Mutex<Vec<Rec>>>>, Names) {
                 *click_names[stripe].lock().unwrap() = Some(keys);
                 continue;
             }
-            let total = parsed
+            let total: usize = parsed
                 .iter()
-                .map(|p| p.events[shard].lock().unwrap().len())
+                .map(|p| p.claims[shard].lock().unwrap().len())
                 .sum();
-            let mut short =
-                HashMap::<u64, u32, BuildHasherDefault<IdentityHasher>>::with_capacity_and_hasher(
-                    total,
-                    BuildHasherDefault::default(),
-                );
+            short.clear();
+            short.reserve(total);
             let mut long = Shard::with_capacity(total / 8);
-            let mut slots = Vec::<Payload>::with_capacity(total);
-            let mut long_slots = Vec::<Payload>::with_capacity(total / 8);
+            long_slots.clear();
+            long_slots.reserve(total / 8);
             for p in parsed {
-                let part = std::mem::take(&mut *p.events[shard].lock().unwrap());
+                let part = std::mem::take(&mut *p.claims[shard].lock().unwrap());
                 for row in part {
                     let id = id_at(g, row.id, 0);
                     let hash = id.hash();
                     if let Id::Short(_) = id {
                         // The mixer is a bijection on u64, so equal short
                         // hashes imply equal packed keys.
-                        let next = slots.len() as u32;
-                        let index = *short.entry(hash).or_insert(next);
-                        if index == next {
-                            slots.push(row.payload);
-                        } else {
-                            update_event(&mut slots[index as usize], row.payload);
+                        match short.entry(hash) {
+                            Entry::Occupied(mut slot) => {
+                                choose(slot.get_mut(), row.copy, locations, parsed)
+                            }
+                            Entry::Vacant(slot) => {
+                                slot.insert(row.copy);
+                            }
                         }
                     } else {
                         let (index, is_new) = long.intern(id, hash);
                         if is_new {
-                            long_slots.push(row.payload);
+                            long_slots.push(row.copy);
                         } else {
-                            update_event(&mut long_slots[index as usize], row.payload);
+                            choose(&mut long_slots[index as usize], row.copy, locations, parsed);
                         }
                     }
                 }
             }
-            for e in slots.into_iter().chain(long_slots) {
-                if e.w0 != u64::MAX {
-                    let u = e.user_ingest >> 21;
-                    people[(u >> UB) as usize].push(Rec { w0: e.w0, w1: u });
-                }
-            }
         }
         clicks.finish();
-        *workers[tid].lock().unwrap() = Some(people.into_iter().map(Mutex::new).collect());
     });
-    let people = workers
-        .into_iter()
-        .map(|w| w.into_inner().unwrap().unwrap())
-        .collect();
-    let names = Names::from_shards(click_names.map(|w| w.into_inner().unwrap().unwrap()));
-    (people, names)
+    Names::from_shards(click_names.map(|w| w.into_inner().unwrap().unwrap()))
 }
 
 fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Part) -> Shard {
@@ -590,11 +655,11 @@ fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Par
 
 // Express consumes contiguous runs in event-slot order. Assign those slots
 // after dedup so opaque event IDs and shuffled input cannot split a person.
-fn order_events(g: &G, people: &[Vec<Mutex<Vec<Rec>>>]) {
+fn order_events(g: &G, parsed: &[Parsed]) {
     let mut offsets = Vec::with_capacity(g.nub + 1);
     offsets.push(0usize);
     for bucket in 0..g.nub {
-        let count: usize = people.iter().map(|p| p[bucket].lock().unwrap().len()).sum();
+        let count: usize = parsed.iter().map(|p| p.people[bucket].len()).sum();
         offsets.push(offsets[bucket] + count);
     }
     if offsets[g.nub] as u64 > g.ecap {
@@ -613,9 +678,14 @@ fn order_events(g: &G, people: &[Vec<Mutex<Vec<Rec>>>]) {
             if bucket >= g.nub {
                 break;
             }
-            for p in people {
-                let mut source = std::mem::take(&mut *p[bucket].lock().unwrap());
-                rows.append(&mut source);
+            for p in parsed {
+                rows.extend(p.people[bucket].iter().filter_map(|row| {
+                    let w0 = row.w0.load(Ordering::Relaxed);
+                    (w0 != u64::MAX).then_some(Rec {
+                        w0,
+                        w1: row.user as u64,
+                    })
+                }));
             }
             if rows.is_empty() {
                 continue;
@@ -652,11 +722,12 @@ fn order_events(g: &G, people: &[Vec<Mutex<Vec<Rec>>>]) {
 pub fn stage1(g: &mut G) {
     let users = Users::new(g);
     sys::lap("link_ids");
-    let parsed = scan(g, &users);
+    let locations = Locations::new(g);
+    let parsed = scan(g, &users, locations);
     sys::lap("scan_ids");
-    let (people, clicks) = dedup(g, &parsed);
+    let clicks = dedup(g, &parsed, locations);
     sys::lap("dedup_ids");
-    order_events(g, &people);
+    order_events(g, &parsed);
     sys::lap("order_events");
     g.ids = Some(Dictionaries {
         users: users.into_names(),
