@@ -1,0 +1,50 @@
+name: express-cl gate and timing
+on:
+  push:
+    branches: [ci/express-cl]
+  workflow_dispatch:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      BASE_SHA: 52f49502f44ad29e42c0d429c8ac8abf8d6cc2ab
+      NCPU: "8"
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+      - name: Runner info
+        run: |
+          lscpu | grep -E 'Model name|Flags' | cut -c1-120
+          grep -qw avx512f /proc/cpuinfo && echo HAVE_AVX512 || { echo "NO AVX-512: fast path cannot run here"; exit 1; }
+          nproc; df -h . | tail -1
+      - name: Baseline source
+        run: |
+          git fetch --depth=1 origin $BASE_SHA
+          mkdir -p $HOME/base && git archive $BASE_SHA | tar -x -C $HOME/base
+      - run: python3 -m pip install --disable-pip-version-check polars
+      - name: Build baseline
+        run: |
+          cd $HOME/base/rust && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked 2>&1 | tail -3
+      - name: Build candidate fast + fallback (as the Dockerfile does)
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo test --release --target x86_64-unknown-linux-gnu --locked -- v5 2>&1 | tail -15 || true
+          cargo build --release --target x86_64-unknown-linux-musl 2>&1 | grep -E 'error|warning: unused|Finished' | tail -20
+          (cd fallback && RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static -Cprofile-use=$PWD/pgo/merged.profdata" cargo build --release --locked --target x86_64-unknown-linux-gnu 2>&1 | tail -2)
+          sudo cp fallback/target/x86_64-unknown-linux-gnu/release/pipeline /fallback
+          sudo chmod 0755 /fallback
+          mkdir -p $HOME/bin && cp target/x86_64-unknown-linux-musl/release/pipeline $HOME/bin/cand
+      - name: Generate v5 corpora
+        run: |
+          unzip -q bench/assets/generator.zip -d $HOME/gen
+          cargo build --release --locked --manifest-path $HOME/gen/generator/Cargo.toml 2>&1 | tail -1
+          G=$HOME/gen/generator/target/release/generate
+          $G --seed 1 --events 1000000 --clicks 250000 --output $HOME/v5-dev --threads 8
+          $G --seed 17 --events 20000000 --clicks 5000000 --output $HOME/v5-20m --threads 8
+          $G --seed 17 --events 60000000 --clicks 15000000 --output $HOME/v5-60m --threads 8
+      - name: Gate and time
+        run: python3 bench/ci.py $HOME $GITHUB_WORKSPACE/bench-work $HOME/base/rust/target/release/rproto $HOME/bin/cand 2>&1 | tee ci.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: express-logs, path: "bench-work/logs/", retention-days: 5 }
