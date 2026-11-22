@@ -252,7 +252,7 @@ fn id_at(g: &G, id: u64, base: usize) -> Id<'_> {
     Id::Long(unsafe { std::slice::from_raw_parts(g.region.add(at), len) })
 }
 
-const USER_CACHE: usize = 16384;
+const USER_CACHE: usize = 4096;
 const EVENT_SHARDS: usize = 1024;
 const NO_PAYLOAD: u32 = u32::MAX;
 
@@ -342,9 +342,21 @@ impl PersonBlock {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Tail {
+    rows: *mut MaybeUninit<PersonEvent>,
+    block: u32,
+    len: u32,
+}
+
+// Rows live in a shared arena that outlives every Parsed value.
+unsafe impl Send for Tail {}
+unsafe impl Sync for Tail {}
+
 struct PersonEvents {
     blocks: Vec<PersonBlock>,
     buckets: Vec<Vec<u32>>,
+    tails: Vec<Tail>,
 }
 
 impl PersonEvents {
@@ -352,29 +364,48 @@ impl PersonEvents {
         Self {
             blocks: Vec::new(),
             buckets: (0..buckets).map(|_| Vec::new()).collect(),
+            tails: vec![
+                Tail {
+                    rows: std::ptr::null_mut(),
+                    block: 0,
+                    len: PERSON_BLOCK_ROWS as u32,
+                };
+                buckets
+            ],
+        }
+    }
+
+    // Publishes the length of every partially filled tail block.
+    fn finish(&mut self) {
+        for tail in &self.tails {
+            if !tail.rows.is_null() {
+                self.blocks[tail.block as usize].len = tail.len as usize;
+            }
         }
     }
 
     #[inline]
     fn push(&mut self, arena: &sys::Arena, worker: u32, event: PersonEvent) -> u32 {
-        let bucket = &mut self.buckets[event.user as usize >> UB];
-        let block = match bucket.last().copied() {
-            Some(block) if self.blocks[block as usize].len < PERSON_BLOCK_ROWS => block,
-            _ => {
-                let block = self.blocks.len() as u32;
-                if block >= (1 << (PERSON_WORKER_SHIFT - PERSON_BLOCK_SHIFT)) {
-                    sys::fallback("worker exceeds event locator capacity");
-                }
-                self.blocks.push(PersonBlock::new(arena));
-                bucket.push(block);
-                block
+        let bucket = event.user as usize >> UB;
+        if self.tails[bucket].len as usize == PERSON_BLOCK_ROWS {
+            let block = self.blocks.len() as u32;
+            if block >= (1 << (PERSON_WORKER_SHIFT - PERSON_BLOCK_SHIFT)) {
+                sys::fallback("worker exceeds event locator capacity");
             }
-        };
-        let dst = &mut self.blocks[block as usize];
-        let index = dst.len;
-        unsafe { (*dst.rows.add(index)).write(event) };
-        dst.len += 1;
-        let loc = worker << PERSON_WORKER_SHIFT | block << PERSON_BLOCK_SHIFT | index as u32;
+            let fresh = PersonBlock::new(arena);
+            self.tails[bucket] = Tail { rows: fresh.rows, block, len: 0 };
+            self.blocks.push(fresh);
+            self.buckets[bucket].push(block);
+        }
+        let tail = &mut self.tails[bucket];
+        let index = tail.len;
+        unsafe { (*tail.rows.add(index as usize)).write(event) };
+        tail.len += 1;
+        let block = tail.block;
+        if tail.len as usize == PERSON_BLOCK_ROWS {
+            self.blocks[block as usize].len = PERSON_BLOCK_ROWS;
+        }
+        let loc = worker << PERSON_WORKER_SHIFT | block << PERSON_BLOCK_SHIFT | index;
         if loc == NO_PAYLOAD {
             sys::fallback("event locator exceeds capacity");
         }
@@ -651,6 +682,7 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena, people_arena: &sys::Arena) -> 
         LAP_US[1].fetch_add((s.tsc_ev as f64 * per_tsc) as u64, Ordering::Relaxed);
         LAP_US[2].fetch_add((s.tsc_ck as f64 * per_tsc) as u64, Ordering::Relaxed);
         let fin0 = std::time::Instant::now();
+        s.people.finish();
         s.claims.finish();
         LAP_US[3].fetch_add(fin0.elapsed().as_micros() as u64, Ordering::Relaxed);
         *workers[tid].lock().unwrap() = Some(Parsed {
