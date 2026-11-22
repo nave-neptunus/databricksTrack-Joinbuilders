@@ -194,3 +194,81 @@ fn definition_levels(column: &mut BytesMut, bits: &[u8]) -> usize {
     column[start + len..DEFINITION_SPACE].copy_from_slice(bits);
     start
 }
+
+const CAMPAIGN_SCHEMA: &str = "
+    message campaign_daily {
+        REQUIRED BYTE_ARRAY campaign_id (UTF8);
+        REQUIRED BYTE_ARRAY channel (UTF8);
+        REQUIRED INT32 day (DATE);
+        REQUIRED INT64 sessions;
+        REQUIRED INT64 purchasing_sessions;
+        REQUIRED INT64 revenue_cents;
+        REQUIRED INT64 assisted_sessions;
+    }
+";
+
+/// One campaign_daily row: campaign, channel, day, then sessions, purchasing
+/// sessions, revenue and assisted sessions.
+pub(super) type CampaignRow<'a> = (&'a [u8], &'a [u8], i32, [i64; 4]);
+
+/// Write the whole (small) campaign_daily table as one PLAIN, uncompressed row group.
+pub(super) fn write_campaign(path: &str, rows: &[CampaignRow]) {
+    let schema = Arc::new(SchemaDescriptor::new(Arc::new(
+        parse_message_type(CAMPAIGN_SCHEMA).unwrap(),
+    )));
+    let mut file = TrackedWrite::new(BufWriter::with_capacity(1 << 16, File::create(path).unwrap()));
+    file.write_all(b"PAR1").unwrap();
+    let mut row_groups = Vec::new();
+    if !rows.is_empty() {
+        let mut columns: [BytesMut; 7] = Default::default();
+        for &(campaign, channel, day, values) in rows {
+            let [c, h, d, a, b, r, s] = &mut columns;
+            plain_string(c, campaign);
+            plain_string(h, channel);
+            d.put_i32_le(day);
+            for (column, value) in [a, b, r, s].into_iter().zip(values) {
+                column.put_i64_le(value);
+            }
+        }
+        let num_rows = rows.len() as u32;
+        let file_offset = file.bytes_written() as i64;
+        let mut group = RowGroupMetaData::builder(schema.clone())
+            .set_num_rows(i64::from(num_rows))
+            .set_file_offset(file_offset);
+        for (column, descriptor) in columns.into_iter().zip(schema.columns()) {
+            let body = column.freeze();
+            let size = body.len();
+            let page = Page::DataPageV2 {
+                buf: body,
+                num_values: num_rows,
+                encoding: Encoding::PLAIN,
+                num_nulls: 0,
+                num_rows,
+                def_levels_byte_len: 0,
+                rep_levels_byte_len: 0,
+                is_compressed: false,
+                statistics: None,
+            };
+            let spec = SerializedPageWriter::new(&mut file)
+                .write_page(CompressedPage::new(page, size))
+                .unwrap();
+            let metadata = ColumnChunkMetaData::builder(descriptor.clone())
+                .set_encodings(vec![Encoding::PLAIN])
+                .set_compression(Compression::UNCOMPRESSED)
+                .set_num_values(i64::from(num_rows))
+                .set_total_compressed_size(spec.compressed_size as i64)
+                .set_total_uncompressed_size(spec.uncompressed_size as i64)
+                .set_data_page_offset(spec.offset as i64)
+                .build()
+                .unwrap();
+            group = group.add_column_metadata(metadata);
+        }
+        let group = group.set_total_byte_size(file.bytes_written() as i64 - file_offset);
+        row_groups.push(group.build().unwrap());
+    }
+    let total = row_groups.iter().map(RowGroupMetaData::num_rows).sum();
+    let meta = FileMetaData::new(2, total, None, None, schema, None);
+    let metadata = ParquetMetaData::new(meta, row_groups);
+    ParquetMetaDataWriter::new(&mut file, &metadata).finish().unwrap();
+    file.flush().unwrap();
+}
