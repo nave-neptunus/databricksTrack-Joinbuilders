@@ -1,5 +1,7 @@
 mod core;
 mod parse;
+mod v5;
+pub use v5::{run as run_v5, Decline};
 use crate::pqw;
 mod util;
 

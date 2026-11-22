@@ -319,6 +319,16 @@ fn main() {
     if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
         sys::alloc_enable();
     }
+    if std::env::var("XL_V5").map_or(true, |v| v != "0") {
+        match generic::run_v5(std::path::Path::new(&data), std::path::Path::new(&outdir), nt) {
+            Ok(()) => {
+                eprintln!("[v5] FAST PATH OK");
+                unsafe { sys::_exit(0) }
+            }
+            Err(generic::Decline::Why(w)) => sys::fallback(&format!("v5 declined: {w}")),
+            Err(generic::Decline::Io(e)) => sys::fallback(&format!("v5 io: {e}")),
+        }
+    }
     if std::env::var("XL_FIRST4K").is_ok_and(|v| v == "1") {
         sys::FIRST_SMALL.store(true, std::sync::atomic::Ordering::Relaxed);
     }

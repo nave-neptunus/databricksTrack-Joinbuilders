@@ -4,7 +4,18 @@ on:
     branches: [ci/express-cl]
   workflow_dispatch:
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo check (musl, as the Dockerfile builds)
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo check --release --target x86_64-unknown-linux-musl 2>&1 | grep -vE '^\s*(Compiling|Checking)' | head -150
+          test ${PIPESTATUS[0]} -eq 0
+        shell: bash
   gate:
+    needs: check
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -37,8 +48,8 @@ jobs:
         if: steps.cpu.outputs.ok == 'true'
         run: |
           rustup target add x86_64-unknown-linux-musl
-          cargo test --release --target x86_64-unknown-linux-gnu --locked -- v5 2>&1 | tail -15 || true
-          cargo build --release --target x86_64-unknown-linux-musl 2>&1 | grep -E 'error|warning: unused|Finished' | tail -20
+          cargo test --release --target x86_64-unknown-linux-gnu --locked -- v5 2>&1 | tail -25 || true
+          cargo build --release --target x86_64-unknown-linux-musl 2>&1 | tail -5
           (cd fallback && RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static -Cprofile-use=$PWD/pgo/merged.profdata" cargo build --release --locked --target x86_64-unknown-linux-gnu 2>&1 | tail -2)
           sudo cp fallback/target/x86_64-unknown-linux-gnu/release/pipeline /fallback
           sudo chmod 0755 /fallback
