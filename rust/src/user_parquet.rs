@@ -43,6 +43,7 @@ pub(super) struct UserParquet {
     present: Vec<u8>,
     rows: u32,
     nulls: u32,
+    pub(super) flush_cycles: u64,
 }
 
 impl UserParquet {
@@ -62,6 +63,7 @@ impl UserParquet {
             present: Vec::new(),
             rows: 0,
             nulls: 0,
+            flush_cycles: 0,
         }
     }
 
@@ -93,6 +95,7 @@ impl UserParquet {
         if self.rows == 0 {
             return;
         }
+        let tf = super::tsc();
         let file_offset = self.file.bytes_written() as i64;
         let mut group = RowGroupMetaData::builder(self.schema.clone())
             .set_num_rows(i64::from(self.rows))
@@ -157,6 +160,7 @@ impl UserParquet {
         self.present.clear();
         self.rows = 0;
         self.nulls = 0;
+        self.flush_cycles += super::tsc() - tf;
     }
 
     pub(super) fn close(mut self) {
