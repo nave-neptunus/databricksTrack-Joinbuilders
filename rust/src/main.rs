@@ -2197,30 +2197,7 @@ fn fast(nova: bool) -> bool {
     }
 
     // write parquet: user_daily in parallel parts, campaign_daily in one file
-    use arrow_array::*;
-    use arrow_array::builder::StringBuilder;
-    use arrow_schema::{DataType, Field, Schema};
-    let props = Arc::new(parquet::file::properties::WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
-        .set_dictionary_enabled(false)
-        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
-        .build());
-    let write = |path: String, batch: RecordBatch| {
-        let f = std::fs::File::create(path).unwrap();
-        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), Some(props.as_ref().clone())).unwrap();
-        w.write(&batch).unwrap();
-        w.close().unwrap();
-    };
     let user_schema = user_parquet::schema();
-    let s2 = Arc::new(Schema::new(vec![
-        Field::new("campaign_id", DataType::Utf8, false),
-        Field::new("channel", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("purchasing_sessions", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("assisted_sessions", DataType::Int64, false),
-    ]));
     // Schedule large partitions first.
     let ncs = ncamp + 1;
     let mut order = Vec::with_capacity(P);
@@ -2286,41 +2263,18 @@ fn fast(nova: bool) -> bool {
     }
     lap(&format!("merged: user_daily {}", nrows));
 
-    let camp_job = || {
-        let (mut cid, mut cch2, mut cday) = (StringBuilder::new(), StringBuilder::new(), vec![]);
-        let mut cv: [Vec<i64>; 4] = Default::default();
-        for c in 0..ncs {
-            for d in 0..ndays {
-                let v = cd[c * ndays + d];
-                if v[0] == 0 && v[3] == 0 {
-                    continue;
-                }
-                let (n, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { (camp_names[c], camp_chan[c]) };
-                cid.append_value(csv_str(n));
-                cch2.append_value(csv_str(ch));
-                cday.push((day0 + d as i64) as i32);
-                for k in 0..4 {
-                    cv[k].push(v[k]);
-                }
+    let mut camp_rows: Vec<user_parquet::CampaignRow> = Vec::new();
+    for c in 0..ncs {
+        for d in 0..ndays {
+            let v = cd[c * ndays + d];
+            if v[0] == 0 && v[3] == 0 {
+                continue;
             }
+            let (n, ch): (&[u8], &[u8]) = if c == ncamp { (b"organic", b"organic") } else { (camp_names[c], camp_chan[c]) };
+            camp_rows.push((n, ch, (day0 + d as i64) as i32, v));
         }
-        let [a, b, c, d] = cv;
-        let batch = RecordBatch::try_new(
-            s2.clone(),
-            vec![
-                Arc::new(cid.finish()),
-                Arc::new(cch2.finish()),
-                Arc::new(Date32Array::from(cday)),
-                Arc::new(Int64Array::from(a)),
-                Arc::new(Int64Array::from(b)),
-                Arc::new(Int64Array::from(c)),
-                Arc::new(Int64Array::from(d)),
-            ],
-        )
-        .unwrap();
-        write(format!("{out}/campaign_daily/part-0.parquet"), batch);
-    };
-    camp_job();
+    }
+    user_parquet::write_campaign(&format!("{out}/campaign_daily/part-0.parquet"), &camp_rows);
     lap("parquet written");
     // The user parts and campaign table have flushed and closed their writers.
     std::process::exit(0);
