@@ -1,54 +1,94 @@
-name: gum v5 Intel gate and timing
+name: gum v5 Intel profiling
 
 on:
   push:
-    branches: [ci/gum]
+    branches: [ci/gum-perf]
   workflow_dispatch:
 
 jobs:
-  gate-and-time:
-    # ubuntu-latest is intentionally refused below unless GitHub assigns the
-    # requested Cascade-Lake-class Intel/AVX-512 machine.
+  profile:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 35
+    env:
+      NCPU: '8'
+      TIMING: '1'
+      GLIBC_TUNABLES: glibc.malloc.hugetlb=1
+      PROFILE_ROOT: ${{ runner.temp }}/gum-profile
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Require the scoring-shaped Intel host
+
+      - name: Require an Intel host
         shell: bash
         run: |
           set -euo pipefail
           lscpu
           grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || { echo 'AMD/non-Intel runner refused' >&2; exit 1; }
           grep -qw avx512f /proc/cpuinfo || { echo 'AVX-512F unavailable' >&2; exit 1; }
-          test "$(nproc)" -ge 4 || { echo "need 4+ vCPUs, got $(nproc)" >&2; exit 1; }; echo "RUNNER_VCPUS=$(nproc)" >> "$GITHUB_ENV"
-          echo NCPU=8 >> "$GITHUB_ENV"
-      - name: Install exact-check dependency
-        run: python3 -m pip install --disable-pip-version-check polars
-      - name: Build the supplied v5 generator and generate corpora
+          test "$(nproc)" -ge 4 || { echo "Need 4+ vCPUs, got $(nproc)" >&2; exit 1; }
+          mkdir -p bench-work
+          lscpu > bench-work/host.txt
+          uname -r >> bench-work/host.txt
+          cat /sys/kernel/mm/transparent_hugepage/enabled >> bench-work/host.txt
+
+      - name: Install and enable perf
         shell: bash
         run: |
           set -euo pipefail
-          unzip -q bench/assets/generator.zip -d "$HOME/gum-v5-generator"
-          cargo build --release --locked --manifest-path "$HOME/gum-v5-generator/generator/Cargo.toml"
-          # The supplied public dev-answer is the documented seed-1 dev set.
-          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 1 --events 1000000 --clicks 250000 --output "$HOME/v5-dev" --threads "$NCPU"
-          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads "$NCPU"
-          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/v5-60m" --threads "$NCPU"
-          du -sh "$HOME/v5-dev" "$HOME/v5-20m" "$HOME/v5-60m"
-      - name: Gate candidate and interleave timing rounds
+          if ! perf --version; then
+            sudo apt-get update
+            sudo apt-get install -y "linux-tools-$(uname -r)" linux-tools-generic
+          fi
+          perf --version | tee -a bench-work/host.txt
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+
+      - name: Build the supplied v5 generator and profiling binaries
         shell: bash
         run: |
           set -euo pipefail
-          python3 bench/ci_bench.py "$HOME" "$GITHUB_WORKSPACE/bench-work"
-      - name: Publish benchmark evidence
-        if: always()
+          unzip -q bench/assets/generator.zip -d "$PROFILE_ROOT"
+          cargo build --release --locked --manifest-path "$PROFILE_ROOT/generator/Cargo.toml"
+          python3 bench/ci_profile.py build "$PROFILE_ROOT" bench-work
+
+      - name: Profile v5 seed 17 at 20M
         shell: bash
         run: |
-          if test -f bench-work/summary.md; then cat bench-work/summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+          set -euo pipefail
+          "$PROFILE_ROOT/generator/target/release/generate" --seed 17 --events 20000000 --clicks 5000000 --output "$PROFILE_ROOT/data-20m" --threads "$NCPU"
+          python3 bench/ci_profile.py 20m "$PROFILE_ROOT" bench-work
+          rm -rf "$PROFILE_ROOT/data-20m"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: gum-v5-intel-${{ github.run_id }}-${{ github.run_attempt }}
-          path: bench-work/
+          name: gum-perf-20m-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            bench-work/host.txt
+            bench-work/20m/
+          retention-days: 7
+
+      - name: Profile v5 seed 17 at 60M
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "$PROFILE_ROOT/bin"
+          "$PROFILE_ROOT/generator/target/release/generate" --seed 17 --events 60000000 --clicks 15000000 --output "$PROFILE_ROOT/data-60m" --threads "$NCPU"
+          python3 bench/ci_profile.py 60m "$PROFILE_ROOT" bench-work
+
+      - name: Publish timing and sampling summaries
+        if: always()
+        shell: bash
+        run: |
+          for path in bench-work/{20m,60m}/summary.md; do
+            if [[ -f "$path" ]]; then cat "$path" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gum-perf-60m-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            bench-work/host.txt
+            bench-work/60m/
           retention-days: 7
