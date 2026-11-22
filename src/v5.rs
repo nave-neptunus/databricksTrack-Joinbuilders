@@ -3,9 +3,7 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::ids::{
-    self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard, ShortMap, SHARDS,
-};
+use crate::ids::{self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard, SHARDS};
 use crate::iface::*;
 use crate::{
     core, k_ref, parse, setup, sys, Kind, Rec, BB, BSIZE, CBOUND, DAY_MS, G, ING_MAX, K, PBOUND, UB,
@@ -35,7 +33,7 @@ impl UserNames {
 struct Users {
     linked: FrozenDictionary,
     unlinked: Dictionary,
-    linked_short: [ShortMap; SHARDS],
+    linked_short: [sys::U64Map; SHARDS],
     roots: Vec<u32>,
     boundary: u32,
 }
@@ -44,7 +42,7 @@ impl Users {
     fn new(g: &G) -> Self {
         let (linked, roots) = links(g);
         let boundary = roots.len() as u32;
-        let maps: [Mutex<Option<ShortMap>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
+        let maps: [Mutex<Option<sys::U64Map>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
         let next = AtomicUsize::new(0);
         sys::run_par(g.nt, |_| loop {
             let stripe = next.fetch_add(1, Ordering::Relaxed);
@@ -65,7 +63,7 @@ impl Users {
     #[inline]
     fn person(&self, id: Id<'_>, hash: u64) -> u32 {
         let linked = match id {
-            Id::Short(_) => self.linked_short[ids::shard(hash)].get(&hash).copied(),
+            Id::Short(key) => self.linked_short[ids::shard(hash)].get(key),
             Id::Long(_) => self
                 .linked
                 .lookup(id, hash)
@@ -78,6 +76,14 @@ impl Users {
                 .checked_add(self.boundary)
                 .unwrap_or_else(|| sys::fallback("IDs exceed user index capacity"))
         })
+    }
+
+    #[inline]
+    fn prefetch(&self, id: u64) {
+        if id & ID_ODD == 0 {
+            let stripe = ids::shard(Id::Short(id).hash());
+            self.linked_short[stripe].prefetch(id);
+        }
     }
 
     fn into_names(self) -> UserNames {
@@ -345,7 +351,14 @@ impl EventSink for Scan<'_> {
     fn ev_flush(&mut self) {
         let n = std::mem::take(&mut self.ev.n);
         self.n_ev += n as u64;
+        const LOOKAHEAD: usize = 12;
+        for &id in &self.ev.uid[..n.min(LOOKAHEAD)] {
+            self.users.prefetch(id);
+        }
         for i in 0..n {
+            if i + LOOKAHEAD < n {
+                self.users.prefetch(self.ev.uid[i + LOOKAHEAD]);
+            }
             self.event_row(self.ev.row(i));
         }
     }
@@ -359,13 +372,45 @@ impl ClickSink for Scan<'_> {
     fn ck_flush(&mut self) {
         let n = std::mem::take(&mut self.ck.n);
         self.n_ck += n as u64;
+        const LOOKAHEAD: usize = 12;
+        for &id in &self.ck.uid[..n.min(LOOKAHEAD)] {
+            self.users.prefetch(id);
+        }
         for i in 0..n {
+            if i + LOOKAHEAD < n {
+                self.users.prefetch(self.ck.uid[i + LOOKAHEAD]);
+            }
             self.click_row(self.ck.row(i));
         }
     }
 }
 
+fn scan_reserve(g: &G, kind: Kind, stripes: usize) -> usize {
+    let bytes: usize = g
+        .files
+        .iter()
+        .filter(|file| file.kind == kind)
+        .map(|file| file.len)
+        .sum();
+    if bytes < 8 << 20 {
+        return 0;
+    }
+    let (index, _) = g
+        .files
+        .iter()
+        .enumerate()
+        .find(|(_, file)| file.kind == kind)
+        .unwrap();
+    let data = file(g, index);
+    let sample = &data[..data.len().min(64 << 10)];
+    let lines = sample.iter().filter(|&&b| b == b'\n').count().max(1);
+    let average = sample.len().div_ceil(lines).max(16);
+    (bytes / average).div_ceil(stripes * g.nt) * 5 / 4
+}
+
 fn scan(g: &G, users: &Users) -> Vec<Parsed> {
+    let event_reserve = scan_reserve(g, Kind::Ev, EVENT_SHARDS);
+    let click_reserve = scan_reserve(g, Kind::Ck, SHARDS);
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
@@ -385,8 +430,8 @@ fn scan(g: &G, users: &Users) -> Vec<Parsed> {
             users,
             user_keys: [0; USER_CACHE],
             user_values: [0; USER_CACHE],
-            events: std::array::from_fn(|_| Vec::new()),
-            clicks: std::array::from_fn(|_| Vec::new()),
+            events: std::array::from_fn(|_| Vec::with_capacity(event_reserve)),
+            clicks: std::array::from_fn(|_| Vec::with_capacity(click_reserve)),
             ev: EvBatch::new(),
             ck: CkBatch::new(),
             base: 0,

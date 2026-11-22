@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Mutex;
 
-use crate::sys::fallback;
+use crate::sys::{fallback, U64Map};
 
 const BITS: u32 = 6;
 pub const SHARDS: usize = 1 << BITS;
@@ -111,8 +111,6 @@ pub fn shard(hash: u64) -> usize {
 
 #[derive(Default)]
 pub struct IdentityHasher(u64);
-
-pub type ShortMap = HashMap<u64, u32, BuildHasherDefault<IdentityHasher>>;
 
 impl Hasher for IdentityHasher {
     fn finish(&self) -> u64 {
@@ -267,14 +265,13 @@ impl FrozenDictionary {
         ((local as usize) < keys.entries.len()).then(|| keys.id(local))
     }
 
-    pub fn short_people(&self, stripe: usize, roots: &[u32]) -> ShortMap {
+    pub fn short_people(&self, stripe: usize, roots: &[u32]) -> U64Map {
         let entries = &self.0[stripe].keys.entries;
-        let mut short =
-            ShortMap::with_capacity_and_hasher(entries.len(), BuildHasherDefault::default());
+        let mut short = U64Map::with_capacity(entries.len());
         for (local, &key) in entries.iter().enumerate() {
             if key & LONG == 0 {
                 let index = Names::index(stripe, local as u32);
-                short.insert(mix(key), roots[index as usize]);
+                short.get_or_insert(key, roots[index as usize]);
             }
         }
         short
