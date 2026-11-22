@@ -1,5 +1,6 @@
 use std::collections::{hash_map::Entry, HashMap};
 use std::hash::BuildHasherDefault;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -230,8 +231,7 @@ struct Scan<'a> {
     user_keys: [u64; USER_CACHE],
     user_values: [u32; USER_CACHE],
     claims: parse::Part,
-    people: Vec<Vec<PersonEvent>>,
-    locations: Locations,
+    people: PersonEvents,
     worker: u32,
     clicks: [Vec<Click>; SHARDS],
     ev: Box<EvBatch>,
@@ -267,47 +267,85 @@ struct PersonEvent {
     user: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Locations {
-    index_bits: u32,
-    bucket_bits: u32,
+const PERSON_BLOCK_SHIFT: u32 = 9;
+const PERSON_BLOCK_ROWS: usize = 1 << PERSON_BLOCK_SHIFT;
+const PERSON_WORKER_SHIFT: u32 = 28;
+const PERSON_WORKER_MASK: u32 = (1 << PERSON_WORKER_SHIFT) - 1;
+
+struct PersonBlock {
+    rows: Box<[MaybeUninit<PersonEvent>]>,
+    len: usize,
 }
 
-impl Locations {
-    fn new(g: &G) -> Self {
-        let worker_bits = g.nt.next_power_of_two().trailing_zeros();
-        let bucket_bits = g.nub.next_power_of_two().trailing_zeros();
-        // Keep at least one high bit even when there is one worker and bucket.
-        let index_bits = (32 - worker_bits - bucket_bits).min(31);
+impl PersonBlock {
+    fn new() -> Self {
         Self {
-            index_bits,
-            bucket_bits,
+            rows: Box::new_uninit_slice(PERSON_BLOCK_ROWS),
+            len: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[PersonEvent] {
+        // Exactly the first len rows are initialized by PersonEvents::push.
+        unsafe { std::slice::from_raw_parts(self.rows.as_ptr().cast(), self.len) }
+    }
+}
+
+struct PersonEvents {
+    blocks: Vec<PersonBlock>,
+    buckets: Vec<Vec<u32>>,
+}
+
+impl PersonEvents {
+    fn new(buckets: usize) -> Self {
+        Self {
+            blocks: Vec::new(),
+            buckets: (0..buckets).map(|_| Vec::new()).collect(),
         }
     }
 
     #[inline]
-    fn pack(self, worker: u32, bucket: usize, index: usize) -> u32 {
-        if index >= 1usize << self.index_bits {
-            sys::fallback("person bucket exceeds event locator capacity");
-        }
-        let loc = (worker << self.bucket_bits | bucket as u32) << self.index_bits | index as u32;
+    fn push(&mut self, worker: u32, event: PersonEvent) -> u32 {
+        let bucket = &mut self.buckets[event.user as usize >> UB];
+        let block = match bucket.last().copied() {
+            Some(block) if self.blocks[block as usize].len < PERSON_BLOCK_ROWS => block,
+            _ => {
+                let block = self.blocks.len() as u32;
+                if block >= (1 << (PERSON_WORKER_SHIFT - PERSON_BLOCK_SHIFT)) {
+                    sys::fallback("worker exceeds event locator capacity");
+                }
+                self.blocks.push(PersonBlock::new());
+                bucket.push(block);
+                block
+            }
+        };
+        let dst = &mut self.blocks[block as usize];
+        let index = dst.len;
+        dst.rows[index].write(event);
+        dst.len += 1;
+        let loc = worker << PERSON_WORKER_SHIFT | block << PERSON_BLOCK_SHIFT | index as u32;
         if loc == NO_PAYLOAD {
             sys::fallback("event locator exceeds capacity");
         }
         loc
     }
 
-    #[inline]
-    fn event(self, parsed: &[Parsed], loc: u32) -> Option<&PersonEvent> {
-        if loc == NO_PAYLOAD {
-            return None;
-        }
-        let index = loc & ((1 << self.index_bits) - 1);
-        let loc = loc >> self.index_bits;
-        let bucket = loc & ((1 << self.bucket_bits) - 1);
-        let worker = loc >> self.bucket_bits;
-        Some(&parsed[worker as usize].people[bucket as usize][index as usize])
+    fn bucket(&self, bucket: usize) -> impl Iterator<Item = &[PersonEvent]> {
+        self.buckets[bucket]
+            .iter()
+            .map(|&i| self.blocks[i as usize].as_slice())
     }
+}
+
+#[inline]
+fn event_at(parsed: &[Parsed], loc: u32) -> Option<&PersonEvent> {
+    if loc == NO_PAYLOAD {
+        return None;
+    }
+    let worker = (loc >> PERSON_WORKER_SHIFT) as usize;
+    let block = ((loc & PERSON_WORKER_MASK) >> PERSON_BLOCK_SHIFT) as usize;
+    let index = loc as usize & (PERSON_BLOCK_ROWS - 1);
+    Some(&parsed[worker].people.blocks[block].as_slice()[index])
 }
 
 #[derive(Clone, Copy)]
@@ -319,7 +357,7 @@ struct Click {
 
 struct Parsed {
     claims: FinishedClaims,
-    people: Vec<Vec<PersonEvent>>,
+    people: PersonEvents,
     clicks: [Mutex<Vec<Click>>; SHARDS],
 }
 
@@ -381,13 +419,13 @@ impl Scan<'_> {
                 g.prod[(r.product as usize).min(PBOUND)] as u64
             };
             let w0 = rel << 33 | (r.price as u64) << 9 | cat << 4;
-            let bucket = (user as usize) >> UB;
-            let rows = &mut self.people[bucket];
-            loc = self.locations.pack(self.worker, bucket, rows.len());
-            rows.push(PersonEvent {
-                w0: AtomicU64::new(w0),
-                user,
-            });
+            loc = self.people.push(
+                self.worker,
+                PersonEvent {
+                    w0: AtomicU64::new(w0),
+                    user,
+                },
+            );
         }
         let hash = id_at(g, r.eid, self.base).hash();
         let id = self.absolute_id(r.eid);
@@ -491,7 +529,7 @@ fn scan_reserve(g: &G, kind: Kind, stripes: usize) -> usize {
     (bytes / average).div_ceil(stripes * g.nt) * 5 / 4
 }
 
-fn scan(g: &G, users: &Users, locations: Locations, arena: &sys::Arena) -> Vec<Parsed> {
+fn scan(g: &G, users: &Users, arena: &sys::Arena) -> Vec<Parsed> {
     let click_reserve = scan_reserve(g, Kind::Ck, SHARDS);
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
@@ -513,8 +551,7 @@ fn scan(g: &G, users: &Users, locations: Locations, arena: &sys::Arena) -> Vec<P
             user_keys: [0; USER_CACHE],
             user_values: [0; USER_CACHE],
             claims: parse::Part::new(arena, EVENT_SHARDS),
-            people: (0..g.nub).map(|_| Vec::new()).collect(),
-            locations,
+            people: PersonEvents::new(g.nub),
             worker: tid as u32,
             clicks: std::array::from_fn(|_| Vec::with_capacity(click_reserve)),
             ev: EvBatch::new(),
@@ -557,30 +594,27 @@ fn scan(g: &G, users: &Users, locations: Locations, arena: &sys::Arena) -> Vec<P
 }
 
 #[inline]
-fn choose(winner: &mut CopyLocation, copy: CopyLocation, locations: Locations, parsed: &[Parsed]) {
+fn choose(winner: &mut CopyLocation, copy: CopyLocation, parsed: &[Parsed]) {
     let loser = if copy.ingest < winner.ingest {
         let loser = winner.loc;
         *winner = copy;
         loser
     } else {
         if copy.ingest == winner.ingest && winner.loc != copy.loc {
-            let value = |loc| {
-                locations
-                    .event(parsed, loc)
-                    .map(|row| (row.w0.load(Ordering::Relaxed), row.user))
-            };
+            let value =
+                |loc| event_at(parsed, loc).map(|row| (row.w0.load(Ordering::Relaxed), row.user));
             if value(winner.loc) != value(copy.loc) {
                 sys::fallback("equal-ingest copies disagree");
             }
         }
         copy.loc
     };
-    if let Some(row) = locations.event(parsed, loser) {
+    if let Some(row) = event_at(parsed, loser) {
         row.w0.store(u64::MAX, Ordering::Relaxed);
     }
 }
 
-fn dedup(g: &G, parsed: &[Parsed], locations: Locations) -> Names {
+fn dedup(g: &G, parsed: &[Parsed]) -> Names {
     let click_names: [Mutex<Option<Shard>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
@@ -614,9 +648,7 @@ fn dedup(g: &G, parsed: &[Parsed], locations: Locations) -> Names {
                             // The mixer is a bijection on u64, so equal short
                             // hashes imply equal packed keys.
                             match short.entry(hash) {
-                                Entry::Occupied(mut slot) => {
-                                    choose(slot.get_mut(), copy, locations, parsed)
-                                }
+                                Entry::Occupied(mut slot) => choose(slot.get_mut(), copy, parsed),
                                 Entry::Vacant(slot) => {
                                     slot.insert(copy);
                                 }
@@ -626,7 +658,7 @@ fn dedup(g: &G, parsed: &[Parsed], locations: Locations) -> Names {
                             if is_new {
                                 long_slots.push(copy);
                             } else {
-                                choose(&mut long_slots[index as usize], copy, locations, parsed);
+                                choose(&mut long_slots[index as usize], copy, parsed);
                             }
                         }
                     }
@@ -666,7 +698,11 @@ fn order_events(g: &G, parsed: &[Parsed]) {
     let mut offsets = Vec::with_capacity(g.nub + 1);
     offsets.push(0usize);
     for bucket in 0..g.nub {
-        let count: usize = parsed.iter().map(|p| p.people[bucket].len()).sum();
+        let count: usize = parsed
+            .iter()
+            .flat_map(|p| p.people.bucket(bucket))
+            .map(<[PersonEvent]>::len)
+            .sum();
         offsets.push(offsets[bucket] + count);
     }
     if offsets[g.nub] as u64 > g.ecap {
@@ -686,7 +722,7 @@ fn order_events(g: &G, parsed: &[Parsed]) {
                 break;
             }
             for p in parsed {
-                rows.extend(p.people[bucket].iter().filter_map(|row| {
+                rows.extend(p.people.bucket(bucket).flatten().filter_map(|row| {
                     let w0 = row.w0.load(Ordering::Relaxed);
                     (w0 != u64::MAX).then_some(Rec {
                         w0,
@@ -729,12 +765,11 @@ fn order_events(g: &G, parsed: &[Parsed]) {
 pub fn stage1(g: &mut G) {
     let users = Users::new(g);
     sys::lap("link_ids");
-    let locations = Locations::new(g);
     let claim_arena =
         sys::Arena::new(g.ecap as usize * 16 + g.nt * (EVENT_SHARDS * parse::CHUNK + (2 << 20)));
-    let parsed = scan(g, &users, locations, &claim_arena);
+    let parsed = scan(g, &users, &claim_arena);
     sys::lap("scan_ids");
-    let clicks = dedup(g, &parsed, locations);
+    let clicks = dedup(g, &parsed);
     sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
     sys::lap("dedup_ids");
     order_events(g, &parsed);
