@@ -19,12 +19,13 @@ def fresh(p):
     p.mkdir(parents=True)
 
 
-def run(binary, data, label):
+def run(binary, data, label, extra=()):
     out, scratch = WORK / "out" / label, WORK / "scratch" / label
     fresh(out); fresh(scratch)
     env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out), SCRATCH_DIR=str(scratch), NCPU=NCPU, TIMING="1")
     t = time.perf_counter()
-    r = subprocess.run([str(binary)], text=True, capture_output=True, env=env)
+    env["V1ND_LOG"] = "1"
+    r = subprocess.run([str(binary), *extra], text=True, capture_output=True, env=env)
     ms = (time.perf_counter() - t) * 1000
     (WORK / "logs").mkdir(exist_ok=True)
     (WORK / "logs" / f"{label}.stderr").write_text(r.stderr)
@@ -66,6 +67,10 @@ def main():
         if cfb:
             FAILS.append(f"{size}: candidate fell back")
         print("\n".join(l for l in cerr.splitlines() if re.search(r"FALLBACK|v5|fast", l))[:1500], flush=True)
+    if os.environ.get("GENERIC", "1") == "1":
+        for size in ("20m",):
+            _, ms, _, err = run(CAND_BIN, HOME / f"v5-{size}", f"gen-{size}", ("--generic",))
+            print(f"GENERIC {size}: {ms:.0f} ms\n" + "\n".join(l for l in err.splitlines() if "v1nd" in l), flush=True)
     rows = {}
     for size in ("20m", "60m"):
         d = HOME / f"v5-{size}"
