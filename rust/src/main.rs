@@ -822,7 +822,7 @@ impl Tab {
 // ------------------------------------------------------------------ records
 const SHB: u32 = 8;
 const SH: usize = 1 << SHB;
-const PB: u32 = 9;
+const PB: u32 = 8;
 const P: usize = 1 << PB;
 
 const TOMBSTONE: u32 = u32::MAX;
