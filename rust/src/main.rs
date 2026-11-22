@@ -745,6 +745,7 @@ struct ExactIds {
 }
 
 impl ExactIds {
+    #[cfg(test)]
     fn new() -> Self {
         Self::with_user_capacity(1024)
     }

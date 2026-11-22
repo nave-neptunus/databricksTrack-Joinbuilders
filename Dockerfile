@@ -1,7 +1,7 @@
 # Shopping Sessions: Rust pipeline (rust/). The Python/DuckDB fallback is Dockerfile.python.
 FROM rust:1-slim-bookworm AS build
 ARG TARGETARCH
-ARG NOVA_SHARDS=256
+ARG NOVA_SHARDS=1024
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src

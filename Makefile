@@ -4,7 +4,7 @@ MEM   ?= 24g
 # The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
 PLATFORM ?= linux/amd64
 DEV   ?= dev
-NOVA_SHARDS ?= 256
+NOVA_SHARDS ?= 1024
 # In the monorepo the fixtures live two levels up; the published starter has its own copy.
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
 export IMAGE CPUS MEM PLATFORM
