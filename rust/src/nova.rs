@@ -466,8 +466,11 @@ trait EventSink<'a> {
 unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     use std::arch::x86_64::*;
 
+    let v_nl = _mm256_set1_epi8(b'\n' as i8);
+    let v_comma = _mm256_set1_epi8(b',' as i8);
+    let v_quote = _mm256_set1_epi8(b'"' as i8);
     let mask =
-        |value, byte| _mm256_movemask_epi8(_mm256_cmpeq_epi8(value, _mm256_set1_epi8(byte))) as u32;
+        |value, target| _mm256_movemask_epi8(_mm256_cmpeq_epi8(value, target)) as u32;
     while bytes.len() >= 96 {
         let (a, b) = unsafe {
             let ptr = bytes.as_ptr();
@@ -476,7 +479,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
                 _mm256_loadu_si256(ptr.add(32).cast()),
             )
         };
-        if mask(a, b'\n' as i8) | mask(b, b'\n' as i8) != 0 {
+        if mask(a, v_nl) | mask(b, v_nl) != 0 {
             let n = memchr::memchr(b'\n', &bytes[..64]).unwrap();
             if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
                 sink.row(&bytes[..n], fields);
@@ -485,7 +488,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
             continue;
         }
         let c = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(64).cast()) };
-        let newline = mask(c, b'\n' as i8);
+        let newline = mask(c, v_nl);
         if newline == 0 {
             let n = memchr::memchr(b'\n', &bytes[96..]).map_or(bytes.len(), |n| n + 96);
             if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
@@ -497,14 +500,14 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
         let n = newline.trailing_zeros();
         let clip = (1u32 << n) - 1;
         let line = &bytes[..64 + n as usize];
-        let join = |byte| {
-            u128::from(mask(a, byte))
-                | (u128::from(mask(b, byte)) << 32)
-                | (u128::from(mask(c, byte) & clip) << 64)
+        let join = |target| {
+            u128::from(mask(a, target))
+                | (u128::from(mask(b, target)) << 32)
+                | (u128::from(mask(c, target) & clip) << 64)
         };
-        let commas = join(b',' as i8);
+        let commas = join(v_comma);
         if commas.count_ones() == 6 {
-            let quotes = join(b'"' as i8);
+            let quotes = join(v_quote);
             let quote_flags = if quotes == 0 {
                 Some(0)
             } else if commas & 1 != 0 {
@@ -556,9 +559,12 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
 
 #[inline]
 fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    {
+        return unsafe { fused_event_rows(bytes, sink) };
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "bmi2")))]
     if std::is_x86_feature_detected!("bmi2") {
-        // AVX2 is required by this compilation and BMI2 was checked above.
         return unsafe { fused_event_rows(bytes, sink) };
     }
     event_rows(bytes, |line, fields| sink.row(line, fields));
@@ -660,7 +666,7 @@ fn clock_seconds(s: &[u8]) -> Option<i64> {
     if (h > 23) | (m > 59) | (seconds > 59) {
         return None;
     }
-    Some(i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(seconds))
+    Some(((h as u32 * 60 + m as u32) * 60 + seconds as u32) as i64)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -841,12 +847,9 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.declined.store(true, Relaxed);
             return;
         };
-        let Ok(order) = i32::try_from(seconds - self.window_seconds) else {
-            self.declined.store(true, Relaxed);
-            return;
-        };
-        if order == CARRIER {
-            // This value is reserved for the full-ID carrier claim.
+        let diff = seconds - self.window_seconds;
+        let order = diff as i32;
+        if (order as i64 != diff) | (order == CARRIER) {
             self.declined.store(true, Relaxed);
             return;
         }
