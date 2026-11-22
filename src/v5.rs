@@ -3,7 +3,9 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::ids::{self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard, SHARDS};
+use crate::ids::{
+    self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, Shard, ShortMap, SHARDS,
+};
 use crate::iface::*;
 use crate::{
     core, k_ref, parse, setup, sys, Kind, Rec, BB, BSIZE, CBOUND, DAY_MS, G, ING_MAX, K, PBOUND, UB,
@@ -33,18 +35,28 @@ impl UserNames {
 struct Users {
     linked: FrozenDictionary,
     unlinked: Dictionary,
+    linked_short: [ShortMap; SHARDS],
     roots: Vec<u32>,
     boundary: u32,
 }
 
 impl Users {
     fn new(g: &G) -> Self {
-        let linked = Dictionary::new();
-        let roots = links(g, &linked);
+        let (linked, roots) = links(g);
         let boundary = roots.len() as u32;
+        let maps: [Mutex<Option<ShortMap>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
+        let next = AtomicUsize::new(0);
+        sys::run_par(g.nt, |_| loop {
+            let stripe = next.fetch_add(1, Ordering::Relaxed);
+            if stripe >= SHARDS {
+                break;
+            }
+            *maps[stripe].lock().unwrap() = Some(linked.short_people(stripe, &roots));
+        });
         Self {
-            linked: linked.freeze(),
+            linked,
             unlinked: Dictionary::new(),
+            linked_short: maps.map(|m| m.into_inner().unwrap().unwrap()),
             roots,
             boundary,
         }
@@ -52,15 +64,20 @@ impl Users {
 
     #[inline]
     fn person(&self, id: Id<'_>, hash: u64) -> u32 {
-        if let Some(index) = self.linked.lookup(id, hash) {
-            self.roots[index as usize]
-        } else {
+        let linked = match id {
+            Id::Short(_) => self.linked_short[ids::shard(hash)].get(&hash).copied(),
+            Id::Long(_) => self
+                .linked
+                .lookup(id, hash)
+                .map(|index| self.roots[index as usize]),
+        };
+        linked.unwrap_or_else(|| {
             self.unlinked
                 .intern(id, hash)
                 .0
                 .checked_add(self.boundary)
                 .unwrap_or_else(|| sys::fallback("IDs exceed user index capacity"))
-        }
+        })
     }
 
     fn into_names(self) -> UserNames {
@@ -100,56 +117,70 @@ fn find(parent: &mut [u32], mut id: u32) -> u32 {
     root
 }
 
-fn links(g: &G, users: &Dictionary) -> Vec<u32> {
-    let mut parent = Vec::new();
-    let mut names = Vec::<Option<Id>>::new();
-    let mut n = 0;
-    for (i, f) in g.files.iter().enumerate() {
-        if f.kind != Kind::Lk {
-            continue;
+fn links(g: &G) -> (FrozenDictionary, Vec<u32>) {
+    let users = Dictionary::new();
+    let chunks: Vec<_> = g
+        .queue
+        .iter()
+        .filter(|c| g.files[c.file as usize].kind == Kind::Lk)
+        .collect();
+    let edges: Vec<_> = (0..g.nt)
+        .map(|_| Mutex::new(Vec::<(u32, u32)>::new()))
+        .collect();
+    let next = AtomicUsize::new(0);
+    sys::run_par(g.nt, |tid| {
+        let mut edges = edges[tid].lock().unwrap();
+        while let Some(chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
+            let data = file(g, chunk.file as usize);
+            let start = line_start(data, chunk.a);
+            let end = line_start(data, chunk.b);
+            k_ref::for_each_line(&data[start..end], |a, b| {
+                let Some((a, b)) = setup::split2(&data[start + a..start + b]) else {
+                    return;
+                };
+                if a.is_empty() || b.is_empty() {
+                    return;
+                }
+                let a = Id::parse(a, b'u');
+                let b = Id::parse(b, b'u');
+                edges.push((users.intern(a, a.hash()).0, users.intern(b, b.hash()).0));
+            });
         }
-        let data = file(g, i);
-        let start = line_start(data, 1);
-        k_ref::for_each_line(&data[start..], |a, b| {
-            let Some((a, b)) = setup::split2(&data[start + a..start + b]) else {
-                return;
-            };
-            if a.is_empty() || b.is_empty() {
-                return;
-            }
-            let ka = Id::parse(a, b'u');
-            let kb = Id::parse(b, b'u');
-            let (ia, _) = users.intern(ka, ka.hash());
-            let (ib, _) = users.intern(kb, kb.hash());
-            let needed = ia.max(ib) as usize + 1;
+        g.t(tid).n_lk_rows = edges.len() as u64;
+    });
+    let users = users.freeze();
+    let mut parent = Vec::new();
+    for thread_edges in edges {
+        for (a, b) in thread_edges.into_inner().unwrap() {
+            let needed = a.max(b) as usize + 1;
             if needed > g.ucap as usize {
                 sys::fallback("linked IDs exceed user capacity");
             }
             if needed > parent.len() {
                 parent.extend(parent.len() as u32..needed as u32);
-                names.resize(needed, None);
             }
-            names[ia as usize] = Some(ka);
-            names[ib as usize] = Some(kb);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if names[ra as usize]
-                .unwrap()
-                .cmp(names[rb as usize].unwrap(), b'u')
-                .is_lt()
-            {
-                parent[rb as usize] = ra;
-            } else {
-                parent[ra as usize] = rb;
-            }
-            n += 1;
-        });
+            let ra = find(&mut parent, a);
+            let rb = find(&mut parent, b);
+            parent[ra.max(rb) as usize] = ra.min(rb);
+        }
     }
-    for i in 0..parent.len() {
-        find(&mut parent, i as u32);
+    let mut minimum = vec![u32::MAX; parent.len()];
+    for i in 0..parent.len() as u32 {
+        let Some(id) = users.id(i) else { continue };
+        let root = find(&mut parent, i) as usize;
+        let best = minimum[root];
+        if best == u32::MAX || id.cmp(users.id(best).unwrap(), b'u').is_lt() {
+            minimum[root] = i;
+        }
     }
-    g.t(0).n_lk_rows = n;
-    parent
+    for i in 0..parent.len() as u32 {
+        let root = find(&mut parent, i);
+        parent[i as usize] = root;
+    }
+    for p in &mut parent {
+        *p = minimum[*p as usize];
+    }
+    (users, parent)
 }
 
 #[inline]
@@ -191,6 +222,11 @@ struct Scan<'a> {
 struct Event {
     // Long IDs have their exact mmap offset and byte count in the scanner token.
     id: u64,
+    payload: Payload,
+}
+
+#[derive(Clone, Copy)]
+struct Payload {
     w0: u64,
     user_ingest: u64,
 }
@@ -266,8 +302,10 @@ impl Scan<'_> {
         let id = self.absolute_id(r.eid);
         self.events[event_shard(hash)].push(Event {
             id,
-            w0,
-            user_ingest: (user as u64) << 21 | ingest / 1000,
+            payload: Payload {
+                w0,
+                user_ingest: (user as u64) << 21 | ingest / 1000,
+            },
         });
     }
 
@@ -387,7 +425,7 @@ fn scan(g: &G, users: &Users) -> Vec<Parsed> {
 }
 
 #[inline]
-fn update_event(slot: &mut Event, row: Event) {
+fn update_event(slot: &mut Payload, row: Payload) {
     let old_ing = slot.user_ingest & ING_MAX;
     let new_ing = row.user_ingest & ING_MAX;
     if new_ing < old_ing {
@@ -425,8 +463,8 @@ fn dedup(g: &G, parsed: &[Parsed]) -> (Vec<Vec<Mutex<Vec<Rec>>>>, Names) {
                     BuildHasherDefault::default(),
                 );
             let mut long = Shard::with_capacity(total / 8);
-            let mut slots = Vec::<Event>::with_capacity(total);
-            let mut long_slots = Vec::<Event>::with_capacity(total / 8);
+            let mut slots = Vec::<Payload>::with_capacity(total);
+            let mut long_slots = Vec::<Payload>::with_capacity(total / 8);
             for p in parsed {
                 let part = std::mem::take(&mut *p.events[shard].lock().unwrap());
                 for row in part {
@@ -438,16 +476,16 @@ fn dedup(g: &G, parsed: &[Parsed]) -> (Vec<Vec<Mutex<Vec<Rec>>>>, Names) {
                         let next = slots.len() as u32;
                         let index = *short.entry(hash).or_insert(next);
                         if index == next {
-                            slots.push(row);
+                            slots.push(row.payload);
                         } else {
-                            update_event(&mut slots[index as usize], row);
+                            update_event(&mut slots[index as usize], row.payload);
                         }
                     } else {
                         let (index, is_new) = long.intern(id, hash);
                         if is_new {
-                            long_slots.push(row);
+                            long_slots.push(row.payload);
                         } else {
-                            update_event(&mut long_slots[index as usize], row);
+                            update_event(&mut long_slots[index as usize], row.payload);
                         }
                     }
                 }

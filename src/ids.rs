@@ -112,6 +112,8 @@ pub fn shard(hash: u64) -> usize {
 #[derive(Default)]
 pub struct IdentityHasher(u64);
 
+pub type ShortMap = HashMap<u64, u32, BuildHasherDefault<IdentityHasher>>;
+
 impl Hasher for IdentityHasher {
     fn finish(&self) -> u64 {
         self.0
@@ -257,6 +259,25 @@ impl FrozenDictionary {
         let stripe = shard(hash);
         let index = self.0[stripe].lookup(id, hash)?;
         Some((index << BITS) | stripe as u32)
+    }
+
+    pub fn id(&self, index: u32) -> Option<Id<'_>> {
+        let keys = &self.0[index as usize & (SHARDS - 1)].keys;
+        let local = index >> BITS;
+        ((local as usize) < keys.entries.len()).then(|| keys.id(local))
+    }
+
+    pub fn short_people(&self, stripe: usize, roots: &[u32]) -> ShortMap {
+        let entries = &self.0[stripe].keys.entries;
+        let mut short =
+            ShortMap::with_capacity_and_hasher(entries.len(), BuildHasherDefault::default());
+        for (local, &key) in entries.iter().enumerate() {
+            if key & LONG == 0 {
+                let index = Names::index(stripe, local as u32);
+                short.insert(mix(key), roots[index as usize]);
+            }
+        }
+        short
     }
 
     pub fn into_names(self) -> Names {

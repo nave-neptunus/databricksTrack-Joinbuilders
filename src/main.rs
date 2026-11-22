@@ -319,7 +319,7 @@ fn main() {
         sys::tl::T0_NS = sys::tl::realtime_ns() - t0.elapsed().as_nanos() as u64;
         sys::tl::LAPT.reserve(64);
     }
-    if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
+    if std::env::var("XL_ALLOC").is_ok_and(|v| v == "1") {
         sys::alloc_enable();
     }
     if std::env::var("XL_FIRST4K").is_ok_and(|v| v == "1") {
