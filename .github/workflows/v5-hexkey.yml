@@ -34,7 +34,7 @@ jobs:
           git archive --format=tar 6da0386b4ca6a001a5c7f747c68f40815fc14afb | docker build --platform linux/amd64 --load --tag hexkey-baseline -
           docker build --platform linux/amd64 --load --tag hexkey-candidate .
       - name: Run all 36 fixtures
-        env: { IMAGE: hexkey-candidate }
+        env: { IMAGE: hexkey-candidate, CPUS: '4' }
         run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
       - name: Generate v5 20M corpus
         run: generator/target/release/generate --seed 17 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/v5-20m"
@@ -44,6 +44,6 @@ jobs:
           git show FETCH_HEAD:bench/ci_bench.py > "$RUNNER_TEMP/ci_bench.py"
           mkdir -p bench
           cp "$RUNNER_TEMP/ci_bench.py" bench/ci_bench.py
-          BASELINE_REF=6da0386b4ca6a001a5c7f747c68f40815fc14afb CANDIDATE_REF="$GITHUB_SHA" BASELINE_IMAGE=hexkey-baseline CANDIDATE_IMAGE=hexkey-candidate PAIRS=8 NCPU=8 python3 bench/ci_bench.py "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-results"
+          BASELINE_REF=6da0386b4ca6a001a5c7f747c68f40815fc14afb CANDIDATE_REF="$GITHUB_SHA" BASELINE_IMAGE=hexkey-baseline CANDIDATE_IMAGE=hexkey-candidate PAIRS=8 NCPU=4 python3 bench/ci_bench.py "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-results"
       - if: always()
         run: cat "$RUNNER_TEMP/v5-results/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
