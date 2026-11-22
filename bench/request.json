@@ -1,8 +1,11 @@
 {
-  "baseline": "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed",
-  "candidate": "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed",
+  "baseline": "01e026ac01c71e82943df158ed78462afd8885ca",
+  "candidate": "01e026ac01c71e82943df158ed78462afd8885ca",
   "timing": [
-    "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed"
+    "01e026ac01c71e82943df158ed78462afd8885ca"
   ],
-  "rounds": {"20m": 1, "60m": 1}
+  "rounds": {
+    "20m": 1,
+    "60m": 1
+  }
 }

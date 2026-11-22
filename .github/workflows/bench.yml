@@ -2,7 +2,7 @@ name: gum v5 Intel profiling
 
 on:
   push:
-    branches: [ci/gum-perf]
+    branches: [ci/gum-tail-perf]
   workflow_dispatch:
 
 jobs:
@@ -67,6 +67,16 @@ jobs:
             bench-work/binaries.json
             bench-work/20m/
           retention-days: 7
+
+      - name: Show tail source lines
+        if: always()
+        shell: bash
+        run: |
+          f=$(ls bench-work/20m/perf-srcline.txt 2>/dev/null | head -1)
+          echo "file=$f"
+          grep -E "main.rs:(2[2-6][0-9][0-9])|user_parquet.rs|nova.rs" "$f" | head -150 || true
+          echo ---- top 60
+          head -90 "$f" | cut -c1-200
 
       - name: Profile v5 seed 17 at 60M
         if: ${{ false }}
