@@ -800,6 +800,123 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
     }
 }
 
+// TIMING-only phase diagnostics (per-worker busy/wait accounting).
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct RUsage {
+    utime: [i64; 2],
+    stime: [i64; 2],
+    maxrss: i64,
+    ixrss: i64,
+    idrss: i64,
+    isrss: i64,
+    minflt: i64,
+    majflt: i64,
+    nswap: i64,
+    inblock: i64,
+    oublock: i64,
+    msgsnd: i64,
+    msgrcv: i64,
+    nsignals: i64,
+    nvcsw: i64,
+    nivcsw: i64,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+}
+
+fn rusage(who: i32) -> RUsage {
+    let mut r = RUsage::default();
+    #[cfg(target_os = "linux")]
+    unsafe {
+        getrusage(who, &mut r);
+    }
+    let _ = who;
+    r
+}
+
+fn tv_ms(t: [i64; 2]) -> f64 {
+    t[0] as f64 * 1e3 + t[1] as f64 / 1e3
+}
+
+#[derive(Default)]
+struct WorkerStat {
+    worker: u32,
+    start_ms: f64,
+    end_ms: f64,
+    wait_ns: u64,
+    parse_ns: u64,
+    tail_ns: u64,
+    chunks: u64,
+    bytes: u64,
+    max_parse_ns: u64,
+    max_wait_ns: u64,
+    user_ms: f64,
+    sys_ms: f64,
+    minflt: i64,
+    nvcsw: i64,
+    nivcsw: i64,
+}
+
+fn report_phase(stats: &[WorkerStat], wall_ms: f64, p0: RUsage, p1: RUsage) {
+    let threads = stats.len().max(1) as f64;
+    let busy: f64 = stats.iter().map(|w| (w.parse_ns + w.tail_ns) as f64 / 1e6).sum();
+    let wait: f64 = stats.iter().map(|w| w.wait_ns as f64 / 1e6).sum();
+    let chunks: u64 = stats.iter().map(|w| w.chunks).sum();
+    let bytes: u64 = stats.iter().map(|w| w.bytes).sum();
+    let max_parse = stats.iter().map(|w| w.max_parse_ns).max().unwrap_or(0) as f64 / 1e6;
+    let max_wait = stats.iter().map(|w| w.max_wait_ns).max().unwrap_or(0) as f64 / 1e6;
+    let tu: f64 = stats.iter().map(|w| w.user_ms).sum();
+    let ts: f64 = stats.iter().map(|w| w.sys_ms).sum();
+    let tf: i64 = stats.iter().map(|w| w.minflt).sum();
+    eprintln!(
+        "UTIL events phase: wall {wall_ms:.1} ms, {} workers, busy(parse+tail) {busy:.1} ms, wait(read_ahead) {wait:.1} ms, utilization busy/(wall*threads) {:.3}, (busy+wait) {:.3}",
+        stats.len(),
+        busy / (wall_ms * threads),
+        (busy + wait) / (wall_ms * threads)
+    );
+    eprintln!(
+        "UTIL chunks {chunks}, avg {:.0} bytes, avg parse {:.3} ms/chunk, max parse {max_parse:.1} ms, max wait {max_wait:.1} ms",
+        bytes as f64 / chunks.max(1) as f64,
+        busy / chunks.max(1) as f64
+    );
+    eprintln!(
+        "UTIL worker threads CPU: user {tu:.1} ms, sys {ts:.1} ms (util cpu/(wall*threads) {:.3}), minflt {tf}",
+        (tu + ts) / (wall_ms * threads)
+    );
+    eprintln!(
+        "UTIL process rusage over phase: user {:.1} ms, sys {:.1} ms, minflt {}, majflt {}, vcsw {}, ivcsw {}, inblock {}",
+        tv_ms(p1.utime) - tv_ms(p0.utime),
+        tv_ms(p1.stime) - tv_ms(p0.stime),
+        p1.minflt - p0.minflt,
+        p1.majflt - p0.majflt,
+        p1.nvcsw - p0.nvcsw,
+        p1.nivcsw - p0.nivcsw,
+        p1.inblock - p0.inblock
+    );
+    for w in stats {
+        eprintln!(
+            "UTIL w{:02} start {:7.1} end {:7.1} chunks {:4} parse {:7.1} wait {:7.1} tail {:6.1} maxparse {:6.2} maxwait {:6.2} cpu u{:7.1} s{:6.1} minflt {:7} vcsw {} ivcsw {}",
+            w.worker,
+            w.start_ms,
+            w.end_ms,
+            w.chunks,
+            w.parse_ns as f64 / 1e6,
+            w.wait_ns as f64 / 1e6,
+            w.tail_ns as f64 / 1e6,
+            w.max_parse_ns as f64 / 1e6,
+            w.max_wait_ns as f64 / 1e6,
+            w.user_ms,
+            w.sys_ms,
+            w.minflt,
+            w.nvcsw,
+            w.nivcsw
+        );
+    }
+}
+
 fn events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
@@ -811,12 +928,21 @@ fn events(
 ) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
+    let timing = std::env::var_os("TIMING").is_some();
+    let phase_start = std::time::Instant::now();
+    let proc0 = if timing { rusage(0) } else { RUsage::default() };
+    let stats = std::sync::Mutex::new(Vec::<WorkerStat>::new());
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
     let reservation = (rows_per_partition + rows_per_partition / 4)
         .clamp(PAYLOAD_ROWS, INDEX_MASK as usize + 1)
         .next_multiple_of(PAYLOAD_ROWS);
     let mut parsed: Vec<_> = rayon::broadcast(|_| {
         let worker = workers.fetch_add(1, Relaxed) as u32;
+        let mut stat = WorkerStat { worker, ..Default::default() };
+        let thread0 = if timing { rusage(1) } else { RUsage::default() };
+        if timing {
+            stat.start_ms = phase_start.elapsed().as_secs_f64() * 1e3;
+        }
         let too_many = worker >= 1 << (32 - LOC_WORKER_SHIFT);
         if too_many {
             declined.store(true, Relaxed);
@@ -843,18 +969,53 @@ fn events(
                 if index >= work.len() {
                     break;
                 }
-                read_ahead.wait(work.raw(index));
-                parser.parse_chunk(work.get(index));
+                if timing {
+                    let t0 = std::time::Instant::now();
+                    read_ahead.wait(work.raw(index));
+                    let t1 = std::time::Instant::now();
+                    let chunk = work.get(index);
+                    parser.parse_chunk(chunk);
+                    let t2 = std::time::Instant::now();
+                    let wait = (t1 - t0).as_nanos() as u64;
+                    let parse = (t2 - t1).as_nanos() as u64;
+                    stat.wait_ns += wait;
+                    stat.parse_ns += parse;
+                    stat.max_wait_ns = stat.max_wait_ns.max(wait);
+                    stat.max_parse_ns = stat.max_parse_ns.max(parse);
+                    stat.chunks += 1;
+                    stat.bytes += chunk.len() as u64;
+                } else {
+                    read_ahead.wait(work.raw(index));
+                    parser.parse_chunk(work.get(index));
+                }
             }
+            let t3 = std::time::Instant::now();
             parser.flush();
             parser.people.finish();
+            stat.tail_ns = t3.elapsed().as_nanos() as u64;
             parser.streams
         };
+        if timing {
+            let thread1 = rusage(1);
+            stat.end_ms = phase_start.elapsed().as_secs_f64() * 1e3;
+            stat.user_ms = tv_ms(thread1.utime) - tv_ms(thread0.utime);
+            stat.sys_ms = tv_ms(thread1.stime) - tv_ms(thread0.stime);
+            stat.minflt = thread1.minflt - thread0.minflt;
+            stat.nvcsw = thread1.nvcsw - thread0.nvcsw;
+            stat.nivcsw = thread1.nivcsw - thread0.nivcsw;
+            stats.lock().unwrap().push(stat);
+        }
         (worker, streams, people)
     });
     // `broadcast` returns results in completion order, but locations encode
     // the assigned worker id, so restore that order before indexing.
     parsed.sort_unstable_by_key(|(worker, _, _)| *worker);
+    if timing {
+        let wall_ms = phase_start.elapsed().as_secs_f64() * 1e3;
+        let mut stats = stats.into_inner().unwrap();
+        stats.sort_unstable_by_key(|w| w.worker);
+        report_phase(&stats, wall_ms, proc0, rusage(0));
+    }
     let mut streams = Vec::with_capacity(parsed.len());
     let mut people = Vec::with_capacity(parsed.len());
     for (_, s, p) in parsed {
