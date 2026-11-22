@@ -23,5 +23,6 @@ COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/rproto /app/rprot
 # Static glibc reads tunables at startup, so huge-page malloc still applies without libc mounts.
 ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 ENV BLUE2_IO_THREADS=32
+ENV GUM_LZ4=1
 USER 1000:1000
 CMD ["/app/rproto"]

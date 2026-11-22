@@ -11,6 +11,7 @@ bytes = "1"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 parquet = { version = "60.1.0", default-features = false, features = ["arrow"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 rayon = "1.12.0"
 
 [profile.release]

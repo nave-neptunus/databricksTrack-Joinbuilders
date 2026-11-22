@@ -112,8 +112,18 @@ impl UserParquet {
             };
             let body = std::mem::take(column).freeze();
             let size = body.len() - start;
+            let levels = if optional { DEFINITION_SPACE - start } else { 0 };
+            // V2 pages keep the levels uncompressed; only the values are LZ4_RAW blocks.
+            let packed = lz4().then(|| {
+                let raw = &body[start..];
+                let mut out = Vec::with_capacity(levels + lz4_flex::block::get_maximum_output_size(raw.len() - levels));
+                out.extend_from_slice(&raw[..levels]);
+                out.extend_from_slice(&lz4_flex::block::compress(&raw[levels..]));
+                bytes::Bytes::from(out)
+            });
+            let compressed = packed.is_some();
             let page = Page::DataPageV2 {
-                buf: body.slice(start..),
+                buf: packed.unwrap_or_else(|| body.slice(start..)),
                 num_values: self.rows,
                 encoding: Encoding::PLAIN,
                 num_nulls: nulls,
@@ -124,7 +134,7 @@ impl UserParquet {
                     0
                 },
                 rep_levels_byte_len: 0,
-                is_compressed: false,
+                is_compressed: compressed,
                 statistics: None,
             };
             let spec = SerializedPageWriter::new(&mut self.file)
@@ -143,7 +153,7 @@ impl UserParquet {
             };
             let metadata = ColumnChunkMetaData::builder(descriptor.clone())
                 .set_encodings(encodings)
-                .set_compression(Compression::UNCOMPRESSED)
+                .set_compression(if compressed { Compression::LZ4_RAW } else { Compression::UNCOMPRESSED })
                 .set_num_values(i64::from(self.rows))
                 .set_total_compressed_size(spec.compressed_size as i64)
                 .set_total_uncompressed_size(spec.uncompressed_size as i64)
@@ -170,6 +180,12 @@ impl UserParquet {
             .unwrap();
         self.file.flush().unwrap();
     }
+}
+
+/// GUM_LZ4=1 writes user_daily values as LZ4_RAW (smaller output, less write-back after exit).
+fn lz4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GUM_LZ4").is_some_and(|v| v != "0"))
 }
 
 fn plain_string(buf: &mut BytesMut, value: &[u8]) {
