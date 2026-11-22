@@ -1242,7 +1242,10 @@ unsafe extern "C" fn ev_cold<S: EventSink>(cx: *const Cx<EvBatch, S>, p: *const 
         let l = p.offset_from(base) as usize;
         let sink = &mut *cx.sink;
         (*b).n = s.offset_from((*b).ts.as_ptr()) as usize;
-        let r = ev_core::<S, true>(base, len, l, 0, cx.cache, sink);
+        let mut r = ev_core::<S, true>(base, len, l, 0, cx.cache, sink);
+        if r == FAIL {
+            r = ev_long(base, len, l, cx.cache, sink);
+        }
         let next = if r != FAIL { r + 1 } else { scan_event(core::slice::from_raw_parts(base, len), l, sink) };
         Pair(base.wrapping_add(next) as u64, (*b).ts.as_mut_ptr().add((*b).n) as u64)
     }
@@ -1573,7 +1576,10 @@ unsafe extern "C" fn cl_cold<S: ClickSink>(cx: *const Cx<CkBatch, S>, p: *const 
         let sink = &mut *cx.sink;
         (*b).n = s.offset_from((*b).ts.as_ptr()) as usize;
         let (w, nl) = cl_masks(p);
-        let r = cl_core::<S, true, true>(base, len, l, 0, &w, nl, cx.cache, sink);
+        let mut r = cl_core::<S, true, true>(base, len, l, 0, &w, nl, cx.cache, sink);
+        if r == FAIL {
+            r = ck_long(base, len, l, cx.cache, sink);
+        }
         let next = if r != FAIL { r + 1 } else { scan_click(core::slice::from_raw_parts(base, len), l, sink) };
         Pair(base.wrapping_add(next) as u64, (*b).ts.as_mut_ptr().add((*b).n) as u64)
     }
@@ -1702,6 +1708,97 @@ fn here(mut v: u64) -> u64 {
 fn here_k(mut v: u64) -> u64 {
     unsafe { core::arch::asm!("/* {0} */", inout(kreg) v, options(nomem, nostack, preserves_flags)) };
     v
+}
+
+// Rows whose IDs are too long for the 64-byte window of ev_core/cl_core (32-hex IDs) used to fall into the
+// scalar byte-by-byte slow path. These parse them from two 64-byte compare masks (128 bytes), classify the IDs
+// with the same reference routine, and bail out (FAIL) on anything unusual so the slow path stays the authority.
+#[inline(always)]
+unsafe fn wide_masks(p: *const u8) -> (u128, u128, u128) {
+    unsafe {
+        let (a, b) = (masks(p), masks(p.add(64)));
+        (a.c as u128 | (b.c as u128) << 64, a.q as u128 | (b.q as u128) << 64, a.n as u128 | (b.n as u128) << 64)
+    }
+}
+
+#[inline(always)]
+fn nth_comma(c: &mut u128) -> usize {
+    let i = c.trailing_zeros() as usize;
+    *c &= c.wrapping_sub(1);
+    i
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn ev_long<S: EventSink>(base: *const u8, len: usize, l: usize, cache: *mut DateEnt, sink: &mut S) -> usize {
+    unsafe {
+        if l + 128 > len {
+            return FAIL;
+        }
+        let p = base.add(l);
+        let (c, q, n) = wide_masks(p);
+        if n == 0 {
+            return FAIL;
+        }
+        let m = n.trailing_zeros() as usize;
+        let below = (1u128 << m) - 1;
+        let mut cm = c & below;
+        if (q & below != 0) | (cm.count_ones() != 6) {
+            return FAIL;
+        }
+        let (c0, c1, c2, c3, c4, c5) = (nth_comma(&mut cm), nth_comma(&mut cm), nth_comma(&mut cm), nth_comma(&mut cm), nth_comma(&mut cm), nth_comma(&mut cm));
+        if (c0 == 0) | (c2 - c1 - 1 > 32) | (c3 - c2 - 1 != 20) {
+            return FAIL;
+        }
+        let Some(ts) = ts_careful::<true>(p.add(c1 + 1), c2 - c1 - 1, cache) else { return FAIL };
+        let Some(ingest) = ts_careful::<false>(p.add(c2 + 1), 20, cache) else { return FAIL };
+        let buf = core::slice::from_raw_parts(base, len);
+        let kind = slow::parse_kind(&buf[l + c3 + 1..l + c4]);
+        sink.event(&EvRow {
+            eid: slow::parse_id(buf, (l, l + c0), b'e'),
+            uid: slow::parse_id(buf, (l + c0 + 1, l + c1), b'u'),
+            ts,
+            ingest,
+            kind,
+            product: slow::parse_product(&buf[l + c4 + 1..l + c5]),
+            price: if kind == KIND_PURCHASE { slow::parse_price(&buf[l + c5 + 1..l + m]) } else { 0 },
+        });
+        l + m
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn ck_long<S: ClickSink>(base: *const u8, len: usize, l: usize, cache: *mut DateEnt, sink: &mut S) -> usize {
+    unsafe {
+        if l + 128 > len {
+            return FAIL;
+        }
+        let p = base.add(l);
+        let (c, q, n) = wide_masks(p);
+        if n == 0 {
+            return FAIL;
+        }
+        let m = n.trailing_zeros() as usize;
+        let below = (1u128 << m) - 1;
+        let mut cm = c & below;
+        if (q & below != 0) | (cm.count_ones() != 3) {
+            return FAIL;
+        }
+        let (c0, c1, c2) = (nth_comma(&mut cm), nth_comma(&mut cm), nth_comma(&mut cm));
+        if (c0 == 0) | (m - c2 - 1 > 32) {
+            return FAIL;
+        }
+        let Some(ts) = ts_careful::<true>(p.add(c2 + 1), m - c2 - 1, cache) else { return FAIL };
+        let buf = core::slice::from_raw_parts(base, len);
+        sink.click(&ClRow {
+            cid: slow::parse_id(buf, (l, l + c0), b'k'),
+            uid: slow::parse_id(buf, (l + c0 + 1, l + c1), b'u'),
+            campaign: slow::parse_campaign(&buf[l + c1 + 1..l + c2]),
+            ts,
+        });
+        l + m
+    }
 }
 
 #[cold]
@@ -2358,7 +2455,7 @@ mod slow {
         }
     }
 
-    fn parse_price(v: &[u8]) -> u32 {
+    pub fn parse_price(v: &[u8]) -> u32 {
         if v.is_empty() || !v.iter().all(|b| b.is_ascii_digit()) {
             return 0;
         }

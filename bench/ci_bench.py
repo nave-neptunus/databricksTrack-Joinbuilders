@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REQUEST = json.loads((ROOT / "bench/request.json").read_text())
 BASE = REQUEST["baseline"]
 CAND = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-TIMING, ROUNDS = [BASE, CAND], REQUEST["rounds"]
+TIMING, ROUNDS = [BASE] + ([REQUEST["prev"]] if REQUEST.get("prev") else []) + [CAND], REQUEST["rounds"]
 NCPU = os.environ.get("NCPU", "8")
 WORK.mkdir(parents=True, exist_ok=True)
 GATE_FAILURES = []
@@ -152,7 +152,7 @@ def time_size(binaries, size, rounds):
         order = TIMING[number % len(TIMING):] + TIMING[:number % len(TIMING)]
         row = {"round": number + 1, "order": order}
         for sha in order:
-            out, elapsed, laps = run(binaries[sha], HOME / f"v5-{size}", f"{size}-{number + 1}-{sha[:8]}", candidate=sha == CAND, timing=True)
+            out, elapsed, laps = run(binaries[sha], HOME / f"v5-{size}", f"{size}-{number + 1}-{sha[:8]}", candidate=sha != BASE, timing=True)
             row[sha] = (elapsed, laps)
             print(f"{size} {sha[:8]} wall {elapsed:.1f} ms", flush=True)
             shutil.rmtree(out)

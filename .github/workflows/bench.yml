@@ -2,7 +2,7 @@ name: Express v5 gate and timing
 
 on:
   push:
-    branches: [ci/gum-express-sol]
+    branches: [ci/gum-express-parse]
   workflow_dispatch:
 
 jobs:

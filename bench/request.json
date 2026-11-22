@@ -3,5 +3,6 @@
   "rounds": {
     "20m": 5,
     "60m": 3
-  }
+  },
+  "prev": "0bae30fbfe6cd9a7ba59c31945c42eb6931ebc18"
 }
