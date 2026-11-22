@@ -56,6 +56,9 @@ impl HexUsers {
     }
 
     pub(super) fn intern(&self, bytes: &[u8]) -> Option<u64> {
+        if self.overflowed() {
+            return None;
+        }
         let (high, low) = identity(bytes)?;
         let mask = self.entries.len() - 1;
         let mixed = high.wrapping_mul(0xd6e8_feb8_6659_fd93) ^ low.rotate_left(29);
@@ -140,14 +143,14 @@ mod tests {
     }
 
     #[test]
-    fn saturated_table_declines_and_existing_handles_stay_stable() {
+    fn saturated_table_declines_without_repeated_full_table_scans() {
         let table = HexUsers::new(1);
-        let first = table.intern(b"u00000000000000000000000000000000");
+        assert!(table.intern(b"u00000000000000000000000000000000").is_some());
         for value in 1..16 {
             assert!(table.intern(format!("u{value:032x}").as_bytes()).is_some());
         }
         assert_eq!(table.intern(b"u00000000000000000000000000000010"), None);
         assert!(table.overflowed());
-        assert_eq!(table.intern(b"u00000000000000000000000000000000"), first);
+        assert_eq!(table.intern(b"u00000000000000000000000000000000"), None);
     }
 }
