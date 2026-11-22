@@ -94,6 +94,14 @@ fn mix(h: u64) -> u64 {
     h ^ (h >> 32)
 }
 
+// A reversible mix of the 48 packed bits in a 63-bit word, leaving the
+// high bit available for raw-span claims. Short event equality is exact.
+#[inline]
+pub fn event_key(key: u64) -> u64 {
+    let mixed = (key ^ (key >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9) & (u64::MAX >> 1);
+    mixed ^ (mixed >> 32)
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hash = bytes.len() as u64 ^ 0x517c_c1b7_2722_0a95;
     let (words, tail) = bytes.as_chunks::<8>();

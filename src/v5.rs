@@ -1,12 +1,10 @@
-use std::collections::{hash_map::Entry, HashMap};
-use std::hash::BuildHasherDefault;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::ids::{
-    self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, PackedDictionary, PackedNames,
-    PackedPeople, Shard, SHARDS,
+    self, Dictionary, FrozenDictionary, Id, Names, PackedDictionary, PackedNames, PackedPeople,
+    Shard, SHARDS,
 };
 use crate::iface::*;
 use crate::{
@@ -429,8 +427,12 @@ impl Scan<'_> {
                 },
             );
         }
-        let hash = id_at(g, r.eid, self.base).hash();
-        let id = self.absolute_id(r.eid);
+        let (id, hash) = if r.eid & ID_ODD == 0 {
+            let key = ids::event_key(r.eid);
+            (key, key)
+        } else {
+            (self.absolute_id(r.eid), id_at(g, r.eid, self.base).hash())
+        };
         let copy = CopyLocation {
             ingest: (ingest / 1000) as u32,
             loc,
@@ -615,12 +617,70 @@ fn choose(g: &G, winner: &mut CopyLocation, copy: CopyLocation, parsed: &[Parsed
     }
 }
 
+#[derive(Clone, Copy)]
+struct DedupSlot {
+    key: u64,
+    copy: CopyLocation,
+}
+
+impl DedupSlot {
+    const EMPTY: Self = Self {
+        key: 0,
+        copy: CopyLocation {
+            ingest: 0,
+            loc: NO_PAYLOAD,
+        },
+    };
+}
+
+struct EventSlots {
+    slots: Vec<DedupSlot>,
+}
+
+impl EventSlots {
+    fn reset(&mut self, capacity: usize) {
+        let len = (2 * capacity).next_power_of_two();
+        self.slots.resize(len, DedupSlot::EMPTY);
+        self.slots.fill(DedupSlot::EMPTY);
+    }
+
+    #[inline]
+    fn prefetch(&self, key: u64) {
+        if key & ID_ODD != 0 {
+            return;
+        }
+        let slot = key as usize & (self.slots.len() - 1);
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(slot).cast());
+        }
+    }
+
+    #[inline]
+    fn copy(&mut self, g: &G, parsed: &[Parsed], key: u64, copy: CopyLocation) {
+        let mask = self.slots.len() - 1;
+        let mut i = key as usize & mask;
+        loop {
+            let slot = &mut self.slots[i];
+            if slot.key == 0 {
+                *slot = DedupSlot { key, copy };
+                return;
+            }
+            if slot.key == key {
+                choose(g, &mut slot.copy, copy, parsed);
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
 fn dedup(g: &G, parsed: &[Parsed]) -> Names {
     let click_names: [Mutex<Option<Shard>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
         let clicks = &mut g.t(tid).us;
-        let mut short = HashMap::<u64, CopyLocation, BuildHasherDefault<IdentityHasher>>::default();
+        let mut short = EventSlots { slots: Vec::new() };
         let mut long_slots = Vec::<CopyLocation>::new();
         loop {
             let shard = next.fetch_add(1, Ordering::Relaxed);
@@ -634,30 +694,22 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                 continue;
             }
             let total: usize = parsed.iter().map(|p| p.claims.0.count(shard)).sum();
-            short.clear();
-            short.reserve(total);
+            short.reset(total);
             let mut long = Shard::with_capacity(total / 8);
             long_slots.clear();
             long_slots.reserve(total / 8);
             for p in parsed {
                 p.claims.0.for_each(shard, |part| {
-                    for row in part {
-                        let id = id_at(g, row.w0, 0);
+                    for (i, row) in part.iter().enumerate() {
+                        if let Some(next) = part.get(i + 10) {
+                            short.prefetch(next.w0);
+                        }
                         let copy = CopyLocation::unpack(row.w1);
-                        let hash = id.hash();
-                        if let Id::Short(_) = id {
-                            // The mixer is a bijection on u64, so equal short
-                            // hashes imply equal packed keys.
-                            match short.entry(hash) {
-                                Entry::Occupied(mut slot) => {
-                                    choose(g, slot.get_mut(), copy, parsed)
-                                }
-                                Entry::Vacant(slot) => {
-                                    slot.insert(copy);
-                                }
-                            }
+                        if row.w0 & ID_ODD == 0 {
+                            short.copy(g, parsed, row.w0, copy);
                         } else {
-                            let (index, is_new) = long.intern(id, hash);
+                            let id = id_at(g, row.w0, 0);
+                            let (index, is_new) = long.intern(id, id.hash());
                             if is_new {
                                 long_slots.push(copy);
                             } else {
