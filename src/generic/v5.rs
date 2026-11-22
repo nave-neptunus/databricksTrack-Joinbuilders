@@ -21,7 +21,7 @@ use crate::iface::*;
 use std::cmp::Ordering as Cmp;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const ES: usize = 256;
@@ -294,21 +294,36 @@ fn build_links(parts: &[Vec<(B, u64, B, u64)>]) -> R<LinkTab> {
 // ---------- records ----------
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Claim {
     key: u64,
-    loc: u64,
-    ing: i64,
+    ing: i32,
     ord: u32,
-    seq: u32,
 }
 #[derive(Clone, Copy)]
+#[repr(C)]
+struct ClaimO {
+    key: u64,
+    loc: u64,
+    ing: i32,
+    ord: u32,
+}
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
 struct Pay {
+    pkey: u64,
+    ts: u32,
+    pp: u32, // price | cat << 24 | kind << 29
+    ord: u32,
+}
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct PayO {
     pkey: u64,
     ploc: u64,
     ts: u32,
-    pp: u32, // price | kind << 24
-    seq: u32,
-    cat: u32,
+    pp: u32,
+    ord: u32,
 }
 #[derive(Clone, Copy)]
 struct CPay {
@@ -353,13 +368,20 @@ impl<T: Copy> Seg<T> {
 
 struct TS {
     claims: Vec<Seg<Claim>>,
+    claims_o: Vec<Seg<ClaimO>>,
     pays: Vec<Seg<Pay>>,
+    pays_o: Vec<Seg<PayO>>,
     cpays: Vec<Seg<CPay>>,
-    seq: u32,
 }
 impl TS {
     fn new() -> TS {
-        TS { claims: (0..ES).map(|_| Seg::new()).collect(), pays: (0..PS).map(|_| Seg::new()).collect(), cpays: (0..PS).map(|_| Seg::new()).collect(), seq: 0 }
+        TS {
+            claims: (0..ES).map(|_| Seg::new()).collect(),
+            claims_o: (0..ES).map(|_| Seg::new()).collect(),
+            pays: (0..PS).map(|_| Seg::new()).collect(),
+            pays_o: (0..PS).map(|_| Seg::new()).collect(),
+            cpays: (0..PS).map(|_| Seg::new()).collect(),
+        }
     }
 }
 
@@ -453,9 +475,13 @@ impl<'a, 'b> Sink<'a, 'b> {
         }
         let ord = self.chunk << 20 | self.ridx;
         self.ridx += 1;
-        let seq = self.st.seq;
-        self.st.seq += 1;
         let c = self.c;
+        let ing = r.ingest.wrapping_sub(c.ws);
+        if ing < i32::MIN as i64 || ing > i32::MAX as i64 {
+            self.bad = Some("ingest out of range");
+            return;
+        }
+        let ing = ing as i32;
         let rel = r.ts.wrapping_sub(c.ws);
         let valid = r.uid != ID_EMPTY
             && r.product != PROD_EMPTY
@@ -465,7 +491,11 @@ impl<'a, 'b> Sink<'a, 'b> {
             && (r.kind != KIND_PURCHASE || r.price != 0)
             && r.ingest.wrapping_sub(r.ts) <= DAY_MS;
         let h = mixk(ekey);
-        self.st.claims[shard_h(h)].push(Claim { key: ekey, loc: eloc, ing: r.ingest, ord, seq });
+        if ekey & ODD == 0 {
+            self.st.claims[shard_h(h)].push(Claim { key: ekey, ing, ord });
+        } else {
+            self.st.claims_o[shard_h(h)].push(ClaimO { key: ekey, loc: eloc, ing, ord });
+        }
         if !valid {
             return;
         }
@@ -480,7 +510,12 @@ impl<'a, 'b> Sink<'a, 'b> {
         }
         let (pkey, ploc) = self.person(ukey, uloc);
         let p = shard_h(mixk(pkey));
-        self.st.pays[p].push(Pay { pkey, ploc, ts: rel as u32, pp: price | (r.kind as u32) << 24, seq, cat });
+        let pp = price | cat << 24 | (r.kind as u32) << 29;
+        if pkey & ODD == 0 {
+            self.st.pays[p].push(Pay { pkey, ts: rel as u32, pp, ord });
+        } else {
+            self.st.pays_o[p].push(PayO { pkey, ploc, ts: rel as u32, pp, ord });
+        }
     }
 
     fn ck_batch(&mut self) {
@@ -545,9 +580,8 @@ impl<'a, 'b> ClickSink for Sink<'a, 'b> {
 
 #[derive(Clone, Copy)]
 struct PE {
-    ts: i64,
-    pt: u32,
-    cat: u32,
+    ts: u32,
+    pp: u32,
 }
 #[derive(Clone, Copy)]
 struct PC {
@@ -608,35 +642,37 @@ fn click_cmp(a: &PC, b: &PC) -> Cmp {
     a.ts.cmp(&b.ts).then_with(|| id_cmp((a.ckey, a.cloc), (b.ckey, b.cloc), b'k'))
 }
 
-fn person(name: &'static [u8], evs: &mut [PE], cks: &mut [PC], sc: &mut Scratch, rows: &mut Vec<UserRow<'static>>, organic: u32, acc: &mut Acc) {
+fn person(ws: i64, name: &'static [u8], evs: &mut [PE], cks: &mut [PC], sc: &mut Scratch, rows: &mut Vec<UserRow<'static>>, organic: u32, acc: &mut Acc) {
     if evs.is_empty() {
         return;
     }
     evs.sort_unstable_by_key(|e| e.ts);
     sc.sess.clear();
-    let mut d = DayAcc { day: day_of(evs[0].ts), sessions: 0, events: 0, revenue: 0 };
-    let mut prev = evs[0].ts;
+    let mut d = DayAcc { day: day_of(ws + evs[0].ts as i64), sessions: 0, events: 0, revenue: 0 };
+    let mut prev = ws + evs[0].ts as i64;
     for (i, e) in evs.iter().enumerate() {
-        if i == 0 || e.ts - prev > GAP_MS {
-            let day = day_of(e.ts);
+        let et = ws + e.ts as i64;
+        if i == 0 || et - prev > GAP_MS {
+            let day = day_of(et);
             if day != d.day {
                 flush_row(name, &d, sc, rows);
                 d = DayAcc { day, sessions: 0, events: 0, revenue: 0 };
             }
             d.sessions += 1;
-            sc.sess.push(Sess { start: e.ts, day, rev: 0, purch: false });
+            sc.sess.push(Sess { start: et, day, rev: 0, purch: false });
         }
-        prev = e.ts;
+        prev = et;
         d.events += 1;
-        if (e.pt >> 24) == T_PURCHASE {
-            let price = (e.pt & 0x00ff_ffff) as u64;
+        if (e.pp >> 29) == T_PURCHASE {
+            let price = (e.pp & 0x00ff_ffff) as u64;
             let s = sc.sess.last_mut().unwrap();
             s.rev += price;
             s.purch = true;
             d.revenue += price;
-            let c = e.cat as usize;
+            let cat = (e.pp >> 24) & 31;
+            let c = cat as usize;
             if sc.catsum[c] == 0 {
-                sc.touched.push(e.cat);
+                sc.touched.push(cat);
             }
             sc.catsum[c] += price;
         }
@@ -831,6 +867,9 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
     camp_ids.push(b"organic");
     channels.push(b"organic");
     let ncat = cat_names.len();
+    if ncat > 32 {
+        return why("more than 32 categories");
+    }
 
     let ev_files: Vec<B> = evm.iter().map(|m| m.bytes()).collect();
     let ck_files: Vec<B> = ckm.iter().map(|m| m.bytes()).collect();
@@ -855,7 +894,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
         return why("too many chunks");
     }
     let bad_slot: Mutex<Option<&'static str>> = Mutex::new(None);
-    let (_, states) = par_run(
+    let (rowcounts, states) = par_run(
         ne + nc,
         ncpu,
         || (TS::new(), EvBatch::new(), CkBatch::new()),
@@ -889,6 +928,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
             if let Some(b) = sink.bad {
                 *bad_slot.lock().unwrap() = Some(b);
             }
+            sink.ridx
         },
     );
     if let Some(b) = bad_slot.into_inner().unwrap() {
@@ -902,45 +942,51 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
             eprintln!("[stats] {} = {}", crate::k_free::REASON_NAMES[i], n);
         }
     }
-    let nthreads = states.len();
-    let lost: Vec<Vec<AtomicU8>> = states
-        .iter()
-        .map(|s| {
-            let v = vec![0u8; s.0.seq as usize];
-            unsafe { std::mem::transmute::<Vec<u8>, Vec<AtomicU8>>(v) }
-        })
-        .collect();
+    let lost: Vec<Vec<AtomicU64>> = rowcounts.iter().map(|&n| (0..(n as usize + 63) / 64).map(|_| AtomicU64::new(0)).collect()).collect();
+    let mark = |ord: u32| {
+        lost[(ord >> 20) as usize][((ord & 0xF_FFFF) >> 6) as usize].fetch_or(1u64 << (ord & 63), Ordering::Relaxed);
+    };
+    let is_lost = |ord: u32| lost[(ord >> 20) as usize][((ord & 0xF_FFFF) >> 6) as usize].load(Ordering::Relaxed) >> (ord & 63) & 1 != 0;
     let ts_states: Vec<&TS> = states.iter().map(|s| &s.0).collect();
 
     // ---- dedup per event shard ----
+    #[derive(Clone, Copy)]
+    struct CL {
+        key: u64,
+        loc: u64,
+        ing: i32,
+        ord: u32,
+    }
     let _ = par_run(
         ES,
         ncpu,
-        || (Tab::default(), Vec::<(Claim, u32)>::new()),
-        |(tab, cl), s| {
+        || (Tab::default(), Vec::<CL>::new(), Vec::<u32>::new()),
+        |(tab, cl, best), s| {
             cl.clear();
-            for (t, st) in ts_states.iter().enumerate() {
+            best.clear();
+            for st in ts_states.iter() {
                 for c in st.claims[s].iter() {
-                    cl.push((*c, t as u32));
+                    cl.push(CL { key: c.key, loc: 0, ing: c.ing, ord: c.ord });
+                }
+                for c in st.claims_o[s].iter() {
+                    cl.push(CL { key: c.key, loc: c.loc, ing: c.ing, ord: c.ord });
                 }
             }
             tab.reset(cl.len());
-            let mut best: Vec<u32> = Vec::new(); // indexes into cl of current winners, by table idx
             for k in 0..cl.len() {
-                let (c, t) = cl[k];
+                let c = cl[k];
                 let h = mixk(c.key);
                 match tab.find(h, |i| {
-                    let w = &cl[best[i as usize] as usize].0;
+                    let w = &cl[best[i as usize] as usize];
                     id_eq(w.key, w.loc, c.key, c.loc)
                 }) {
                     Ok((_, i)) => {
-                        let wi = best[i as usize] as usize;
-                        let (w, wt) = cl[wi];
+                        let w = cl[best[i as usize] as usize];
                         if (c.ing, c.ord) < (w.ing, w.ord) {
-                            lost[wt as usize][w.seq as usize].store(1, Ordering::Relaxed);
+                            mark(w.ord);
                             best[i as usize] = k as u32;
                         } else {
-                            lost[t as usize][c.seq as usize].store(1, Ordering::Relaxed);
+                            mark(c.ord);
                         }
                     }
                     Err(slot) => {
@@ -962,59 +1008,61 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
             // group events by person key
             let mut n_ev = 0usize;
             for st in &ts_states {
-                n_ev += st.pays[p].len();
+                n_ev += st.pays[p].len() + st.pays_o[p].len();
             }
             tab.reset(n_ev);
             let mut pk: Vec<(u64, u64)> = Vec::new();
-            let mut pid: Vec<u32> = Vec::with_capacity(n_ev);
-            let mut nkept = 0usize;
-            for (t, st) in ts_states.iter().enumerate() {
+            let mut kept: Vec<(u32, u32, u32)> = Vec::with_capacity(n_ev);
+            let mut off: Vec<u32> = Vec::new();
+            let mut assign = |pk: &mut Vec<(u64, u64)>, tab: &mut Tab, key: u64, loc: u64| -> u32 {
+                let h = mixk(key);
+                match tab.find(h, |i| {
+                    let q = pk[i as usize];
+                    id_eq(q.0, q.1, key, loc)
+                }) {
+                    Ok((_, i)) => i,
+                    Err(slot) => {
+                        let i = pk.len() as u32;
+                        pk.push((key, loc));
+                        tab.set(slot, h, i);
+                        i
+                    }
+                }
+            };
+            for st in ts_states.iter() {
                 for y in st.pays[p].iter() {
-                    if lost[t][y.seq as usize].load(Ordering::Relaxed) != 0 {
-                        pid.push(u32::MAX);
+                    let (key, ts, pp, ord) = ({ y.pkey }, { y.ts }, { y.pp }, { y.ord });
+                    if is_lost(ord) {
                         continue;
                     }
-                    nkept += 1;
-                    let h = mixk(y.pkey);
-                    let id = match tab.find(h, |i| {
-                        let q = pk[i as usize];
-                        id_eq(q.0, q.1, y.pkey, y.ploc)
-                    }) {
-                        Ok((_, i)) => i,
-                        Err(slot) => {
-                            let i = pk.len() as u32;
-                            pk.push((y.pkey, y.ploc));
-                            tab.set(slot, h, i);
-                            i
-                        }
-                    };
-                    pid.push(id);
+                    let id = assign(&mut pk, tab, key, 0);
+                    kept.push((id, ts, pp));
+                }
+                for y in st.pays_o[p].iter() {
+                    let (key, loc, ts, pp, ord) = ({ y.pkey }, { y.ploc }, { y.ts }, { y.pp }, { y.ord });
+                    if is_lost(ord) {
+                        continue;
+                    }
+                    let id = assign(&mut pk, tab, key, loc);
+                    kept.push((id, ts, pp));
                 }
             }
             let np = pk.len();
-            let mut off = vec![0u32; np + 1];
-            for &i in &pid {
-                if i != u32::MAX {
-                    off[i as usize + 1] += 1;
-                }
+            off.resize(np + 1, 0);
+            for &(i, _, _) in &kept {
+                off[i as usize + 1] += 1;
             }
             for i in 0..np {
                 off[i + 1] += off[i];
             }
             let mut pos: Vec<u32> = off[..np].to_vec();
-            let mut pe = vec![PE { ts: 0, pt: 0, cat: 0 }; nkept];
-            let mut k = 0usize;
-            for st in ts_states.iter() {
-                for y in st.pays[p].iter() {
-                    let i = pid[k];
-                    k += 1;
-                    if i != u32::MAX {
-                        let q = &mut pos[i as usize];
-                        pe[*q as usize] = PE { ts: ws + y.ts as i64, pt: y.pp, cat: y.cat };
-                        *q += 1;
-                    }
-                }
+            let mut pe = vec![PE { ts: 0, pp: 0 }; kept.len()];
+            for &(i, ts, pp) in &kept {
+                let q = &mut pos[i as usize];
+                pe[*q as usize] = PE { ts, pp };
+                *q += 1;
             }
+            drop(kept);
             // clicks of known people
             let lo = ws - WEEK_MS;
             let mut cid: Vec<u32> = Vec::new();
@@ -1069,7 +1117,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
                 };
                 let evs = &mut pe[off[i] as usize..off[i + 1] as usize];
                 let cs = &mut pc[coff[i] as usize..coff[i + 1] as usize];
-                person(name, evs, cs, sc, &mut rows, organic, acc);
+                person(ws, name, evs, cs, sc, &mut rows, organic, acc);
             }
             rows
         },
