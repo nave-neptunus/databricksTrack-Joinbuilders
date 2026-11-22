@@ -131,6 +131,27 @@ def time_size(binaries, size, rounds):
     return rows
 
 
+def mem_profile(binaries, size):
+    """One extra run per SHA under perf stat (or /usr/bin/time) for fault/TLB counts; never fails the gate."""
+    rows = []
+    events = "page-faults,dTLB-load-misses,dTLB-store-misses,dTLB-loads,dTLB-stores"
+    for sha in TIMING:
+        label = f"mem-{size}-{sha[:8]}"
+        out, scratch = WORK / "outputs" / label, WORK / "scratch" / label
+        fresh(out); fresh(scratch)
+        env = dict(os.environ, DATA_DIR=str(HOME / f"v5-{size}"), OUTPUT_DIR=str(out), SCRATCH_DIR=str(scratch), NCPU=NCPU, TIMING="1")
+        for cmd in (["perf", "stat", "-x,", "-e", events, "--", str(binaries[sha])], ["/usr/bin/time", "-v", str(binaries[sha])]):
+            try:
+                r = subprocess.run(cmd, text=True, capture_output=True, env=env)
+            except OSError as e:
+                rows.append((sha, f"{cmd[0]}: {e}")); continue
+            tail = [l.strip() for l in r.stderr.splitlines() if re.search(r"page-faults|dTLB|Minor|Major|Maximum resident|Elapsed", l)]
+            if tail:
+                rows.append((sha, " | ".join(tail))); break
+            rows.append((sha, f"{cmd[0]}: no counters rc={r.returncode}: {r.stderr[-200:]}"))
+    return rows
+
+
 def stages(rows, sha):
     keys = sorted({name for row in rows for _, name in row[sha][1]})
     return {key: statistics.median(next((ms for ms, name in row[sha][1] if name == key), 0.0) for row in rows) for key in keys}
@@ -159,6 +180,12 @@ def main():
             baseline, _, _ = run(binaries[sha], corpus, f"baseline-{size}-{sha[:8]}", timing=True)
             parquet_equal(candidate, baseline, f"{size} candidate vs {sha}")
     results = {size: time_size(binaries, size, int(ROUNDS[size])) for size in ("20m", "60m")}
+    mem = {}
+    for size in ("20m", "60m"):
+        try:
+            mem[size] = mem_profile(binaries, size)
+        except Exception as e:  # profiling is advisory only
+            mem[size] = [("-", f"mem profile error: {e}")]
     gate = "PASS" if not GATE_FAILURES else "FAIL — " + "; ".join(GATE_FAILURES)
     baselines = ", ".join(f"`{sha}`" for sha in GATE_BASELINES)
     lines = ["# gum v5 Intel gate and timing", "", f"- gate baselines: {baselines}", f"- candidate: `{CAND}`", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
@@ -172,6 +199,8 @@ def main():
             stage_text = "; ".join(f"{k}: {v:.1f}" for k, v in stages(rows, sha).items()) or "(no laps)"
             lines.append(f"| `{sha}` | {med:.1f} | {stage_text} |")
         lines.append("")
+    for size, rows in mem.items():
+        lines += [f"## memory counters {size} (1 extra run each)", ""] + [f"- `{sha}`: {txt}" for sha, txt in rows] + [""]
     (WORK / "summary.md").write_text("\n".join(lines))
     (WORK / "observations.json").write_text(json.dumps(results, indent=2))
     print((WORK / "summary.md").read_text())
