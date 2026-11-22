@@ -1,13 +1,13 @@
 {
   "baseline": "d0751053dee84c77b171e44eefa84ddb02e16aed",
-  "candidate": "5d2be03dd0b7e49c52f888be1a863942b49d89ec",
+  "candidate": "dc19dbf7ae82fdc9c683a89ff661ed1278720d30",
   "timing": [
     "d0751053dee84c77b171e44eefa84ddb02e16aed",
-    "5d2be03dd0b7e49c52f888be1a863942b49d89ec"
+    "dc19dbf7ae82fdc9c683a89ff661ed1278720d30"
   ],
   "rounds": {
-    "20m": 3,
+    "20m": 5,
     "60m": 3
   },
-  "skip_test": true
+  "skip_test": false
 }
