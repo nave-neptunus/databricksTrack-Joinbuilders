@@ -2221,6 +2221,9 @@ fn fast(nova: bool) -> bool {
             state.group(partition, linked_count, &paccs, &caccs);
             state.aggregate(partition, &pname, &cat_names, w0, day0, ndays, ncamp);
         }
+        for (total, &assisted) in state.cd.iter_mut().zip(&state.asst) {
+            total[3] += i64::from(assisted);
+        }
         state.user.close();
         (state.user_rows, state.cd)
     });
@@ -2273,7 +2276,8 @@ fn pt<I, T: Send>(items: impl ParallelIterator<Item = I>, init: impl Fn() -> T +
 
 struct PartitionState {
     cd: Vec<[i64; 4]>,
-    counts: Vec<usize>,
+    counts: Vec<u32>,
+    asst: Vec<u32>,
     in_active: Vec<bool>,
     active: Vec<u32>,
     catsum: Vec<i64>,
@@ -2298,6 +2302,7 @@ impl PartitionState {
         Self {
             cd: vec![[0; 4]; campaigns * days],
             counts: vec![0; campaigns],
+            asst: vec![0; campaigns * days],
             in_active: vec![false; campaigns],
             active: Vec::new(),
             catsum: vec![0; categories],
@@ -2378,7 +2383,7 @@ impl PartitionState {
         organic: usize,
     ) {
         let Self {
-            cd, counts, in_active, active, catsum, touched_categories,
+            cd, counts, asst, in_active, active, catsum, touched_categories,
             event_ends, click_ends, events, clicks, gather: _, event_scratch, click_scratch, buckets,
             user, user_rows,
         } = self;
@@ -2398,45 +2403,50 @@ impl PartitionState {
                 *user_rows += 1;
             };
             let (mut lo, mut hi, mut best_click) = (0, 0, None::<Click>);
+            let has_clicks = !clicks.is_empty();
             let mut attribute = |start, session_day, revenue| {
-                let time = start + LOOK as u32;
                 let day_index = (session_day - day0) as usize;
-                let lower = start;
-                while lo < hi && clicks[lo].ts < lower {
-                    counts[clicks[lo].campaign()] -= 1;
-                    lo += 1;
-                }
-                while let Some(&click) = clicks.get(hi) {
-                    if click.ts > time {
-                        break;
-                    }
-                    hi += 1;
-                    if click.ts < lower {
-                        // This click has already expired before its first session.
+                let mut campaign = organic;
+                if has_clicks {
+                    let time = start + LOOK as u32;
+                    let lower = start;
+                    while lo < hi && clicks[lo].ts < lower {
+                        counts[clicks[lo].campaign()] -= 1;
                         lo += 1;
-                        continue;
                     }
-                    let campaign = click.campaign();
-                    counts[campaign] += 1;
-                    if !in_active[campaign] {
-                        in_active[campaign] = true;
-                        active.push(campaign as u32);
+                    while let Some(&click) = clicks.get(hi) {
+                        if click.ts > time {
+                            break;
+                        }
+                        hi += 1;
+                        if click.ts < lower {
+                            // This click has already expired before its first session.
+                            lo += 1;
+                            continue;
+                        }
+                        let campaign = click.campaign();
+                        counts[campaign] += 1;
+                        if !in_active[campaign] {
+                            in_active[campaign] = true;
+                            active.push(campaign as u32);
+                        }
+                        if best_click.is_none_or(|old| click.ts != old.ts || click.id() < old.id()) {
+                            best_click = Some(click);
+                        }
                     }
-                    if best_click.is_none_or(|old| click.ts != old.ts || click.id() < old.id()) {
-                        best_click = Some(click);
+                    let mut i = 0;
+                    while i < active.len() {
+                        let c = active[i] as usize;
+                        if counts[c] == 0 {
+                            in_active[c] = false;
+                            active.swap_remove(i);
+                        } else {
+                            asst[c * days + day_index] += 1;
+                            i += 1;
+                        }
                     }
+                    campaign = best_click.filter(|click| click.ts >= lower).map_or(organic, Click::campaign);
                 }
-                active.retain(|&campaign| {
-                    let c = campaign as usize;
-                    if counts[c] == 0 {
-                        in_active[c] = false;
-                        false
-                    } else {
-                        cd[c * days + day_index][3] += 1;
-                        true
-                    }
-                });
-                let campaign = best_click.filter(|click| click.ts >= lower).map_or(organic, Click::campaign);
                 let total = &mut cd[campaign * days + day_index];
                 total[0] += 1;
                 total[1] += i64::from(revenue > 0);
