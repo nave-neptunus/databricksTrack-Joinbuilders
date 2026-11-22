@@ -33,7 +33,7 @@ impl Uf {
         Uf { map: U64Map::with_capacity(n), parent: Vec::with_capacity(n), toks: Vec::with_capacity(n), root: Vec::new(), name_at: Vec::new(), name_buf: Vec::new() }
     }
     pub fn len(&self) -> usize {
-        self.parent.len()
+        if self.root.is_empty() { self.parent.len() } else { self.root.len() }
     }
     #[inline]
     fn node(&mut self, g: &G, tok: u64) -> u32 {
@@ -122,6 +122,7 @@ impl Uf {
             }
         }
         self.root = root;
+        self.parent = Vec::new();
         self.name_at = at;
         self.name_buf = buf;
     }
