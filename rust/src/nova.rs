@@ -691,15 +691,29 @@ struct Parser<'a, 'catalog, 'table> {
     streams: Streams<Claim, SHARDS>,
     people: PeopleWriter<'a>,
     worker: u32,
+    timing: Option<EventTiming>,
+}
+
+/// Per-worker event-stage accounting.  It is deliberately optional so normal
+/// scoring runs pay only the well-predicted option check, not clock reads.
+#[derive(Default)]
+struct EventTiming {
+    scan_ns: u64,
+    flush_ns: u64,
 }
 
 impl Parser<'_, '_, '_> {
     fn parse_chunk(&mut self, bytes: &[u8]) {
+        let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         scan_event_rows(bytes, self);
+        if let (Some(timing), Some(started)) = (&mut self.timing, started) {
+            timing.scan_ns += started.elapsed().as_nanos() as u64;
+        }
     }
 
     #[inline]
     fn flush(&mut self) {
+        let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         for pending in &self.batch[..self.count] {
             let loc = if pending.ts != INVALID {
                 let person = self
@@ -725,6 +739,9 @@ impl Parser<'_, '_, '_> {
             );
         }
         self.count = 0;
+        if let (Some(timing), Some(started)) = (&mut self.timing, started) {
+            timing.flush_ns += started.elapsed().as_nanos() as u64;
+        }
     }
 }
 
@@ -808,7 +825,7 @@ fn events(
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
-) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
+) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>, EventTiming) {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
@@ -837,6 +854,7 @@ fn events(
                 streams: Streams::new(),
                 people: PeopleWriter::new(&mut people),
                 worker,
+                timing: std::env::var_os("TIMING").map(|_| EventTiming::default()),
             };
             loop {
                 let index = next.fetch_add(1, Relaxed);
@@ -848,20 +866,24 @@ fn events(
             }
             parser.flush();
             parser.people.finish();
-            parser.streams
+            let Parser { streams, timing, .. } = parser;
+            (streams, timing.unwrap_or_default())
         };
-        (worker, streams, people)
+        (worker, streams.0, people, streams.1)
     });
     // `broadcast` returns results in completion order, but locations encode
     // the assigned worker id, so restore that order before indexing.
-    parsed.sort_unstable_by_key(|(worker, _, _)| *worker);
+    parsed.sort_unstable_by_key(|(worker, _, _, _)| *worker);
     let mut streams = Vec::with_capacity(parsed.len());
     let mut people = Vec::with_capacity(parsed.len());
-    for (_, s, p) in parsed {
+    let mut timing = EventTiming::default();
+    for (_, s, p, stats) in parsed {
         streams.push(s);
         people.push(p);
+        timing.scan_ns += stats.scan_ns;
+        timing.flush_ns += stats.flush_ns;
     }
-    (streams, people)
+    (streams, people, timing)
 }
 
 type ClaimStream = Streams<Claim, SHARDS>;
@@ -973,7 +995,14 @@ pub(super) fn run_events(
     declined: &AtomicBool,
     estimated_rows: usize,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let (claims, people) = events(work, read_ahead, users, interner, input, declined, estimated_rows);
+    let (claims, people, timing) = events(work, read_ahead, users, interner, input, declined, estimated_rows);
+    if std::env::var_os("TIMING").is_some() {
+        // `scan_ns` includes batch flushes because they occur in row callbacks;
+        // report the exclusive scan time as well as the total payload/claim push.
+        let scan = timing.scan_ns.saturating_sub(timing.flush_ns);
+        eprintln!("{:8.1} ms  nova event scan (exclusive)", scan as f64 / 1e6);
+        eprintln!("{:8.1} ms  nova event flush (payload + claims)", timing.flush_ns as f64 / 1e6);
+    }
     if declined.load(Relaxed) {
         return None;
     }
