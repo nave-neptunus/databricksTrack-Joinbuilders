@@ -274,6 +274,7 @@ struct Ctx<'a> {
     unknown_cat: u32,
     camp_of: &'a [u32],
     links: &'a LinkTab,
+    mode: u32,
 }
 
 struct Sink<'a, 'b> {
@@ -297,6 +298,9 @@ impl<'a, 'b> Sink<'a, 'b> {
                 return None;
             }
         };
+        if self.c.mode == 3 {
+            return Some((key, loc));
+        }
         if let Some(n) = self.c.links.find(key, loc) {
             Some((LINKED | self.c.links.root[n as usize] as u64, 0))
         } else {
@@ -344,6 +348,9 @@ impl<'a, 'b> Sink<'a, 'b> {
             price = r.price;
             cat = if (r.product as usize) < c.cat_of.len() { c.cat_of[r.product as usize] } else { c.unknown_cat };
         }
+        if self.c.mode == 2 {
+            return;
+        }
         let Some((pkey, ploc)) = self.person(r.uid) else { return };
         let p = shard_h(mixk(pkey));
         self.st.pays[p].push(Pay { pkey, ploc, ts: rel as u32, pp: price | (r.kind as u32) << 24, seq, cat });
@@ -379,6 +386,9 @@ impl<'a, 'b> EventSink for Sink<'a, 'b> {
     fn ev_flush(&mut self) {
         let n = self.eb.n;
         self.eb.n = 0;
+        if self.c.mode == 1 {
+            return;
+        }
         for i in 0..n {
             let r = self.eb.row(i);
             self.ev_row(&r);
@@ -392,6 +402,9 @@ impl<'a, 'b> ClickSink for Sink<'a, 'b> {
     fn ck_flush(&mut self) {
         let n = self.cb.n;
         self.cb.n = 0;
+        if self.c.mode == 1 {
+            return;
+        }
         for i in 0..n {
             let r = self.cb.row(i);
             self.ck_row(&r);
@@ -703,7 +716,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
     lap(log, &mut last, t0, "links");
 
     // ---- parse events + clicks ----
-    let ctx = Ctx { ws, we, cat_of: &cat_of, unknown_cat, camp_of: &camp_of, links: &links };
+    let ctx = Ctx { ws, we, cat_of: &cat_of, unknown_cat, camp_of: &camp_of, links: &links, mode: std::env::var("XL_V5MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0) };
     let (ne, nc) = (ev_chunks.len(), ck_chunks.len());
     if ne + nc >= (1 << 12) {
         return why("too many chunks");

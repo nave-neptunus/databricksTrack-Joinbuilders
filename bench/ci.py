@@ -19,12 +19,13 @@ def fresh(p):
     p.mkdir(parents=True)
 
 
-def run(binary, data, label, extra=()):
+def run(binary, data, label, extra=(), xenv=None):
     out, scratch = WORK / "out" / label, WORK / "scratch" / label
     fresh(out); fresh(scratch)
     env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out), SCRATCH_DIR=str(scratch), NCPU=NCPU, TIMING="1")
     t = time.perf_counter()
     env["V1ND_LOG"] = "1"
+    env.update(xenv or {})
     r = subprocess.run([str(binary), *extra], text=True, capture_output=True, env=env)
     ms = (time.perf_counter() - t) * 1000
     (WORK / "logs").mkdir(exist_ok=True)
@@ -71,6 +72,10 @@ def main():
         for size in ("20m",):
             _, ms, _, err = run(CAND_BIN, HOME / f"v5-{size}", f"gen-{size}", ("--generic",))
             print(f"GENERIC {size}: {ms:.0f} ms\n" + "\n".join(l for l in err.splitlines() if "v1nd" in l), flush=True)
+    if os.environ.get("MODES", "1") == "1":
+        for mode in (1, 2, 3, 0):
+            _, ms, _, err = run(CAND_BIN, HOME / "v5-20m", f"mode{mode}", xenv={"XL_V5MODE": str(mode)})
+            print(f"MODE {mode}: {ms:.0f} ms " + " | ".join(l.split("]")[1].strip()[:28] for l in err.splitlines() if l.startswith("[v5]") and "ms" in l), flush=True)
     rows = {}
     for size in ("20m", "60m"):
         d = HOME / f"v5-{size}"
