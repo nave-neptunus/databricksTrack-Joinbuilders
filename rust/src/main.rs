@@ -1576,93 +1576,192 @@ fn main() {
 }
 
 // Link endpoints are bucketed by the home slot of the all-uid table. Each
-// worker can then build its range with ordinary loads and stores. A chain
-// crossing the end of a range is completed after all range owners finish.
+// worker owns one range and inserts it with ordinary stores. Probe chains
+// that walk off a range are finished after every range owner is done.
 const LINK_SHARDS: usize = 64;
+const LINK_AHEAD: usize = 24;
+const SHORT_LINK_KEY: u64 = 1 << 63;
 
 #[derive(Clone, Copy)]
 struct LinkEnd {
     key: u64,
     name: u64,
+    prefix: u64,
     check: u32,
     endpoint: u32,
+    batch: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct LinkName {
-    reference: std::sync::atomic::AtomicU64,
-    prefix: std::sync::atomic::AtomicU64,
+    reference: u64,
+    prefix: u64,
 }
 
 impl LinkName {
     #[inline]
-    fn set(&self, reference: u64) {
-        let bytes = unpack_ref(reference);
-        let mut prefix = [0; 8];
-        let len = bytes.len().min(prefix.len());
-        prefix[..len].copy_from_slice(&bytes[..len]);
-        self.reference.store(reference, Relaxed);
-        self.prefix.store(u64::from_be_bytes(prefix), Relaxed);
-    }
-
-    #[inline]
     fn bytes(&self) -> &'static [u8] {
-        unpack_ref(self.reference.load(Relaxed))
+        unpack_ref(self.reference)
     }
 }
 
-enum LinkSlot {
-    Inserted(usize),
-    Duplicate(u32),
+enum LinkClaim {
+    Fresh(usize),
+    Same(u32),
     Spill,
 }
 
-#[inline]
-fn link_slot(
-    slots: &mut [(u64, u64)],
-    mut i: usize,
-    mask: usize,
-    e: LinkEnd,
-    node: u32,
-    names: &[LinkName],
-    collision: &AtomicBool,
-) -> LinkSlot {
-    while let Some(slot) = slots.get_mut(i) {
-        if slot.0 == 0 {
-            names[node as usize].set(e.name);
-            *slot = (e.key, (u64::from(e.check) << 32) | u64::from(node));
-            return LinkSlot::Inserted(i);
-        }
-        if slot.0 == e.key {
-            let other = slot.1 as u32;
-            let other_name = names[other as usize].reference.load(Relaxed);
-            if (slot.1 >> 32) as u32 != e.check
-                || (other_name != e.name && unpack_ref(other_name) != unpack_ref(e.name))
-            {
-                collision.store(true, Relaxed);
-            }
-            return LinkSlot::Duplicate(other);
-        }
-        i = (i + 1) & mask;
-    }
-    LinkSlot::Spill
+struct ShardLinks {
+    nodes: Vec<(u32, u32)>,
+    flat: Vec<LinkEnd>,
+    spills: Vec<(u32, u32)>,
+    collision: bool,
 }
 
 #[inline]
-fn link_root(parent: &[AtomicU32], mut node: u32) -> u32 {
-    loop {
-        let next = parent[node as usize].load(Relaxed);
-        if next == 0 {
-            return node;
-        }
-        let grandparent = parent[(next - 1) as usize].load(Relaxed);
-        if grandparent == 0 {
-            return next - 1;
-        }
-        // Path halving keeps the replacement on the same ancestry chain.
-        let _ = parent[node as usize].compare_exchange(next, grandparent, Relaxed, Relaxed);
-        node = grandparent - 1;
+fn link_prefix(bytes: &[u8]) -> u64 {
+    let mut prefix = [0u8; 8];
+    let n = bytes.len().min(prefix.len());
+    prefix[..n].copy_from_slice(&bytes[..n]);
+    u64::from_be_bytes(prefix)
+}
+
+#[inline]
+fn prefetch_link_slot(slots: &[(u64, u64)], index: usize) {
+    let ptr = slots.as_ptr().wrapping_add(index);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_ET0 }>(ptr.cast());
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "prfm pstl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
+
+/// Packed short IDs are a bijection. Longer IDs share a key only when the
+/// 32-bit check, the length, and the bytes agree; a miss declines the fast path.
+#[inline]
+fn link_same(end: &LinkEnd, check: u32, stored: LinkName) -> bool {
+    if end.key >= SHORT_LINK_KEY {
+        return true;
+    }
+    if end.check != check || (end.name >> 48) != (stored.reference >> 48) || end.prefix != stored.prefix {
+        return false;
+    }
+    (end.name >> 48) <= 8 || end.name == stored.reference || unpack_ref(end.name) == unpack_ref(stored.reference)
+}
+
+#[inline]
+fn ends_same(a: &LinkEnd, b: &LinkEnd) -> bool {
+    link_same(a, b.check, LinkName { reference: b.name, prefix: b.prefix })
+}
+
+fn claim_link(
+    slots: &mut [(u64, u64)],
+    home: usize,
+    mask: usize,
+    wrap: bool,
+    end: &LinkEnd,
+    node: u32,
+    names: &mut [LinkName],
+    name_base: u32,
+    collision: &mut bool,
+) -> LinkClaim {
+    let mut i = home;
+    let mut guard = 0usize;
+    loop {
+        if !wrap && i >= slots.len() {
+            return LinkClaim::Spill;
+        }
+        if slots[i].0 == 0 {
+            names[(node - name_base) as usize] = LinkName { reference: end.name, prefix: end.prefix };
+            slots[i] = (end.key, (u64::from(end.check) << 32) | u64::from(node));
+            return LinkClaim::Fresh(i);
+        }
+        if slots[i].0 == end.key {
+            let other = slots[i].1 as u32;
+            let value = slots[i].1;
+            if !link_same(end, (value >> 32) as u32, names[(other - name_base) as usize]) {
+                *collision = true;
+            }
+            return LinkClaim::Same(other);
+        }
+        if wrap {
+            i = (i + 1) & mask;
+            guard += 1;
+            if guard > slots.len() {
+                *collision = true;
+                return LinkClaim::Spill;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn build_shard(
+    shard: usize,
+    slots: &mut [(u64, u64)],
+    bucket: &mut Vec<Vec<LinkEnd>>,
+    names: &mut [LinkName],
+    start: u32,
+    range_len: usize,
+    range_mask: usize,
+) -> ShardLinks {
+    let mut flat = Vec::with_capacity(bucket.iter().map(|batch| batch.len()).sum());
+    for batch in bucket.iter_mut() {
+        flat.append(batch);
+    }
+    let mask_key = range_mask as u64;
+    // Home-slot order turns the probe into a forward scan. Equal keys sit together,
+    // so each distinct id claims one slot and the copies reuse that node.
+    flat.sort_unstable_by(|a, b| (a.key & mask_key).cmp(&(b.key & mask_key)).then(a.key.cmp(&b.key)));
+    let mut nodes = Vec::new();
+    let mut spills = Vec::new();
+    let mut collision = false;
+    let mut fresh = 0u32;
+    let mut i = 0;
+    while i < flat.len() {
+        if let Some(ahead) = flat.get(i + LINK_AHEAD) {
+            prefetch_link_slot(slots, (ahead.key as usize) & range_mask);
+        }
+        let key = flat[i].key;
+        let mut j = i + 1;
+        while j < flat.len() && flat[j].key == key {
+            if !ends_same(&flat[i], &flat[j]) {
+                collision = true;
+            }
+            j += 1;
+        }
+        let node = start + fresh;
+        let head = flat[i];
+        match claim_link(slots, (key as usize) & range_mask, range_mask, false, &head, node, names, start, &mut collision) {
+            LinkClaim::Fresh(at) => {
+                nodes.push(((shard * range_len + at) as u32, node));
+                fresh += 1;
+                let id = u64::from(node);
+                for end in &mut flat[i..j] {
+                    end.key = id;
+                }
+            }
+            LinkClaim::Same(other) => {
+                let id = u64::from(other);
+                for end in &mut flat[i..j] {
+                    end.key = id;
+                }
+            }
+            LinkClaim::Spill => spills.push((i as u32, j as u32)),
+        }
+        i = j;
+    }
+    ShardLinks { nodes, flat, spills, collision }
 }
 
 fn build_links(
@@ -1689,12 +1788,13 @@ fn build_links(
     let range_len = (table.mask + 1) / LINK_SHARDS;
     let shift = range_len.trailing_zeros();
     let collision = AtomicBool::new(false);
+    let range_mask = range_len - 1;
 
-    let batches: Vec<_> = chunks.par_iter().map(|chunk| {
+    let batches: Vec<_> = chunks.par_iter().enumerate().map(|(batch, chunk)| {
         let estimate = (chunk.len() / (12 * LINK_SHARDS)).min(1024);
         let mut ends: [Vec<LinkEnd>; LINK_SHARDS] =
             std::array::from_fn(|_| Vec::with_capacity(estimate));
-        let mut count = 0;
+        let mut count = 0u32;
         csv_rows(chunk, |_, [a, b]| {
             if a.is_empty() || b.is_empty() {
                 return;
@@ -1713,7 +1813,14 @@ fn build_links(
                 };
                 let key = if key == 0 { 1 } else { key };
                 let shard = ((key as usize) & table.mask) >> shift;
-                ends[shard].push(LinkEnd { key, name, check, endpoint: count });
+                ends[shard].push(LinkEnd {
+                    key,
+                    name,
+                    prefix: link_prefix(s),
+                    check,
+                    endpoint: count,
+                    batch: batch as u32,
+                });
                 count += 1;
             }
         });
@@ -1724,9 +1831,7 @@ fn build_links(
     }
     lap("  links parsed+hashed");
 
-    // Keep resolved endpoints in their parsed buffers until an entire input
-    // batch can be gathered by one worker. Insertion writes only shard-local names.
-    let sizes: Vec<_> = batches.iter().map(|(_, count)| *count).collect();
+    let sizes: Vec<u32> = batches.iter().map(|(_, count)| *count).collect();
     let nend: u32 = sizes.iter().sum();
     let mut buckets: [Vec<Vec<LinkEnd>>; LINK_SHARDS] =
         std::array::from_fn(|_| Vec::with_capacity(batches.len()));
@@ -1736,84 +1841,100 @@ fn build_links(
         }
     }
     let mut node_start = 0u32;
-    let starts: Vec<_> = buckets.iter().map(|bucket| {
-        let start = node_start;
-        node_start += bucket.iter().map(|batch| batch.len() as u32).sum::<u32>();
-        start
-    }).collect();
-    let names: Vec<_> = (0..nend).map(|_| LinkName::default()).collect();
-    let range_mask = range_len - 1;
-    let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).zip(&mut buckets)
-        .enumerate().map(|(shard, (slots, bucket))| {
-            let mut nodes = Vec::new();
-            let mut spill = Vec::new();
-            for (batch_id, batch) in bucket.iter_mut().enumerate() {
-                for (end_id, e) in batch.iter_mut().enumerate() {
-                    let node = starts[shard] + nodes.len() as u32;
-                    let i = e.key as usize & range_mask;
-                    match link_slot(slots, i, usize::MAX, *e, node, &names, &collision) {
-                        LinkSlot::Inserted(local) => {
-                            nodes.push(((shard * range_len + local) as u32, node));
-                            e.key = u64::from(node);
-                        }
-                        LinkSlot::Duplicate(other) => e.key = u64::from(other),
-                        LinkSlot::Spill => spill.push((batch_id, end_id)),
+    let mut starts = Vec::with_capacity(LINK_SHARDS);
+    let mut widths = Vec::with_capacity(LINK_SHARDS);
+    for bucket in &buckets {
+        let width = bucket.iter().map(|batch| batch.len() as u32).sum::<u32>();
+        starts.push(node_start);
+        widths.push(width as usize);
+        node_start += width;
+    }
+    let mut names = vec![LinkName::default(); nend as usize];
+    // Each shard writes only its own node range. The join below publishes those
+    // plain stores before any other worker reads a name.
+    let names_addr = names.as_mut_ptr() as usize;
+    let shard_meta: Vec<(u32, usize)> = starts.iter().copied().zip(widths).collect();
+    let mut shards: Vec<ShardLinks> = table.slots.par_chunks_mut(range_len)
+        .zip(buckets.par_iter_mut())
+        .zip(shard_meta.into_par_iter())
+        .enumerate()
+        .map(|(shard, ((slots, bucket), (start, width)))| {
+            let names = unsafe {
+                std::slice::from_raw_parts_mut((names_addr as *mut LinkName).add(start as usize), width)
+            };
+            build_shard(shard, slots, bucket, names, start, range_len, range_mask)
+        })
+        .collect();
+    if shards.iter().any(|shard| shard.collision) {
+        return None;
+    }
+
+    let mut slot_nodes: Vec<Vec<(u32, u32)>> = shards.iter_mut().map(|shard| std::mem::take(&mut shard.nodes)).collect();
+    let mut next: Vec<u32> = (0..LINK_SHARDS).map(|shard| starts[shard] + slot_nodes[shard].len() as u32).collect();
+    let mut spilled = false;
+    let table_mask = table.mask;
+    for shard in 0..LINK_SHARDS {
+        let spills = std::mem::take(&mut shards[shard].spills);
+        for (lo, hi) in spills {
+            for idx in lo..hi {
+                let end = shards[shard].flat[idx as usize];
+                let node = next[shard];
+                if node as usize >= names.len() {
+                    spilled = true;
+                    break;
+                }
+                match claim_link(&mut table.slots, (end.key as usize) & table_mask, table_mask, true, &end, node, &mut names, 0, &mut spilled) {
+                    LinkClaim::Fresh(at) => {
+                        slot_nodes[at >> shift].push((at as u32, node));
+                        next[shard] = node + 1;
+                        shards[shard].flat[idx as usize].key = u64::from(node);
                     }
+                    LinkClaim::Same(other) => {
+                        shards[shard].flat[idx as usize].key = u64::from(other);
+                    }
+                    LinkClaim::Spill => spilled = true,
                 }
             }
-            (nodes, spill)
-        }).collect();
-    let mut next: Vec<_> = starts.iter().zip(&ranges)
-        .map(|(start, (nodes, _))| start + nodes.len() as u32)
-        .collect();
-    for (shard, bucket) in buckets.iter_mut().enumerate() {
-        for (batch_id, end_id) in std::mem::take(&mut ranges[shard].1) {
-            let e = &mut bucket[batch_id][end_id];
-            let node = next[shard];
-            let i = e.key as usize & table.mask;
-            match link_slot(&mut table.slots, i, table.mask, *e, node, &names, &collision) {
-                LinkSlot::Inserted(slot) => {
-                    ranges[slot >> shift].0.push((slot as u32, node));
-                    next[shard] += 1;
-                    e.key = u64::from(node);
-                }
-                LinkSlot::Duplicate(other) => e.key = u64::from(other),
-                LinkSlot::Spill => unreachable!("all-uid table has spare slots"),
+            if spilled {
+                break;
             }
         }
+        if spilled {
+            break;
+        }
     }
-    if collision.load(Relaxed) {
+    if spilled {
         return None;
+    }
+
+    let mut batch_at = Vec::with_capacity(sizes.len());
+    let mut cursor = 0usize;
+    for &count in &sizes {
+        batch_at.push(cursor);
+        cursor += count as usize;
+    }
+    let mut resolved = vec![0u32; nend as usize];
+    for shard in &shards {
+        for end in &shard.flat {
+            resolved[batch_at[end.batch as usize] + end.endpoint as usize] = end.key as u32;
+        }
     }
     lap("  links inserted");
 
-    let empty_batch = |_| std::array::from_fn(|_| Vec::new());
-    let mut batches: Vec<[Vec<LinkEnd>; LINK_SHARDS]> = sizes.iter().map(empty_batch).collect();
-    for (shard, bucket) in buckets.into_iter().enumerate() {
-        for (batch, ends) in batches.iter_mut().zip(bucket) {
-            batch[shard] = ends;
-        }
-    }
-
     let parent: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
-    batches.into_par_iter().zip(sizes).for_each(|(batch, size)| {
-        let mut ends = vec![0u32; size as usize];
-        for lane in &batch {
-            for e in lane {
-                ends[e.endpoint as usize] = e.key as u32;
-            }
-        }
-        for edge in ends.chunks_exact(2) {
-            let mut a = link_root(&parent, edge[0]);
-            let mut b = link_root(&parent, edge[1]);
+    sizes.par_iter().enumerate().for_each(|(batch, &count)| {
+        let base = batch_at[batch];
+        let mut offset = 0usize;
+        while offset + 1 < count as usize {
+            let mut a = link_root(&parent, resolved[base + offset]);
+            let mut b = link_root(&parent, resolved[base + offset + 1]);
+            offset += 2;
             while a != b {
                 // Root order is immutable, so concurrent unions cannot form a
                 // cycle. The root itself is also the smallest ID in its component.
                 let an = &names[a as usize];
                 let bn = &names[b as usize];
-                let ap = an.prefix.load(Relaxed);
-                let bp = bn.prefix.load(Relaxed);
-                let (lo, hi) = if ap < bp || (ap == bp && an.bytes() < bn.bytes()) {
+                let (lo, hi) = if an.prefix < bn.prefix || (an.prefix == bn.prefix && an.bytes() < bn.bytes()) {
                     (a, b)
                 } else {
                     (b, a)
@@ -1828,7 +1949,7 @@ fn build_links(
     });
     lap("  links union-find");
 
-    let roots: Vec<Vec<u32>> = ranges.par_iter().map(|(nodes, _)| {
+    let roots: Vec<Vec<u32>> = slot_nodes.par_iter().map(|nodes| {
         let mut roots = Vec::new();
         for &(_, node) in nodes {
             let r = link_root(&parent, node);
@@ -1858,9 +1979,12 @@ fn build_links(
     let pname = name_groups.into_iter().flatten().collect();
     lap("  links numbered");
 
-    let nids = ranges.iter().map(|(nodes, _)| nodes.len()).sum();
-    table.slots.par_chunks_mut(range_len).zip(&ranges).for_each(|(slots, (nodes, _))| {
-        for &(slot, node) in nodes {
+    let nids = slot_nodes.iter().map(|nodes| nodes.len()).sum();
+    table.slots.par_chunks_mut(range_len).zip(&slot_nodes).for_each(|(slots, nodes)| {
+        for (n, &(slot, node)) in nodes.iter().enumerate() {
+            if let Some(&(next_slot, _)) = nodes.get(n + LINK_AHEAD) {
+                prefetch_link_slot(slots, next_slot as usize & range_mask);
+            }
             let r = match parent[node as usize].load(Relaxed) {
                 0 => node,
                 p => p - 1,
