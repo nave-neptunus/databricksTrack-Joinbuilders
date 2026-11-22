@@ -298,12 +298,19 @@ impl<'a> PeopleWriter<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, part: usize, person: u32, ts: u32, price: u32) -> usize {
-        let index = self.positions[part];
-        let slot = index % PAYLOAD_ROWS;
-        self.batches[part].0[slot].write(EvP { person, ts: AtomicU32::new(ts), price });
-        self.positions[part] = index + 1;
+        debug_assert!(part < P);
+        let index = unsafe { *self.positions.get_unchecked(part) };
+        let slot = index & (PAYLOAD_ROWS - 1);
+        let batch = unsafe { self.batches.get_unchecked_mut(part) };
+        let ptr = unsafe { batch.0.get_unchecked_mut(slot).as_mut_ptr() };
+        unsafe {
+            let lo = (person as u64) | ((ts as u64) << 32);
+            (ptr as *mut u64).write_unaligned(lo);
+            (ptr.cast::<u8>().add(8) as *mut u32).write_unaligned(price);
+            *self.positions.get_unchecked_mut(part) = index + 1;
+        }
         if slot + 1 == PAYLOAD_ROWS {
             self.flush(part, PAYLOAD_ROWS);
         }
@@ -382,27 +389,25 @@ unsafe fn copy_people(src: *const EvP, dst: *mut EvP, count: usize) {
 #[derive(Clone, Copy)]
 struct Pending {
     key: u64,
-    // Nonzero for long event IDs: a packed reference to the full ID bytes.
-    // The dedup router verifies these bytes when two hash keys are equal.
     eref: u64,
-    ingest: i32,
     uid: u64,
     name: u64,
+    ingest: i32,
+    chk: u32,
     ts: u32,
     price: u32,
-    chk: u32,
 }
 
 impl Pending {
     const EMPTY: Self = Self {
         key: 0,
         eref: 0,
-        ingest: 0,
         uid: 0,
         name: 0,
+        ingest: 0,
+        chk: 0,
         ts: INVALID,
         price: 0,
-        chk: 0,
     };
 }
 
@@ -431,18 +436,21 @@ struct RowLayout<'a> {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 impl<'a> Fields<'a> for RowLayout<'a> {
-    #[inline]
+    #[inline(always)]
     fn field<const I: usize>(&self) -> &'a [u8] {
-        let start = self.cuts[I] as usize;
-        let end = self.cuts[I + 1] as usize - 1;
+        debug_assert!(I + 1 < 8);
+        let start = unsafe { *self.cuts.get_unchecked(I) } as usize;
+        let end = unsafe { *self.cuts.get_unchecked(I + 1) } as usize - 1;
         let trim = ((self.wrapped >> I) & 1) as usize;
         // The scanner produced distinct checked cuts and exact endpoint flags.
+        debug_assert!(start + trim <= end - trim && end - trim <= self.line.len());
         unsafe { self.line.get_unchecked(start + trim..end - trim) }
     }
 
-    #[inline]
+    #[inline(always)]
     fn empty<const I: usize>(&self) -> bool {
-        let raw = self.cuts[I + 1] - self.cuts[I] - 1;
+        debug_assert!(I + 1 < 8);
+        let raw = unsafe { *self.cuts.get_unchecked(I + 1) - *self.cuts.get_unchecked(I) - 1 };
         raw == 2 * ((self.wrapped >> I) & 1)
     }
 }
@@ -523,13 +531,14 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
                     .then_some(wrapped)
             };
             if let Some(wrapped) = quote_flags {
-                let mut cuts = [0u8; 8];
                 let mut remaining = commas;
-                for cut in &mut cuts[1..7] {
-                    *cut = remaining.trailing_zeros() as u8 + 1;
-                    remaining &= remaining - 1;
-                }
-                cuts[7] = line.len() as u8 + 1;
+                let c1 = remaining.trailing_zeros() as u8 + 1; remaining &= remaining - 1;
+                let c2 = remaining.trailing_zeros() as u8 + 1; remaining &= remaining - 1;
+                let c3 = remaining.trailing_zeros() as u8 + 1; remaining &= remaining - 1;
+                let c4 = remaining.trailing_zeros() as u8 + 1; remaining &= remaining - 1;
+                let c5 = remaining.trailing_zeros() as u8 + 1; remaining &= remaining - 1;
+                let c6 = remaining.trailing_zeros() as u8 + 1;
+                let cuts = [0, c1, c2, c3, c4, c5, c6, line.len() as u8 + 1];
                 sink.row(
                     line,
                     RowLayout {
@@ -633,12 +642,13 @@ fn swar_value(word: u64) -> u64 {
 }
 
 /// Decode six ASCII digits and two colons with a single eight-byte load.
-#[inline]
+#[inline(always)]
 fn clock_seconds(s: &[u8]) -> Option<i64> {
     const SEPARATORS: u64 = 0x0000_ff00_00ff_0000;
     const COLONS: u64 = 0x0000_3a00_003a_0000;
     const ZEROS: u64 = 0x0000_3000_0030_0000;
-    let word = crate::rd8(s, 11);
+    debug_assert!(s.len() >= 19);
+    let word = unsafe { (s.as_ptr().add(11) as *const u64).read_unaligned() };
     if word & SEPARATORS != COLONS || !swar_digits((word & !SEPARATORS) | ZEROS) {
         return None;
     }
@@ -647,34 +657,57 @@ fn clock_seconds(s: &[u8]) -> Option<i64> {
     let h = pairs as u8;
     let m = (pairs >> 24) as u8;
     let seconds = (pairs >> 48) as u8;
-    (h <= 23 && m <= 59 && seconds <= 59)
-        .then_some(i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(seconds))
+    if (h > 23) | (m > 59) | (seconds > 59) {
+        return None;
+    }
+    Some(i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(seconds))
+}
+
+#[derive(Clone, Copy, Default)]
+struct DateEntry {
+    d0: u64,
+    d1: u16,
+    base_sec: i64,
 }
 
 #[derive(Default)]
-pub(super) struct Dates([([u8; 10], i64); 32]);
+pub(super) struct Dates {
+    last: DateEntry,
+    table: [DateEntry; 32],
+}
 
 impl Dates {
-    #[inline]
+    #[inline(always)]
     fn with_offset(&mut self, s: &[u8], adjustment: i64) -> Option<i64> {
-        if s[4] != b'-' || s[10] != b'T' {
+        debug_assert!(s.len() >= 19);
+        if unsafe { *s.get_unchecked(4) != b'-' || *s.get_unchecked(10) != b'T' } {
             return None;
         }
         let time = clock_seconds(s)?;
-        let date: [u8; 10] = s[..10].try_into().unwrap();
-        let index = (date[8] as usize * 10 + date[9] as usize) & 31;
-        let entry = &mut self.0[index];
-        if entry.0 == date {
-            return Some(entry.1 + time - adjustment);
-        }
-        let seconds = crate::parse_ts(s)? / 1000;
-        *entry = (date, seconds + adjustment - time);
-        Some(seconds)
+        let d0 = unsafe { (s.as_ptr() as *const u64).read_unaligned() };
+        let d1 = unsafe { (s.as_ptr().add(8) as *const u16).read_unaligned() };
+        let base_sec = if self.last.d0 == d0 && self.last.d1 == d1 {
+            self.last.base_sec
+        } else {
+            let index = ((d1 as usize & 0x0f) * 10 + ((d1 as usize >> 8) & 0x0f)) & 31;
+            let entry = unsafe { self.table.get_unchecked_mut(index) };
+            if entry.d0 == d0 && entry.d1 == d1 {
+                self.last = *entry;
+                entry.base_sec
+            } else {
+                let seconds = crate::parse_ts(s)? / 1000;
+                let base = seconds + adjustment - time;
+                *entry = DateEntry { d0, d1, base_sec: base };
+                self.last = *entry;
+                base
+            }
+        };
+        Some(base_sec + time - adjustment)
     }
 
-    #[inline]
+    #[inline(always)]
     fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
-        if s.len() != 20 || s[19] != b'Z' {
+        if s.len() != 20 || unsafe { *s.get_unchecked(19) != b'Z' } {
             return None;
         }
         self.with_offset(s, 0)
@@ -682,17 +715,17 @@ impl Dates {
 
     #[inline]
     pub(super) fn parse(&mut self, s: &[u8]) -> Option<i64> {
-        if s.len() == 20 && s[19] == b'Z' {
+        if s.len() == 20 && unsafe { *s.get_unchecked(19) == b'Z' } {
             return self.utc_seconds(s).map(|t| t * 1000);
         }
-        if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+        if s.len() == 25 && unsafe { (*s.get_unchecked(19) == b'+' || *s.get_unchecked(19) == b'-') && *s.get_unchecked(22) == b':' } {
             let hours = crate::d2(s, 20)?;
             let minutes = crate::d2(s, 23)?;
             if hours > 23 || minutes > 59 {
                 return None;
             }
             let adjustment = (hours * 60 + minutes) * 60;
-            let adjustment = if s[19] == b'+' {
+            let adjustment = if unsafe { *s.get_unchecked(19) == b'+' } {
                 adjustment
             } else {
                 -adjustment
@@ -700,8 +733,8 @@ impl Dates {
             return self.with_offset(s, adjustment).map(|t| t * 1000);
         }
         if s.len() == 13 {
-            let leading = (crate::rd8(s, 0) << 24) | 0x30_3030;
-            let trailing = crate::rd8(s, 5);
+            let leading = (unsafe { (s.as_ptr() as *const u64).read_unaligned() } << 24) | 0x30_3030;
+            let trailing = unsafe { (s.as_ptr().add(5) as *const u64).read_unaligned() };
             if swar_digits(leading) && swar_digits(trailing) {
                 return Some((swar_value(leading) * 100_000_000 + swar_value(trailing)) as i64);
             }
@@ -783,7 +816,7 @@ impl Parser<'_, '_, '_> {
 }
 
 impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
-    #[inline]
+    #[inline(always)]
     fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
         let id = fields.field::<0>();
         if id.is_empty() {
@@ -817,27 +850,43 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             self.declined.store(true, Relaxed);
             return;
         }
-        let mut pending = Pending::EMPTY;
-        pending.key = key;
-        pending.eref = eref;
-        pending.ingest = order;
+        debug_assert!(self.count < self.batch.len());
+        let p = unsafe { self.batch.get_unchecked_mut(self.count) };
+        p.key = key;
+        p.eref = eref;
+        p.ingest = order;
+        p.ts = INVALID;
         'valid: {
             let user = fields.field::<1>();
-            if user.is_empty() || fields.empty::<5>() {
+            if user.is_empty() | fields.empty::<5>() {
                 break 'valid;
             }
-            let purchase = match fields.field::<4>() {
-                b"purchase" => true,
-                b"view" | b"cart" => false,
+            let f4 = fields.field::<4>();
+            let purchase = match f4.len() {
+                4 => {
+                    let w = unsafe { (f4.as_ptr() as *const u32).read_unaligned() };
+                    if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
+                        break 'valid;
+                    }
+                    false
+                }
+                8 => {
+                    let w = unsafe { (f4.as_ptr() as *const u64).read_unaligned() };
+                    if w != u64::from_le_bytes(*b"purchase") {
+                        break 'valid;
+                    }
+                    true
+                }
                 _ => break 'valid,
             };
             let Some(time) = self.dates.parse(fields.field::<2>()) else {
                 break 'valid;
             };
             let relative = time.wrapping_sub(self.input.start) as u64;
-            if relative >= self.window_ms || seconds * 1000 - time > DAY {
+            if (relative >= self.window_ms) | (seconds * 1000 - time > DAY) {
                 break 'valid;
             }
+            let mut price = 0;
             if purchase {
                 let Some(value) = parse_price(fields.field::<6>()) else {
                     break 'valid;
@@ -847,7 +896,7 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .products
                     .get(fields.field::<5>())
                     .unwrap_or(&self.input.unknown);
-                pending.price = value | (category << 24);
+                price = value | (category << 24);
             }
             let (uid, chk) = user_ident(user);
             // Keep a direct reference to the full ID for the name. This avoids
@@ -856,13 +905,13 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
-            pending.name = r;
+            p.name = r;
+            p.price = price;
+            p.uid = uid;
+            p.chk = chk;
             self.users.prefetch(uid);
-            pending.ts = relative as u32;
-            pending.uid = uid;
-            pending.chk = chk;
+            p.ts = relative as u32;
         }
-        self.batch[self.count] = pending;
         self.count += 1;
         if self.count == self.batch.len() {
             self.flush();

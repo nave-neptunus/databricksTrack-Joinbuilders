@@ -599,6 +599,19 @@ fn empty_date_cache_rejects_invalid_date() {
     assert_eq!(cache.parse(b"\0\0\0\0\0\0\0\0\0\0T00:00:00Z"), None);
 }
 
+#[cfg(test)]
+#[test]
+fn price_parser_matches_rules() {
+    assert_eq!(parse_price(b""), None);
+    assert_eq!(parse_price(b"0"), None);
+    assert_eq!(parse_price(b"00"), None);
+    assert_eq!(parse_price(b"0250"), Some(250));
+    assert_eq!(parse_price(b"1"), Some(1));
+    assert_eq!(parse_price(b"10000000"), Some(10_000_000));
+    assert_eq!(parse_price(b"10000001"), None);
+    assert_eq!(parse_price(b"12a34"), None);
+}
+
 /// ms since epoch, or None if bad. Overlong F3 saturates to i64::MAX (out of any window).
 #[inline]
 fn parse_ts(s: &[u8]) -> Option<i64> {
@@ -659,16 +672,21 @@ fn manifest_ts(m: &str, key: &str) -> i64 {
 /// price_cents of a purchase: digits only, 1..=10,000,000.
 #[inline]
 fn parse_price(p: &[u8]) -> Option<u32> {
-    if p.is_empty() || !p.iter().all(|c| c.is_ascii_digit()) {
+    if p.is_empty() {
         return None;
     }
-    let z = p.iter().take_while(|&&c| c == b'0').count();
-    let p = &p[z..];
-    if p.len() > 8 {
-        return None;
+    let mut v: u32 = 0;
+    for &c in p {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        v = v.wrapping_mul(10).wrapping_add(d as u32);
+        if v > 10_000_000 {
+            return None;
+        }
     }
-    let v: u32 = p.iter().fold(0, |a, &c| a * 10 + (c - b'0') as u32);
-    if (1..=10_000_000).contains(&v) { Some(v) } else { None }
+    if v == 0 { None } else { Some(v) }
 }
 
 // ------------------------------------------------------------------ hashing
