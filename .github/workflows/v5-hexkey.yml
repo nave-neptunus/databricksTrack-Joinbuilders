@@ -44,6 +44,15 @@ jobs:
           git show FETCH_HEAD:bench/ci_bench.py > "$RUNNER_TEMP/ci_bench.py"
           mkdir -p bench
           cp "$RUNNER_TEMP/ci_bench.py" bench/ci_bench.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("bench/ci_bench.py")
+          source = path.read_text()
+          source = source.replace('re.search(r"\\[v2b\\] exit at ([0-9.]+) ms", stderr)', 're.search(r"([0-9.]+) ms  parquet written", stderr)')
+          source = source.replace('re.search(r"\\[v2b\\] ms: (.+)", stderr)', 'None')
+          source = source.replace('"XL_TIMING=1"', '"TIMING=1"')
+          path.write_text(source)
+          PY
           BASELINE_REF=6da0386b4ca6a001a5c7f747c68f40815fc14afb CANDIDATE_REF="$GITHUB_SHA" BASELINE_IMAGE=hexkey-baseline CANDIDATE_IMAGE=hexkey-candidate PAIRS=8 NCPU=4 python3 bench/ci_bench.py "$RUNNER_TEMP/v5-20m" "$RUNNER_TEMP/v5-results"
       - if: always()
         run: cat "$RUNNER_TEMP/v5-results/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
