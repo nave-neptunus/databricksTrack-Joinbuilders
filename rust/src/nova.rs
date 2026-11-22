@@ -277,7 +277,7 @@ const LOC_WORKER_SHIFT: u32 = LOC_PART_SHIFT + PB;
 const INDEX_MASK: u32 = (1 << LOC_INDEX_BITS) - 1;
 const NO_LOC: u32 = u32::MAX;
 
-// Sixteen 12-byte rows fill three 64-byte lines. All 512 buffers occupy 96 KiB
+// Sixteen 12-byte rows fill three 64-byte lines. All P buffers occupy P * 192 B
 // per worker. A location is assigned on enqueue, before its payload is flushed.
 const PAYLOAD_ROWS: usize = 16;
 
