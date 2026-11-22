@@ -2,7 +2,7 @@ name: gum v5 Intel gate and timing
 
 on:
   push:
-    branches: [ci/gum-uid]
+    branches: [ci/gum-pgo]
   workflow_dispatch:
 
 jobs:
@@ -25,6 +25,9 @@ jobs:
           echo NCPU=8 >> "$GITHUB_ENV"
       - name: Install exact-check dependency
         run: python3 -m pip install --disable-pip-version-check polars
+      - name: Pin Rust toolchain
+        run: |
+          rustup default 1.100.0
       - name: Build the supplied v5 generator and generate corpora
         shell: bash
         run: |
@@ -33,8 +36,8 @@ jobs:
           cargo build --release --locked --manifest-path "$HOME/gum-v5-generator/generator/Cargo.toml"
           # The supplied public dev-answer is the documented seed-1 dev set.
           "$HOME/gum-v5-generator/generator/target/release/generate" --seed 1 --events 1000000 --clicks 250000 --output "$HOME/v5-dev" --threads "$NCPU"
-          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads "$NCPU"
-          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/v5-60m" --threads "$NCPU"
+          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 42 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads "$NCPU"
+          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 42 --events 60000000 --clicks 15000000 --output "$HOME/v5-60m" --threads "$NCPU"
           du -sh "$HOME/v5-dev" "$HOME/v5-20m" "$HOME/v5-60m"
       - name: Gate candidate and interleave timing rounds
         shell: bash

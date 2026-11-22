@@ -45,7 +45,11 @@ def source_for(sha):
 
 def build(sha):
     source, target = source_for(sha), WORK / "target" / sha
-    env = dict(os.environ, RUSTFLAGS="-C target-cpu=x86-64-v3", CARGO_TARGET_DIR=str(target))
+    rustflags = "-C target-cpu=x86-64-v3"
+    profdata = source / "rust/pgo/merged.profdata"
+    if profdata.is_file():
+        rustflags += f" -Cprofile-use={profdata.resolve()} -Cllvm-args=-no-pgo-warn-mismatch"
+    env = dict(os.environ, RUSTFLAGS=rustflags, CARGO_TARGET_DIR=str(target))
     call(["cargo", "build", "--release", "--locked", "--manifest-path", str(source / "rust/Cargo.toml")], env=env)
     binary = target / "release/rproto"
     if not binary.is_file():
