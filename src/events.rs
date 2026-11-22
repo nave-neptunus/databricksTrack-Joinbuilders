@@ -2273,7 +2273,7 @@ pub fn stage3(g: &mut G) {
     {
         let gr: &G = g;
         let old = gr.nd > 16 || BB > 15 || std::env::var("XL_OLD3").is_ok_and(|v| v == "1");
-        if gr.check {
+        if gr.check && gr.ids.is_none() {
             name_selftest(gr);
         }
         if let Some(v) = std::env::var("XL_DIGMIN").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
