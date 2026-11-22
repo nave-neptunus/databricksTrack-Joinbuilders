@@ -1,9 +1,9 @@
 {
   "baseline": "c3ecbd97207be0881c76ef87d01e594a61ab28be",
-  "candidate": "1f6ad8819afcc8d4cdfc2842e172743455b52a65",
+  "candidate": "40af70079253084c5469c8e1cdb91eb17f9b1661",
   "timing": [
     "c3ecbd97207be0881c76ef87d01e594a61ab28be",
-    "1f6ad8819afcc8d4cdfc2842e172743455b52a65"
+    "40af70079253084c5469c8e1cdb91eb17f9b1661"
   ],
   "rounds": {
     "20m": 5,
