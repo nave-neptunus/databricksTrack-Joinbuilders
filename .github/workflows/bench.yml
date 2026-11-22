@@ -1,11 +1,12 @@
-name: g7 v5 60M Intel benchmark
+name: g7 v5 baseline profile (Intel)
 
 on:
   push:
     branches: [g7/bench-v5]
+  workflow_dispatch:
 
 jobs:
-  benchmark:
+  profile:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -22,60 +23,87 @@ jobs:
           if [ "$have" -ge 8 ]; then use=8; else use=$have; fi
           echo "NCPU=$use" >> "$GITHUB_ENV"
           echo "RUNNER_VCPUS=$have" >> "$GITHUB_ENV"
-      - name: Fetch fixtures and comparator only
+      - name: Fetch fixtures and install their checker dependency
         run: |
           git fetch --no-tags origin ci-bench:refs/remotes/origin/ci-bench
-          git checkout origin/ci-bench -- fixtures scripts bench/ci_bench.py
-      - name: Build v5 generator and create seed-17 60M corpus
+          git checkout origin/ci-bench -- fixtures scripts/run_fixtures.py scripts/compare.py
+          # scripts/run_fixtures.py imports polars; keep this beside the script checkout.
+          python3 -m pip install --disable-pip-version-check polars
+      - name: Install perf for this runner kernel
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-tools-$(uname -r)" linux-tools-generic
+          perf --version
+      - name: Build v5 generator and create seed-17 corpora
         run: |
           cargo build --release --locked --manifest-path generator/Cargo.toml
-          generator/target/release/generate --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/big60" --threads "$NCPU"
-          du -sh "$HOME/big60"
-      - name: Build baseline first
+          generator/target/release/generate --seed 17 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads "$NCPU"
+          generator/target/release/generate --seed 17 --events 60000000 --clicks 15000000 --output "$HOME/v5-60m" --threads "$NCPU"
+          du -sh "$HOME/v5-20m" "$HOME/v5-60m"
+      - name: Build baseline image and host profiling binary
+        env:
+          BASELINE: 6da0386b4ca6a001a5c7f747c68f40815fc14afb
         run: |
-          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          git archive --format=tar 6da0386b4ca6a001a5c7f747c68f40815fc14afb | docker build --platform linux/amd64 --load --tag g7-v5-baseline -
-      - name: Baseline v5 fast-path report
+          git archive --format=tar "$BASELINE" | docker build --platform linux/amd64 --load --tag g7-v5-profile -
+          mkdir -p "$HOME/g7-profile-source"
+          git archive "$BASELINE" | tar -x -C "$HOME/g7-profile-source"
+          RUSTFLAGS='-C target-cpu=x86-64-v3' cargo build --release --locked --manifest-path "$HOME/g7-profile-source/rust/Cargo.toml"
+          cp "$HOME/g7-profile-source/rust/target/release/rproto" "$HOME/g7-profile-rproto"
+          chmod +x "$HOME/g7-profile-rproto"
+      - name: Warm and time 20M and 60M baseline runs
         run: |
-          mkdir -p "$HOME/v5-baseline/out" "$HOME/v5-baseline/scratch"
-          chmod 777 "$HOME/v5-baseline/out" "$HOME/v5-baseline/scratch"
-          start=$(date +%s%N)
-          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --memory 24g --memory-swap 24g --user 1000:1000 -v "$HOME/big60:/data:ro" -v "$HOME/v5-baseline/out:/output" -v "$HOME/v5-baseline/scratch:/scratch" -e "NCPU=$NCPU" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e XL_TIMING=1 g7-v5-baseline 2>"$HOME/v5-baseline/stderr"
-          end=$(date +%s%N)
-          awk -v a="$start" -v b="$end" 'BEGIN {printf "baseline_container_seconds=%.6f\n", (b-a)/1000000000}' > "$HOME/v5-baseline/report.txt"
-          sed -n 's/.*exit at \([0-9.]*\) ms.*/baseline_engine_ms=\1/p' "$HOME/v5-baseline/stderr" >> "$HOME/v5-baseline/report.txt"
-          if grep -qi fallback "$HOME/v5-baseline/stderr"; then echo 'baseline_fast_path=FALLBACK' >> "$HOME/v5-baseline/report.txt"; else echo 'baseline_fast_path=NO_FALLBACK' >> "$HOME/v5-baseline/report.txt"; fi
-          cat "$HOME/v5-baseline/report.txt"
-      - name: Build valid candidates
+          set -euo pipefail
+          run_profile() {
+            size="$1"
+            data="$HOME/v5-$size"
+            work="$HOME/g7-profile/$size"
+            rm -rf "$work"
+            mkdir -p "$work/warm-output" "$work/output"
+            # The unmeasured first invocation warms executable pages and the corpus page cache.
+            DATA_DIR="$data" OUTPUT_DIR="$work/warm-output" SCRATCH_DIR="$work/warm-scratch" NCPU="$NCPU" TIMING=1 GLIBC_TUNABLES=glibc.malloc.hugetlb=1 "$HOME/g7-profile-rproto" 2>"$work/warm.stderr"
+            rm -rf "$work/output" "$work/scratch"
+            mkdir -p "$work/output"
+            DATA_DIR="$data" OUTPUT_DIR="$work/output" SCRATCH_DIR="$work/scratch" NCPU="$NCPU" TIMING=1 GLIBC_TUNABLES=glibc.malloc.hugetlb=1 /usr/bin/time -v "$HOME/g7-profile-rproto" 2>"$work/stderr"
+            test -f "$work/output/user_daily/part-0.parquet"
+            test -f "$work/output/campaign_daily/part-0.parquet"
+          }
+          run_profile 20m
+          run_profile 60m
+      - name: Perf record warm 60M baseline run
         run: |
-          for spec in \
-            gum-agg:1f568fa2a27ff5cd1c19fc136b17e5ff4b3038c6
-          do
-            label=${spec%%:*}; sha=${spec#*:}
-            git archive --format=tar "$sha" | docker build --platform linux/amd64 --load --tag "g7-v5-$label" -
-          done
-      - name: Eight alternating 60M pairs and exact gates
+          set -euo pipefail
+          work="$HOME/g7-profile/60m"
+          rm -rf "$work/perf-output" "$work/perf-scratch"
+          mkdir -p "$work/perf-output"
+          # The binary runs on the host because the normal hardened container drops perf capabilities.
+          DATA_DIR="$HOME/v5-60m" OUTPUT_DIR="$work/perf-output" SCRATCH_DIR="$work/perf-scratch" NCPU="$NCPU" TIMING=1 GLIBC_TUNABLES=glibc.malloc.hugetlb=1 perf record -g --call-graph dwarf --output "$work/perf.data" -- "$HOME/g7-profile-rproto" 2>"$work/perf.stderr"
+          perf report --stdio --no-children --sort symbol --percent-limit 0 --input "$work/perf.data" >"$work/perf-report.txt"
+          test -s "$work/perf-report.txt"
+      - name: Publish profile evidence
+        if: always()
         run: |
-          set -o pipefail
-          for spec in \
-            gum-agg:1f568fa2a27ff5cd1c19fc136b17e5ff4b3038c6
-          do
-            label=${spec%%:*}; sha=${spec#*:}
-            work="$HOME/v5-$label"; mkdir -p "$work"
-            BASELINE_REF=6da0386b4ca6a001a5c7f747c68f40815fc14afb CANDIDATE_REF="$sha" CANDIDATE_LABEL="$sha" BASELINE_IMAGE=g7-v5-baseline CANDIDATE_IMAGE="g7-v5-$label" PAIRS=8 NCPU="$NCPU" python3 bench/ci_bench.py "$HOME/big60" "$work" 2>&1 | tee "$work.log"
-          done
-      - if: always()
-        run: |
-          cat "$HOME/v5-baseline/report.txt" >> "$GITHUB_STEP_SUMMARY" || true
-          for report in "$HOME"/v5-*/summary.md; do if test -f "$report"; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi; done
+          {
+            echo '## g7 v5 baseline profile'
+            echo
+            echo "- baseline: \`6da0386b4ca6a001a5c7f747c68f40815fc14afb\`"
+            echo "- runner vCPUs: ${RUNNER_VCPUS:-unknown}; profiled NCPU: ${NCPU:-unknown}"
+            for size in 20m 60m; do
+              echo
+              echo "### ${size} warm timed stderr"
+              echo '```text'
+              sed -n '/ ms  /p;/User time (seconds)/p;/System time (seconds)/p;/Maximum resident set size/p' "$HOME/g7-profile/$size/stderr" || true
+              echo '```'
+            done
+            echo
+            echo '### 60M perf (self time)'
+            echo '```text'
+            grep -E '^[[:space:]]*[0-9.]+%' "$HOME/g7-profile/60m/perf-report.txt" | head -30 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: v5-60m-${{ github.run_id }}-${{ github.run_attempt }}
+          name: gum-profile-${{ github.run_id }}-${{ github.run_attempt }}
           path: |-
-            ~/v5-baseline/**
-            ~/v5-*.log
-            ~/v5-*/summary.md
-            ~/v5-*/observations.json
-            ~/v5-*/logs/**
+            ~/g7-profile/**
           retention-days: 7
