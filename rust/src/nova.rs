@@ -133,32 +133,60 @@ fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec
     Some((n.div_ceil(P) as u32, all))
 }
 
+const STREAM_BATCH_ROWS: usize = 4;
+
+#[repr(align(64))]
+struct StreamBatch<T: Copy>([MaybeUninit<T>; STREAM_BATCH_ROWS]);
+
+#[inline(always)]
+unsafe fn copy_stream_batch(src: *const u8, dst: *mut u8, bytes: usize) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    if dst as usize % 32 == 0 && src as usize % 32 == 0 && bytes % 32 == 0 {
+        use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
+        let src = src.cast::<__m256i>();
+        let dst = dst.cast::<__m256i>();
+        for lane in 0..(bytes / 32) {
+            _mm256_stream_si256(dst.add(lane), _mm256_load_si256(src.add(lane)));
+        }
+        return;
+    }
+    std::ptr::copy_nonoverlapping(src, dst, bytes);
+}
+
 /// A producer owns disjoint blocks within demand-paged slabs. Stream order is
 /// described by its block IDs. No initialized record moves when a stream grows.
-pub(super) struct Streams<T, const N: usize> {
+pub(super) struct Streams<T: Copy, const N: usize> {
     slabs: Vec<memmap2::MmapMut>,
     blocks: [Vec<u32>; N],
     tails: [*mut T; N],
     used: [usize; N],
     next: usize,
+    pending: [u8; N],
+    batches: Box<[StreamBatch<T>]>,
 }
 
 // Pointers address the owned mappings, which remain stable when moved.
-unsafe impl<T: Send, const N: usize> Send for Streams<T, N> {}
+unsafe impl<T: Send + Copy, const N: usize> Send for Streams<T, N> {}
 // Shared readers can access only initialized records. They never write the tails.
-unsafe impl<T: Sync, const N: usize> Sync for Streams<T, N> {}
+unsafe impl<T: Sync + Copy, const N: usize> Sync for Streams<T, N> {}
 
 impl<T: Copy, const N: usize> Streams<T, N> {
     const ROWS: usize = BLOCK_BYTES / size_of::<T>();
     const SLAB_BLOCKS: usize = SLAB_BYTES / BLOCK_BYTES;
 
     pub(super) fn new() -> Self {
+        let mut batches = Vec::with_capacity(N);
+        for _ in 0..N {
+            batches.push(StreamBatch([const { MaybeUninit::uninit() }; STREAM_BATCH_ROWS]));
+        }
         Self {
             slabs: Vec::new(),
             blocks: std::array::from_fn(|_| Vec::new()),
             tails: [std::ptr::null_mut(); N],
             used: [Self::ROWS; N],
             next: 0,
+            pending: [0; N],
+            batches: batches.into_boxed_slice(),
         }
     }
 
@@ -192,14 +220,70 @@ impl<T: Copy, const N: usize> Streams<T, N> {
     }
 
     #[inline]
-    pub(super) fn push(&mut self, stream: usize, row: T) {
-        if self.used[stream] == Self::ROWS {
-            self.extend(stream);
+    fn write_rows(&mut self, stream: usize, src: *const T, count: usize) {
+        if count == 0 {
+            return;
         }
-        let slot = self.used[stream];
-        // The cursor always points within this producer's current block.
-        unsafe { self.tails[stream].add(slot).write(row) };
-        self.used[stream] = slot + 1;
+        let remaining = Self::ROWS - self.used[stream];
+        if remaining == 0 {
+            self.extend(stream);
+            let dst = unsafe { self.tails[stream].cast::<u8>() };
+            unsafe {
+                copy_stream_batch(src.cast::<u8>(), dst, count * size_of::<T>());
+            }
+            self.used[stream] = count;
+        } else if count <= remaining {
+            let slot = self.used[stream];
+            let dst = unsafe { self.tails[stream].add(slot).cast::<u8>() };
+            unsafe {
+                copy_stream_batch(src.cast::<u8>(), dst, count * size_of::<T>());
+            }
+            self.used[stream] = slot + count;
+        } else {
+            let slot = self.used[stream];
+            let dst = unsafe { self.tails[stream].add(slot).cast::<u8>() };
+            unsafe {
+                copy_stream_batch(src.cast::<u8>(), dst, remaining * size_of::<T>());
+            }
+            self.used[stream] = Self::ROWS;
+            self.extend(stream);
+            let rest = count - remaining;
+            let dst = unsafe { self.tails[stream].cast::<u8>() };
+            let rest_src = unsafe { src.add(remaining).cast::<u8>() };
+            unsafe {
+                copy_stream_batch(rest_src, dst, rest * size_of::<T>());
+            }
+            self.used[stream] = rest;
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn push(&mut self, stream: usize, row: T) {
+        let p = self.pending[stream] as usize;
+        self.batches[stream].0[p].write(row);
+        if p + 1 == STREAM_BATCH_ROWS {
+            let src = self.batches[stream].0.as_ptr().cast::<T>();
+            self.write_rows(stream, src, STREAM_BATCH_ROWS);
+            self.pending[stream] = 0;
+        } else {
+            self.pending[stream] = (p + 1) as u8;
+        }
+    }
+
+    pub(super) fn finish(&mut self) {
+        for stream in 0..N {
+            let p = self.pending[stream] as usize;
+            if p != 0 {
+                let src = self.batches[stream].0.as_ptr().cast::<T>();
+                self.write_rows(stream, src, p);
+                self.pending[stream] = 0;
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
     }
 
     #[inline]
@@ -236,11 +320,18 @@ impl<T: Copy, const N: usize> Streams<T, N> {
 
     pub(super) fn len(&self, stream: usize) -> usize {
         let blocks = self.blocks[stream].len();
+        let pending = self.pending[stream] as usize;
         if blocks == 0 {
-            0
+            pending
         } else {
-            (blocks - 1) * Self::ROWS + self.used[stream]
+            (blocks - 1) * Self::ROWS + self.used[stream] + pending
         }
+    }
+}
+
+impl<T: Copy, const N: usize> Drop for Streams<T, N> {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -278,6 +369,17 @@ struct Folds {
 impl Folds {
     fn new() -> Self {
         Self { short: Streams::new(), long: Streams::new() }
+    }
+
+    fn finish(&mut self) {
+        self.short.finish();
+        self.long.finish();
+    }
+}
+
+impl Drop for Folds {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -932,6 +1034,8 @@ fn events(
             }
             parser.flush();
             parser.people.finish();
+            parser.streams.finish();
+            parser.long.finish();
             Folds { short: parser.streams, long: parser.long }
         };
         (worker, streams, people)
@@ -1191,6 +1295,7 @@ mod tests {
         place_long(&mut writer, &mut claims, key, crate::pack_ref(a).unwrap(), 10, 3, 100, 1);
         place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
         writer.finish();
+        claims[0].finish();
         Router::new().route(&people, &claims, 0);
         assert_eq!(live_rows(&people[0], 3), vec![(100, 1), (200, 2)]);
     }
@@ -1208,6 +1313,7 @@ mod tests {
         place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 10, 3, 100, 1);
         place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
         writer.finish();
+        claims[0].finish();
         Router::new().route(&people, &claims, 0);
         assert_eq!(live_rows(&people[0], 3), vec![(100, 1)]);
     }
@@ -1250,6 +1356,7 @@ mod tests {
         place(&mut second, &mut claims, 1, 3, 20, 3, 10, 1);
         first.finish();
         second.finish();
+        claims.iter_mut().for_each(|c| c.finish());
         assert_eq!(people[0].len(3), 300);
         assert_eq!(people[1].len(7), 1);
         Router::new().route(&people, &claims, 0);

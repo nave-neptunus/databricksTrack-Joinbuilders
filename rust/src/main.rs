@@ -2055,7 +2055,7 @@ fn fast(nova: bool) -> bool {
             acc
         };
         let init = || Box::new(nova::Streams::new());
-        let clicks = if nova {
+        let mut clicks = if nova {
             // Work-stealable chunks share the pool with event dedup. Claim chunk
             // indices in order to stay behind the read-ahead workers.
             let next = std::sync::atomic::AtomicUsize::new(0);
@@ -2065,6 +2065,9 @@ fn fast(nova: bool) -> bool {
         } else {
             pt_ordered(cch.len(), init, parse_chunk)
         };
+        for fold in &mut clicks {
+            fold.finish();
+        }
         lap("clicks parsed");
         clicks
     };
