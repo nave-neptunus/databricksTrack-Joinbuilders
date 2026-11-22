@@ -157,9 +157,16 @@ def summarize_samples(evidence, label, record, profile, event, detailed):
     with (evidence / f"{label}-samples.txt").open("w") as stream:
         subprocess.run(comm, stdout=stream, check=True)
     with (evidence / f"{label}-samples.txt").open() as stream:
+        previous_sample = None
         for line in stream:
             match = SAMPLE.match(line)
             if not match:
+                # perf script emits source lines on a separate indented line.
+                location = LOCATION.fullmatch(line.strip())
+                if location and previous_sample:
+                    key, weight = previous_sample
+                    locations[key][location[1]] += weight
+                previous_sample = None
                 continue
             tid, seconds, period, symbol, dso, rest = match.groups()
             stage = stages[bisect.bisect_left(bounds, float(seconds))]
@@ -171,6 +178,7 @@ def summarize_samples(evidence, label, record, profile, event, detailed):
             location = LOCATION.search(rest)
             if location:
                 locations[key][location[1]] += weight
+            previous_sample = (key, weight)
     total = symbols.total()
     top = []
     for (symbol, dso), weight in symbols.most_common(30):
@@ -246,9 +254,11 @@ def format_summary(size, results):
             lines.append(f"| {name} | {metric['status']} | {metric['unit']} |")
         if size == "20m" and sha == REQUEST["candidate"]:
             lines.extend(["", f"Samples weighted by {cohort['samples'].get('event', 'unavailable')}.",
-                          "", "| Self % | Symbol | DSO |", "|---:|---|---|"])
+                          "", "| Self % | Symbol | DSO | Sampled source |", "|---:|---|---|---|"])
             for symbol in cohort["samples"].get("top_symbols", []):
-                lines.append(f"| {symbol['percent']:.2f} | `{symbol['symbol']}` | {symbol['dso']} |")
+                source = ", ".join(f"`{loc}`" for loc, _ in symbol["locations"][:2])
+                lines.append(f"| {symbol['percent']:.2f} | `{symbol['symbol']}` | "
+                             f"{symbol['dso']} | {source} |")
         lines.append("")
     return "\n".join(lines)
 
