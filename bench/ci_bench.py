@@ -77,6 +77,10 @@ def run(binary, data, label, *, timing=False):
     elapsed = (time.perf_counter() - started) * 1000
     (WORK / "logs").mkdir(exist_ok=True)
     (WORK / "logs" / f"{label}.stderr").write_text(result.stderr)
+    if label != "candidate-1m":
+        for line in result.stderr.splitlines():
+            if line.startswith("UTIL "):
+                print(f"[{label}] {line}", flush=True)
     if result.returncode:
         raise SystemExit(f"{label} failed ({result.returncode}):\n{result.stderr[-4000:]}")
     if "fast engine declined" in result.stderr:
