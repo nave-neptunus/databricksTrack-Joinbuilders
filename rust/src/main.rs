@@ -1663,6 +1663,23 @@ fn ends_same(a: &LinkEnd, b: &LinkEnd) -> bool {
     link_same(a, b.check, LinkName { reference: b.name, prefix: b.prefix })
 }
 
+#[inline]
+fn link_root(parent: &[AtomicU32], mut node: u32) -> u32 {
+    loop {
+        let next = parent[node as usize].load(Relaxed);
+        if next == 0 {
+            return node;
+        }
+        let grandparent = parent[(next - 1) as usize].load(Relaxed);
+        if grandparent == 0 {
+            return next - 1;
+        }
+        // Path halving keeps the replacement on the same ancestry chain.
+        let _ = parent[node as usize].compare_exchange(next, grandparent, Relaxed, Relaxed);
+        node = grandparent - 1;
+    }
+}
+
 fn claim_link(
     slots: &mut [(u64, u64)],
     home: usize,
