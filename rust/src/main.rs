@@ -2278,7 +2278,8 @@ struct PartitionState {
     cd: Vec<[i64; 4]>,
     counts: Vec<u32>,
     asst: Vec<u32>,
-    in_active: Vec<bool>,
+    /// Position of each campaign in `active` while its window count is non-zero.
+    active_pos: Vec<u32>,
     active: Vec<u32>,
     catsum: Vec<i64>,
     touched_categories: Vec<u32>,
@@ -2303,7 +2304,7 @@ impl PartitionState {
             cd: vec![[0; 4]; campaigns * days],
             counts: vec![0; campaigns],
             asst: vec![0; campaigns * days],
-            in_active: vec![false; campaigns],
+            active_pos: vec![0; campaigns],
             active: Vec::new(),
             catsum: vec![0; categories],
             touched_categories: Vec::new(),
@@ -2398,7 +2399,7 @@ impl PartitionState {
         organic: usize,
     ) {
         let Self {
-            cd, counts, asst, in_active, active, catsum, touched_categories,
+            cd, counts, asst, active_pos, active, catsum, touched_categories,
             event_ends, click_ends, events, clicks, gather: _, event_scratch, click_scratch, buckets,
             user, user_rows,
         } = self;
@@ -2434,7 +2435,17 @@ impl PartitionState {
                     let time = start + LOOK as u32;
                     let lower = start;
                     while lo < hi && clicks[lo].ts < lower {
-                        counts[clicks[lo].campaign()] -= 1;
+                        let c = clicks[lo].campaign();
+                        counts[c] -= 1;
+                        if counts[c] == 0 {
+                            // Leave the active set now so the assist loop needs no checks.
+                            let at = active_pos[c] as usize;
+                            let last = active.pop().unwrap();
+                            if last as usize != c {
+                                active[at] = last;
+                                active_pos[last as usize] = at as u32;
+                            }
+                        }
                         lo += 1;
                     }
                     while let Some(&click) = clicks.get(hi) {
@@ -2448,11 +2459,11 @@ impl PartitionState {
                             continue;
                         }
                         let campaign = click.campaign();
-                        counts[campaign] += 1;
-                        if !in_active[campaign] {
-                            in_active[campaign] = true;
+                        if counts[campaign] == 0 {
+                            active_pos[campaign] = active.len() as u32;
                             active.push(campaign as u32);
                         }
+                        counts[campaign] += 1;
                         if best_click.is_none_or(|old| click.ts != old.ts || click.id() < old.id()) {
                             best_click = Some(click);
                         }
@@ -2460,16 +2471,8 @@ impl PartitionState {
                     campaign = best_click.filter(|click| click.ts >= lower).map_or(organic, Click::campaign);
                     // The credited cell is a likely cache miss; overlap it with the assist loop.
                     prefetch_read(cd.as_ptr().wrapping_add(campaign * days + day_index).cast());
-                    let mut i = 0;
-                    while i < active.len() {
-                        let c = active[i] as usize;
-                        if counts[c] == 0 {
-                            in_active[c] = false;
-                            active.swap_remove(i);
-                        } else {
-                            asst[c * days + day_index] += 1;
-                            i += 1;
-                        }
+                    for &c in active.iter() {
+                        asst[c as usize * days + day_index] += 1;
                     }
                 }
                 let total = &mut cd[campaign * days + day_index];
@@ -2503,7 +2506,6 @@ impl PartitionState {
             }
             for campaign in active.drain(..) {
                 counts[campaign as usize] = 0;
-                in_active[campaign as usize] = false;
             }
         }
     }
