@@ -143,6 +143,9 @@ pub(super) struct Streams<T, const N: usize> {
     blocks: [Vec<u32>; N],
     tails: [*mut T; N],
     used: [usize; N],
+    // Logical claims per stream, recorded at production. A long ID adds one
+    // claim but two physical records, so `len` overstates the table demand.
+    logical: [u32; N],
     next: usize,
 }
 
@@ -161,6 +164,7 @@ impl<T: Copy, const N: usize> Streams<T, N> {
             blocks: std::array::from_fn(|_| Vec::new()),
             tails: [std::ptr::null_mut(); N],
             used: [Self::ROWS; N],
+            logical: [0; N],
             next: 0,
         }
     }
@@ -225,6 +229,15 @@ impl<T: Copy, const N: usize> Streams<T, N> {
             // are full and only the initialized tail prefix is exposed.
             unsafe { std::slice::from_raw_parts(slab.as_ptr().add(offset).cast::<T>(), len) }
         })
+    }
+
+    #[inline]
+    pub(super) fn count_logical(&mut self, stream: usize) {
+        self.logical[stream] += 1;
+    }
+
+    pub(super) fn logical(&self, stream: usize) -> usize {
+        self.logical[stream] as usize
     }
 
     pub(super) fn len(&self, stream: usize) -> usize {
@@ -758,6 +771,7 @@ impl Parser<'_, '_, '_> {
             };
             let shard = shard_of(pending.key);
             self.streams.push(shard, Claim { key: pending.key, ingest: pending.ingest, loc });
+            self.streams.count_logical(shard);
             if pending.eref != 0 {
                 // The carrier is next in this very stream, so dedup can pair it
                 // with the claim above without any cross-stream bookkeeping.
@@ -970,7 +984,9 @@ impl Router {
 
     fn route(&mut self, people: &[People], claims: &[ClaimStream], shard: usize) {
         let begin = std::time::Instant::now();
-        let count: usize = claims.iter().map(|fold| fold.len(shard)).sum();
+        // Size from logical claims: carrier records never become entries.
+        // Traversal below still walks every physical record.
+        let count: usize = claims.iter().map(|fold| fold.logical(shard)).sum();
         if count == 0 {
             return;
         }
@@ -1108,6 +1124,7 @@ mod tests {
         let index = people.push(part, person, ts, price);
         let loc = ((part as u32) << LOC_PART_SHIFT) | index as u32;
         claims[0].push(0, Claim { key, ingest, loc });
+        claims[0].count_logical(0);
         claims[0].push(0, Claim { key: eref, ingest: CARRIER, loc: 0 });
     }
 
@@ -1183,6 +1200,7 @@ mod tests {
             };
             // Short keys carry SHORT_KEY in production; route only that shard here.
             claims[worker as usize].push(0, Claim { key: key | SHORT_KEY, ingest, loc });
+            claims[worker as usize].count_logical(0);
         }
 
         let mut people = [People::new(32), People::new(1)];
