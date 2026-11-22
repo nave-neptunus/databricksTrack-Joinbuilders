@@ -42,6 +42,7 @@ struct Users {
     linked: FrozenDictionary,
     short: PackedDictionary,
     long: ids::LongDictionary,
+    long_roots: Vec<Vec<u32>>,
     linked_short: [PackedPeople; SHARDS],
     roots: Vec<u32>,
     boundary: u32,
@@ -52,6 +53,11 @@ impl Users {
         let (linked, roots) = links(g);
         let boundary = roots.len() as u32;
         let maps: [Mutex<Option<PackedPeople>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
+        let long = ids::LongDictionary::new(
+            g.ucap as usize - boundary as usize,
+            (g.ucap as usize * 128).max(64 << 20),
+        );
+        let seeded: Vec<Mutex<Vec<u32>>> = (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect();
         let next = AtomicUsize::new(0);
         sys::run_par(g.nt, |_| loop {
             let stripe = next.fetch_add(1, Ordering::Relaxed);
@@ -59,14 +65,17 @@ impl Users {
                 break;
             }
             *maps[stripe].lock().unwrap() = Some(linked.short_people(stripe, &roots));
+            let values = long.seed(
+                stripe,
+                linked.long_entries(stripe).map(|(bytes, index)| (bytes, roots[index as usize])),
+            );
+            *seeded[stripe].lock().unwrap() = values;
         });
         Self {
             linked,
             short: PackedDictionary::new((g.ucap as usize - boundary as usize) / 2),
-            long: ids::LongDictionary::new(
-                g.ucap as usize - boundary as usize,
-                (g.ucap as usize * 128).max(64 << 20),
-            ),
+            long,
+            long_roots: seeded.into_iter().map(|m| m.into_inner().unwrap()).collect(),
             linked_short: maps.map(|m| m.into_inner().unwrap().unwrap()),
             roots,
             boundary,
@@ -75,17 +84,26 @@ impl Users {
 
     #[inline]
     fn person(&self, id: Id<'_>, hash: u64, sink: &mut ids::LongSink) -> u32 {
+        let mut long_local = 0;
         let linked = match id {
             Id::Short(key) => self.linked_short[ids::shard(hash)].get(key),
-            Id::Long(_) => self
-                .linked
-                .lookup(id, hash)
-                .map(|index| self.roots[index as usize]),
+            Id::Long(bytes) => {
+                let index = self.long.intern(bytes, hash, sink);
+                let stripe = index as usize & (SHARDS - 1);
+                let local = (index >> 6) as usize;
+                let seeded = &self.long_roots[stripe];
+                if local < seeded.len() {
+                    Some(seeded[local])
+                } else {
+                    long_local = ((local - seeded.len()) << 6 | stripe) as u64;
+                    None
+                }
+            }
         };
         linked.unwrap_or_else(|| {
             let index = match id {
                 Id::Short(key) => self.short.intern(key, hash) as u64 * 2,
-                Id::Long(bytes) => self.long.intern(bytes, hash, sink) as u64 * 2 + 1,
+                Id::Long(_) => long_local * 2 + 1,
             };
             u32::try_from(index + self.boundary as u64)
                 .unwrap_or_else(|_| sys::fallback("IDs exceed user index capacity"))
@@ -102,8 +120,6 @@ impl Users {
             let key = id_at(g, id, base);
             let hash = key.hash();
             self.long.prefetch(hash);
-            // Warm the frozen table's probe path; the result is discarded.
-            std::hint::black_box(self.linked.lookup(key, hash));
         }
     }
 
@@ -111,7 +127,7 @@ impl Users {
         UserNames {
             linked: self.linked.into_names(),
             short: self.short.into_names(),
-            long: self.long.into_names(),
+            long: self.long.into_names(self.long_roots.iter().map(Vec::len).collect()),
             boundary: self.boundary,
         }
     }

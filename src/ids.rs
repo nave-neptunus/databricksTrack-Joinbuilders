@@ -289,7 +289,7 @@ impl LongSink {
 
 impl LongDictionary {
     pub fn new(max_users: usize, byte_cap: usize) -> Self {
-        let slots = (2 * max_users.div_ceil(SHARDS)).next_power_of_two().max(1024);
+        let slots = (4 * max_users.div_ceil(SHARDS)).next_power_of_two().max(1024);
         let cap = slots / 2;
         let base = crate::sys::anon(SHARDS * (slots + cap) * 8) as *const AtomicU64;
         let stripes = (0..SHARDS)
@@ -313,6 +313,31 @@ impl LongDictionary {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
             _mm_prefetch::<_MM_HINT_T0>(table.slots.as_ptr().add(slot).cast());
         }
+    }
+
+    // Seeds one stripe with unique IDs whose bytes outlive this table. Entry
+    // `local` carries `values[local]`; call once per stripe before interning.
+    pub fn seed<'a>(&self, stripe: usize, items: impl Iterator<Item = (&'a [u8], u32)>) -> Vec<u32> {
+        let table = &self.stripes[stripe];
+        let mask = table.slots.len() - 1;
+        let mut values = Vec::new();
+        for (bytes, value) in items {
+            let hash = hash_bytes(bytes);
+            debug_assert_eq!(shard(hash), stripe);
+            let local = values.len();
+            if local >= table.entries.len() || bytes.len() > u16::MAX as usize {
+                fallback("linked long IDs exceed the seed capacity");
+            }
+            table.entries[local].store((bytes.as_ptr() as u64) << 16 | bytes.len() as u64, Relaxed);
+            let mut slot = hash as usize & mask;
+            while table.slots[slot].load(Relaxed) != 0 {
+                slot = (slot + 1) & mask;
+            }
+            table.slots[slot].store((hash >> 48) << 48 | (local as u64 + 1), Relaxed);
+            values.push(value);
+        }
+        table.next.store(values.len() as u32, Relaxed);
+        values
     }
 
     fn store(&self, sink: &mut LongSink, bytes: &[u8]) -> u64 {
@@ -382,22 +407,23 @@ impl LongDictionary {
         }
     }
 
-    pub fn into_names(self) -> LongNames {
+    pub fn into_names(self, skip: Vec<usize>) -> LongNames {
         let counts = self.stripes.iter().map(|s| s.next.load(Relaxed) as usize).collect();
-        LongNames { stripes: self.stripes, counts, _arena: self.arena }
+        LongNames { stripes: self.stripes, counts, skip, _arena: self.arena }
     }
 }
 
 pub struct LongNames {
     stripes: Vec<LongStripe>,
     counts: Vec<usize>,
+    skip: Vec<usize>,
     _arena: crate::sys::Arena,
 }
 
 impl LongNames {
     pub fn bytes<'a>(&'a self, index: u32, _prefix: u8, _buf: &'a mut [u8; 9]) -> &'a [u8] {
         let stripe = index as usize & (SHARDS - 1);
-        let local = (index >> BITS) as usize;
+        let local = (index >> BITS) as usize + self.skip[stripe];
         assert!(local < self.counts[stripe]);
         let entry = self.stripes[stripe].entries[local].load(Relaxed);
         unsafe { std::slice::from_raw_parts((entry >> 16) as *const u8, (entry & 0xFFFF) as usize) }
@@ -418,6 +444,17 @@ impl FrozenDictionary {
         let keys = &self.0[index as usize & (SHARDS - 1)].keys;
         let local = index >> BITS;
         ((local as usize) < keys.entries.len()).then(|| keys.id(local))
+    }
+
+    // Long IDs of one stripe with their global (local << BITS | stripe) index.
+    pub fn long_entries(&self, stripe: usize) -> impl Iterator<Item = (&[u8], u32)> + '_ {
+        let keys = &self.0[stripe].keys;
+        keys.entries.iter().enumerate().filter_map(move |(local, &key)| {
+            (key & LONG != 0).then(|| match keys.id(local as u32) {
+                Id::Long(bytes) => (bytes, Names::index(stripe, local as u32)),
+                Id::Short(_) => unreachable!(),
+            })
+        })
     }
 
     pub fn short_people(&self, stripe: usize, roots: &[u32]) -> PackedPeople {
