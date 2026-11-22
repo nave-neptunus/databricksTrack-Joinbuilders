@@ -229,7 +229,7 @@ struct Scan<'a> {
     users: &'a Users,
     user_keys: [u64; USER_CACHE],
     user_values: [u32; USER_CACHE],
-    claims: Vec<Vec<Claim>>,
+    claims: parse::Part,
     people: Vec<Vec<PersonEvent>>,
     locations: Locations,
     worker: u32,
@@ -242,16 +242,24 @@ struct Scan<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Claim {
-    // Long IDs use the exact mmap span. Short IDs are packed byte codes.
-    id: u64,
-    copy: CopyLocation,
-}
-
-#[derive(Clone, Copy)]
 struct CopyLocation {
     ingest: u32,
     loc: u32,
+}
+
+impl CopyLocation {
+    #[inline]
+    fn pack(self) -> u64 {
+        (self.ingest as u64) << 32 | self.loc as u64
+    }
+
+    #[inline]
+    fn unpack(word: u64) -> Self {
+        Self {
+            ingest: (word >> 32) as u32,
+            loc: word as u32,
+        }
+    }
 }
 
 struct PersonEvent {
@@ -310,10 +318,14 @@ struct Click {
 }
 
 struct Parsed {
-    claims: Vec<Mutex<Vec<Claim>>>,
+    claims: FinishedClaims,
     people: Vec<Vec<PersonEvent>>,
     clicks: [Mutex<Vec<Click>>; SHARDS],
 }
+
+struct FinishedClaims(parse::Part);
+// Partition chunks are immutable after finish() publishes the buffered stores.
+unsafe impl Sync for FinishedClaims {}
 
 impl Scan<'_> {
     #[inline]
@@ -379,13 +391,11 @@ impl Scan<'_> {
         }
         let hash = id_at(g, r.eid, self.base).hash();
         let id = self.absolute_id(r.eid);
-        self.claims[event_shard(hash)].push(Claim {
-            id,
-            copy: CopyLocation {
-                ingest: (ingest / 1000) as u32,
-                loc,
-            },
-        });
+        let copy = CopyLocation {
+            ingest: (ingest / 1000) as u32,
+            loc,
+        };
+        self.claims.push(event_shard(hash), id, copy.pack());
     }
 
     #[inline]
@@ -481,8 +491,7 @@ fn scan_reserve(g: &G, kind: Kind, stripes: usize) -> usize {
     (bytes / average).div_ceil(stripes * g.nt) * 5 / 4
 }
 
-fn scan(g: &G, users: &Users, locations: Locations) -> Vec<Parsed> {
-    let event_reserve = scan_reserve(g, Kind::Ev, EVENT_SHARDS);
+fn scan(g: &G, users: &Users, locations: Locations, arena: &sys::Arena) -> Vec<Parsed> {
     let click_reserve = scan_reserve(g, Kind::Ck, SHARDS);
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
@@ -503,9 +512,7 @@ fn scan(g: &G, users: &Users, locations: Locations) -> Vec<Parsed> {
             users,
             user_keys: [0; USER_CACHE],
             user_values: [0; USER_CACHE],
-            claims: (0..EVENT_SHARDS)
-                .map(|_| Vec::with_capacity(event_reserve))
-                .collect(),
+            claims: parse::Part::new(arena, EVENT_SHARDS),
             people: (0..g.nub).map(|_| Vec::new()).collect(),
             locations,
             worker: tid as u32,
@@ -536,8 +543,9 @@ fn scan(g: &G, users: &Users, locations: Locations) -> Vec<Parsed> {
         }
         t.n_ev_rows = s.n_ev;
         t.n_ck_rows = s.n_ck;
+        s.claims.finish();
         *workers[tid].lock().unwrap() = Some(Parsed {
-            claims: s.claims.into_iter().map(Mutex::new).collect(),
+            claims: FinishedClaims(s.claims),
             people: s.people,
             clicks: s.clicks.map(Mutex::new),
         });
@@ -590,40 +598,39 @@ fn dedup(g: &G, parsed: &[Parsed], locations: Locations) -> Names {
                 *click_names[stripe].lock().unwrap() = Some(keys);
                 continue;
             }
-            let total: usize = parsed
-                .iter()
-                .map(|p| p.claims[shard].lock().unwrap().len())
-                .sum();
+            let total: usize = parsed.iter().map(|p| p.claims.0.count(shard)).sum();
             short.clear();
             short.reserve(total);
             let mut long = Shard::with_capacity(total / 8);
             long_slots.clear();
             long_slots.reserve(total / 8);
             for p in parsed {
-                let part = std::mem::take(&mut *p.claims[shard].lock().unwrap());
-                for row in part {
-                    let id = id_at(g, row.id, 0);
-                    let hash = id.hash();
-                    if let Id::Short(_) = id {
-                        // The mixer is a bijection on u64, so equal short
-                        // hashes imply equal packed keys.
-                        match short.entry(hash) {
-                            Entry::Occupied(mut slot) => {
-                                choose(slot.get_mut(), row.copy, locations, parsed)
+                p.claims.0.for_each(shard, |part| {
+                    for row in part {
+                        let id = id_at(g, row.w0, 0);
+                        let copy = CopyLocation::unpack(row.w1);
+                        let hash = id.hash();
+                        if let Id::Short(_) = id {
+                            // The mixer is a bijection on u64, so equal short
+                            // hashes imply equal packed keys.
+                            match short.entry(hash) {
+                                Entry::Occupied(mut slot) => {
+                                    choose(slot.get_mut(), copy, locations, parsed)
+                                }
+                                Entry::Vacant(slot) => {
+                                    slot.insert(copy);
+                                }
                             }
-                            Entry::Vacant(slot) => {
-                                slot.insert(row.copy);
-                            }
-                        }
-                    } else {
-                        let (index, is_new) = long.intern(id, hash);
-                        if is_new {
-                            long_slots.push(row.copy);
                         } else {
-                            choose(&mut long_slots[index as usize], row.copy, locations, parsed);
+                            let (index, is_new) = long.intern(id, hash);
+                            if is_new {
+                                long_slots.push(copy);
+                            } else {
+                                choose(&mut long_slots[index as usize], copy, locations, parsed);
+                            }
                         }
                     }
-                }
+                });
             }
         }
         clicks.finish();
@@ -723,9 +730,12 @@ pub fn stage1(g: &mut G) {
     let users = Users::new(g);
     sys::lap("link_ids");
     let locations = Locations::new(g);
-    let parsed = scan(g, &users, locations);
+    let claim_arena =
+        sys::Arena::new(g.ecap as usize * 16 + g.nt * (EVENT_SHARDS * parse::CHUNK + (2 << 20)));
+    let parsed = scan(g, &users, locations, &claim_arena);
     sys::lap("scan_ids");
     let clicks = dedup(g, &parsed, locations);
+    sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
     sys::lap("dedup_ids");
     order_events(g, &parsed);
     sys::lap("order_events");
