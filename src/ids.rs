@@ -4,7 +4,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
-use crate::sys::{fallback, U64Map};
+use crate::sys::fallback;
 
 const BITS: u32 = 6;
 pub const SHARDS: usize = 1 << BITS;
@@ -267,13 +267,14 @@ impl FrozenDictionary {
         ((local as usize) < keys.entries.len()).then(|| keys.id(local))
     }
 
-    pub fn short_people(&self, stripe: usize, roots: &[u32]) -> U64Map {
+    pub fn short_people(&self, stripe: usize, roots: &[u32]) -> PackedPeople {
         let entries = &self.0[stripe].keys.entries;
-        let mut short = U64Map::with_capacity(entries.len());
+        let user_bits = usize::BITS - roots.len().saturating_sub(1).leading_zeros();
+        let mut short = PackedPeople::new(entries.len(), user_bits);
         for (local, &key) in entries.iter().enumerate() {
             if key & LONG == 0 {
                 let index = Names::index(stripe, local as u32);
-                short.get_or_insert(key, roots[index as usize]);
+                short.insert(key, roots[index as usize]);
             }
         }
         short
@@ -307,6 +308,91 @@ impl Names {
         match self.id(index) {
             Id::Short(key) => unpack(key, prefix, buf),
             Id::Long(bytes) => bytes,
+        }
+    }
+}
+
+#[repr(align(64))]
+#[derive(Clone, Copy)]
+struct PeopleBucket([u64; 8]);
+
+pub struct PackedPeople {
+    buckets: Vec<PeopleBucket>,
+    overflow: HashMap<u64, u32, BuildHasherDefault<IdentityHasher>>,
+    bucket_bits: u32,
+    value_shift: u32,
+    key_mask: u64,
+}
+
+impl PackedPeople {
+    fn new(entries: usize, user_bits: u32) -> Self {
+        let min_bucket_bits = (49 + user_bits).saturating_sub(64);
+        let buckets = entries
+            .div_ceil(3)
+            .next_power_of_two()
+            .max(1 << min_bucket_bits);
+        let bucket_bits = buckets.trailing_zeros();
+        let value_shift = 49 - bucket_bits;
+        Self {
+            buckets: vec![PeopleBucket([0; 8]); if entries == 0 { 0 } else { buckets }],
+            overflow: HashMap::default(),
+            bucket_bits,
+            value_shift,
+            key_mask: (1 << value_shift) - 1,
+        }
+    }
+
+    // Multiplication by an odd constant and XOR with a right shift are
+    // reversible in 48 bits. The bucket stores the low bits implicitly,
+    // so the remaining bits are the complete key within that bucket.
+    #[inline]
+    fn position(&self, key: u64) -> (usize, u64) {
+        let h = key.wrapping_mul(0x517c_c1b7_2722_0a95) & SHORT_MASK;
+        let hash = h ^ (h >> 23);
+        (
+            hash as usize & (self.buckets.len() - 1),
+            (hash >> self.bucket_bits) + 1,
+        )
+    }
+
+    fn insert(&mut self, key: u64, user: u32) {
+        let (bucket, quotient) = self.position(key);
+        if let Some(slot) = self.buckets[bucket].0.iter_mut().find(|slot| **slot == 0) {
+            *slot = (user as u64) << self.value_shift | quotient;
+        } else {
+            self.overflow.insert(key, user);
+        }
+    }
+
+    #[inline]
+    pub fn prefetch(&self, key: u64) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        let (bucket, _) = self.position(key);
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.buckets.as_ptr().add(bucket).cast());
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, key: u64) -> Option<u32> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        let (bucket, quotient) = self.position(key);
+        let words = &self.buckets[bucket];
+        let matches = unsafe {
+            use std::arch::x86_64::*;
+            let group = _mm512_load_si512(words.0.as_ptr().cast());
+            let keys = _mm512_and_si512(group, _mm512_set1_epi64(self.key_mask as i64));
+            _mm512_cmpeq_epi64_mask(keys, _mm512_set1_epi64(quotient as i64))
+        };
+        if matches != 0 {
+            Some((words.0[matches.trailing_zeros() as usize] >> self.value_shift) as u32)
+        } else {
+            self.overflow.get(&key).copied()
         }
     }
 }

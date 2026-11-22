@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use crate::ids::{
     self, Dictionary, FrozenDictionary, Id, IdentityHasher, Names, PackedDictionary, PackedNames,
-    Shard, SHARDS,
+    PackedPeople, Shard, SHARDS,
 };
 use crate::iface::*;
 use crate::{
@@ -43,7 +43,7 @@ struct Users {
     linked: FrozenDictionary,
     short: PackedDictionary,
     long: Dictionary,
-    linked_short: [sys::U64Map; SHARDS],
+    linked_short: [PackedPeople; SHARDS],
     roots: Vec<u32>,
     boundary: u32,
 }
@@ -52,7 +52,7 @@ impl Users {
     fn new(g: &G) -> Self {
         let (linked, roots) = links(g);
         let boundary = roots.len() as u32;
-        let maps: [Mutex<Option<sys::U64Map>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
+        let maps: [Mutex<Option<PackedPeople>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
         let next = AtomicUsize::new(0);
         sys::run_par(g.nt, |_| loop {
             let stripe = next.fetch_add(1, Ordering::Relaxed);

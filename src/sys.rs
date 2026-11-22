@@ -593,14 +593,6 @@ impl U64Map {
         (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & mask
     }
     #[inline]
-    pub fn prefetch(&self, k: u64) {
-        let index = Self::h(k, self.mask);
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch::<_MM_HINT_T0>(self.slots.as_ptr().add(index).cast());
-        }
-    }
-    #[inline]
     pub fn get(&self, k: u64) -> Option<u32> {
         let k1 = k + 1;
         let mut i = Self::h(k, self.mask);
