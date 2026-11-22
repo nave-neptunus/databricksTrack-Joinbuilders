@@ -1537,11 +1537,12 @@ struct Click {
     tag: u64,
     person: u32,
     ts: u32,
+    // The leading packed half avoids most pointer walks for long-v5 ties;
+    // the raw bytes settle the (exceptional) equal-half case exactly.
     id_hi: u64,
-    id_lo: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<Click>() == 32);
+const _: () = assert!(std::mem::size_of::<Click>() == 24);
 const CLICK_LONG: u32 = 1 << 31;
 
 impl Click {
@@ -1553,8 +1554,13 @@ impl Click {
     fn time(self) -> u32 { self.ts & !CLICK_LONG }
     #[inline]
     fn id_before(self, other: Self) -> bool {
-        if self.ts & other.ts & CLICK_LONG != 0 { (self.id_hi, self.id_lo) < (other.id_hi, other.id_lo) }
-        else { self.id() < other.id() }
+        if self.ts & other.ts & CLICK_LONG != 0 && self.id_hi != other.id_hi {
+            self.id_hi < other.id_hi
+        } else {
+            // Different shapes, and the equal-high-half long case, retain the
+            // exact raw-byte lexical ordering.
+            self.id() < other.id()
+        }
     }
 
     fn id(self) -> &'static [u8] {
@@ -2227,10 +2233,10 @@ fn fast(nova: bool) -> bool {
                 let Some(name) = pack_ref(user) else { coll.store(true, Relaxed); return; };
                 users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
-                let (id_hi, id_lo, ts) = match v5_hex_key(cid, b'k') {
-                    Some(hex) => (hex.hi, hex.lo, ts | CLICK_LONG), None => (0, 0, ts),
+                let (id_hi, ts) = match v5_hex_key(cid, b'k') {
+                    Some(hex) => (hex.hi, ts | CLICK_LONG), None => (0, ts),
                 };
-                batch.push(PendingClick { click: Click { tag, person: 0, ts, id_hi, id_lo }, key, check, name });
+                batch.push(PendingClick { click: Click { tag, person: 0, ts, id_hi }, key, check, name });
                 if batch.len() == 16 {
                     flush(&mut batch);
                 }
@@ -2442,7 +2448,7 @@ impl PartitionState {
         }
         // Retain the original event counts until the click scatter is done.
         // The prefix sums then become exclusive ends as records are placed.
-        clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0, id_hi: 0, id_lo: 0 });
+        clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0, id_hi: 0 });
         for &click in click_rows() {
             let person = (click.person >> PB) as usize;
             if event_ends[person] != 0 {
