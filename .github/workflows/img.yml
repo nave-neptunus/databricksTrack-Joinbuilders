@@ -1,0 +1,40 @@
+name: gum static image gate
+
+on:
+  push:
+    branches: [ci/gum-img]
+  workflow_dispatch:
+
+jobs:
+  image-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Fetch image branch SHAs
+        run: git fetch --all --tags
+      - name: Install exact-compare dependency
+        run: python3 -m pip install --disable-pip-version-check polars
+      - name: Build the supplied v5 generator and generate corpora
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q bench/assets/generator.zip -d "$HOME/gum-v5-generator"
+          cargo build --release --locked --manifest-path "$HOME/gum-v5-generator/generator/Cargo.toml"
+          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 1 --events 1000000 --clicks 250000 --output "$HOME/v5-1m" --threads 8
+          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads 8
+      - name: Build both images and compare canonical output
+        shell: bash
+        run: bash bench/img_gate.sh "$HOME" "$GITHUB_WORKSPACE/bench-work"
+      - name: Publish image evidence
+        if: always()
+        shell: bash
+        run: |
+          if test -f bench-work/summary.md; then cat bench-work/summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gum-img-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bench-work/
+          retention-days: 7
