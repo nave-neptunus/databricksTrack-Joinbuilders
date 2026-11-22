@@ -11,7 +11,7 @@ const LOOK: i64 = 7 * DAY;
 
 static mut T0: Option<Instant> = None;
 fn lap(name: &str) {
-    if std::env::var_os("TIMING").is_some() {
+    if crate::timing_enabled() {
         #[allow(static_mut_refs)]
         let t = unsafe { T0.unwrap() };
         eprintln!("{:8.1} ms  {}", t.elapsed().as_secs_f64() * 1000.0, name);
@@ -220,7 +220,9 @@ struct Ev {
 const SH: usize = 256;
 
 pub fn run() {
-    unsafe { T0 = Some(Instant::now()) };
+    if crate::timing_enabled() {
+        unsafe { T0 = Some(Instant::now()) };
+    }
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or("/output".into());
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);

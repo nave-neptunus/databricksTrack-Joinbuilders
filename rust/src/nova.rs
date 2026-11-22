@@ -911,7 +911,7 @@ impl Router {
     }
 
     fn route(&mut self, people: &[People], claims: &[ClaimStream], shard: usize) {
-        let begin = std::time::Instant::now();
+        let begin = crate::timing_enabled().then(std::time::Instant::now);
         let count: usize = claims.iter().map(|fold| fold.len(shard)).sum();
         if count == 0 {
             return;
@@ -959,7 +959,9 @@ impl Router {
                 }
             }
         }
-        self.route_ns += begin.elapsed().as_nanos() as u64;
+        if let Some(begin) = begin {
+            self.route_ns += begin.elapsed().as_nanos() as u64;
+        }
     }
 }
 
@@ -996,7 +998,7 @@ pub(super) fn run_events(
     )
     .into_iter()
     .for_each(|router| {
-        if std::env::var_os("TIMING").is_some() {
+        if crate::timing_enabled() {
             eprintln!("ROUTER tombstone={:.1}", router.route_ns as f64 / 1e6);
         }
     });
