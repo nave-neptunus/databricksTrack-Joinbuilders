@@ -139,7 +139,9 @@ jobs:
           set -euo pipefail
           work="$HOME/g7-final-safety"
           mkdir -p "$work"/empty-out "$work"/empty-scratch "$work"/real20-out "$work"/real20-scratch
-          chmod -R 777 "$work"
+          # Large-run outputs are owned by container UID 1000.  Do not recurse
+          # into them here; only open the newly-created timing targets.
+          chmod 777 "$work"/empty-out "$work"/empty-scratch "$work"/real20-out "$work"/real20-scratch
           docker_run() {
             data="$1"; out="$2"; scratch="$3"; err="$4"
             docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --memory 12g --memory-swap 12g --user 1000:1000 \
