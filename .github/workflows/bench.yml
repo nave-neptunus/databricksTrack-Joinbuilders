@@ -54,7 +54,8 @@ jobs:
           $G --seed 17 --events 60000000 --clicks 15000000 --output $HOME/v5-60m --threads 8
       - name: Gate and time
         if: steps.cpu.outputs.ok == 'true'
-        run: python3 bench/ci.py $HOME $GITHUB_WORKSPACE/bench-work $HOME/base/rust/target/release/rproto $HOME/bin/cand 2>&1 | tee ci.log
+        shell: bash
+        run: set -o pipefail; python3 bench/ci.py $HOME $GITHUB_WORKSPACE/bench-work $HOME/base/rust/target/release/rproto $HOME/bin/cand 2>&1 | tee ci.log
       - uses: actions/upload-artifact@v4
         if: always() && steps.cpu.outputs.ok == 'true'
         with:

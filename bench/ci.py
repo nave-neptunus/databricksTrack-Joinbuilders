@@ -59,7 +59,7 @@ def main():
         b, bms, bfb, _ = run(BASE_BIN, d, f"base-{size}")
         print(f"[{size}] cand {cms:.0f} ms fallback={cfb} | base {bms:.0f} ms", flush=True)
         if size == "1m":
-            r = subprocess.run([sys.executable, str(ROOT / "bench/compare.py"), str(c), str(next(exp.rglob("user_daily")).parent)], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, str(ROOT / "bench/compare.py"), str(c), str(exp / "dev-answer")], capture_output=True, text=True)
             print("1M vs dev-answer:", r.stdout.strip()[-200:], flush=True)
             if not r.stdout.rstrip().endswith("MATCH"):
                 FAILS.append("1m dev-answer mismatch")
