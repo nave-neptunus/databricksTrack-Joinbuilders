@@ -166,7 +166,10 @@ const RA_PIECE: usize = 16 << 20;
 
 impl ReadAhead {
     fn start(maps: Vec<&'static memmap2::Mmap>, paths: Vec<&'static str>) -> &'static ReadAhead {
-        let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        // The two four-thread CPU phases below deliberately occupy all eight
+        // scorer CPUs.  Parsing faults its mapped pages directly during that
+        // overlap; an additional read-ahead gang would only oversubscribe it.
+        let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let mut table = vec![];
         let mut ranges = vec![];
         for (m, path) in maps.iter().zip(&paths) {
@@ -1980,23 +1983,30 @@ fn fast(nova: bool) -> bool {
         total / ((1 << 16) / rows).max(1)
     });
     let est_users = estimated_rows / 12;
-    for b in &lkb {
-        ra.wait(b);
-    }
-    lap("  links read");
     let ids = ExactIds::new();
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, &ids, nova) else {
+    let ech = LazyChunks::new(&evb, 1 << 20);
+    let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
+    let coll = AtomicBool::new(false);
+    // Link construction publishes the only state event resolution needs.  The
+    // CSV scan itself is independent, so give each phase four CPUs and join
+    // before resolving people.  This keeps the overlap at eight busy threads.
+    let link_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let scan_pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let (links, scanned) = std::thread::scope(|scope| {
+        let scan = scope.spawn(|| scan_pool.install(|| nova::scan_events(&ech, ra, &input, &coll)));
+        let links = link_pool.install(|| build_links(&lkb, est_users, &ids, nova));
+        (links, scan.join().unwrap())
+    });
+    lap("  links + event scan");
+    let Some((mut ltab, nedges, nids, pname)) = links else {
         return false;
     };
-    let coll = AtomicBool::new(false);
     let users = Users::new(&mut ltab, nids, pname.len());
     lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Produce person partitions with exactly the retained, valid events.
-    let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs) = if nova {
-        let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll, estimated_rows) else {
+        let Some(result) = nova::finish_events(scanned, &users, &input, &pname, &coll, estimated_rows) else {
             return false;
         };
         result
