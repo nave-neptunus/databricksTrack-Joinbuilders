@@ -6,6 +6,9 @@ on:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { rep: [1,2,3,4,5,6] }
     timeout-minutes: 240
     env:
       BASE_SHA: 52f49502f44ad29e42c0d429c8ac8abf8d6cc2ab
@@ -14,19 +17,24 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 1 }
       - name: Runner info
+        id: cpu
         run: |
-          lscpu | grep -E 'Model name|Flags' | cut -c1-120
-          grep -qw avx512f /proc/cpuinfo && echo HAVE_AVX512 || { echo "NO AVX-512: fast path cannot run here"; exit 1; }
+          lscpu | grep -E 'Model name' | cut -c1-120
+          if grep -qw avx512f /proc/cpuinfo; then echo "ok=true" >> $GITHUB_OUTPUT; echo HAVE_AVX512; else echo "ok=false" >> $GITHUB_OUTPUT; echo "NO AVX-512: skipping"; fi
           nproc; df -h . | tail -1
       - name: Baseline source
+        if: steps.cpu.outputs.ok == 'true'
         run: |
           git fetch --depth=1 origin $BASE_SHA
           mkdir -p $HOME/base && git archive $BASE_SHA | tar -x -C $HOME/base
-      - run: python3 -m pip install --disable-pip-version-check polars
+      - if: steps.cpu.outputs.ok == 'true'
+        run: python3 -m pip install --disable-pip-version-check polars
       - name: Build baseline
+        if: steps.cpu.outputs.ok == 'true'
         run: |
           cd $HOME/base/rust && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked 2>&1 | tail -3
       - name: Build candidate fast + fallback (as the Dockerfile does)
+        if: steps.cpu.outputs.ok == 'true'
         run: |
           rustup target add x86_64-unknown-linux-musl
           cargo test --release --target x86_64-unknown-linux-gnu --locked -- v5 2>&1 | tail -15 || true
@@ -36,6 +44,7 @@ jobs:
           sudo chmod 0755 /fallback
           mkdir -p $HOME/bin && cp target/x86_64-unknown-linux-musl/release/pipeline $HOME/bin/cand
       - name: Generate v5 corpora
+        if: steps.cpu.outputs.ok == 'true'
         run: |
           unzip -q bench/assets/generator.zip -d $HOME/gen
           cargo build --release --locked --manifest-path $HOME/gen/generator/Cargo.toml 2>&1 | tail -1
@@ -44,7 +53,8 @@ jobs:
           $G --seed 17 --events 20000000 --clicks 5000000 --output $HOME/v5-20m --threads 8
           $G --seed 17 --events 60000000 --clicks 15000000 --output $HOME/v5-60m --threads 8
       - name: Gate and time
+        if: steps.cpu.outputs.ok == 'true'
         run: python3 bench/ci.py $HOME $GITHUB_WORKSPACE/bench-work $HOME/base/rust/target/release/rproto $HOME/bin/cand 2>&1 | tee ci.log
       - uses: actions/upload-artifact@v4
-        if: always()
-        with: { name: express-logs, path: "bench-work/logs/", retention-days: 5 }
+        if: always() && steps.cpu.outputs.ok == 'true'
+        with: { name: express-logs-${{ matrix.rep }}, path: "bench-work/logs/", retention-days: 5 }
