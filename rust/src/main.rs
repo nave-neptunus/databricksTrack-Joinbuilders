@@ -2452,6 +2452,10 @@ impl PartitionState {
         // former ascending-person order without scanning every person in each
         // partition, while the sparse reset above avoids zero-filling them.
         grouped_people.sort_unstable();
+        // After prefixing, the first grouped person's cursor is zero, just
+        // like an untouched person. Keep its ID to retain the event-membership
+        // check while scattering clicks.
+        let first_grouped = grouped_people.first().copied();
         let (mut event_total, mut click_total) = (0, 0);
         for &person in grouped_people.iter() {
             let person = person as usize;
@@ -2463,7 +2467,7 @@ impl PartitionState {
         clicks.resize(click_total, Click { tag: 0, person: 0, ts: 0 });
         for &click in click_rows() {
             let person = (click.person >> PB) as usize;
-            if event_ends[person] != 0 {
+            if event_ends[person] != 0 || first_grouped == Some(person as u32) {
                 let next = &mut click_ends[person];
                 clicks[*next] = click;
                 *next += 1;
