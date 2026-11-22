@@ -79,11 +79,11 @@ jobs:
           path: ${{ runner.temp }}/image
       - name: Load cached baseline image
         run: zstd -dc "$RUNNER_TEMP"/image/*.tar.zst | docker load
-      - name: Final-scale correctness, fallback check, and fixed-overhead timings
+      - name: Final-scale correctness and fallback check
         run: |
           set -euo pipefail
           work="$HOME/g7-final-safety"
-          mkdir -p "$work"/large-ref "$work"/large-ref-scratch "$work"/large-fast "$work"/large-fast-scratch "$work"/empty-out "$work"/empty-scratch "$work"/real20-out "$work"/real20-scratch
+          mkdir -p "$work"/large-ref "$work"/large-ref-scratch "$work"/large-fast "$work"/large-fast-scratch
           chmod -R 777 "$work"
           docker_run() {
             entry="$1"; data="$2"; out="$3"; scratch="$4"; err="$5"
@@ -105,17 +105,6 @@ jobs:
           final_engine=$(sed -n 's/.*exit at \([0-9.]*\) ms.*/\1/p' "$work/final.stderr" | tail -1)
           final_rss=$(sed -n 's/.*peak_rss_kb=\([0-9]*\).*/\1/p' "$work/final.stderr" | tail -1)
           test -n "$final_engine"; test -n "$final_rss"
-          # Scratch image has no /bin/true. Supply only the mandatory lookup
-          # files and empty event/click/link directories as the clean proxy.
-          empty="$work/empty-input"; mkdir -p "$empty/events" "$empty/clicks" "$empty/links"
-          cp "$HOME/big20/products.csv" "$empty/products.csv"
-          cp "$HOME/big20/campaigns.csv" "$empty/campaigns.csv"
-          begin=$(date +%s%N); docker_run /pipeline "$empty" "$work/empty-out" "$work/empty-scratch" "$work/empty.stderr"; end=$(date +%s%N)
-          empty_s=$(seconds "$begin" "$end")
-          find "$HOME/big20" -type f -exec cat {} + >/dev/null
-          begin=$(date +%s%N); docker_run /pipeline "$HOME/big20" "$work/real20-out" "$work/real20-scratch" "$work/real20.stderr"; end=$(date +%s%N)
-          real20_s=$(seconds "$begin" "$end")
-          real20_engine=$(sed -n 's/.*exit at \([0-9.]*\) ms.*/\1/p' "$work/real20.stderr" | tail -1)
           cat > "$work/summary.md" <<EOF
           # Final safety measurement
           final_events=$FINAL_EVENTS final_clicks=$FINAL_CLICKS seed=17 disk_gb_before=$FINAL_DISK_GB_BEFORE
@@ -125,7 +114,59 @@ jobs:
           final_peak_rss_kb=$final_rss
           final_exact_output=MATCH
           final_fallback_line=ABSENT
+          EOF
+          cat "$work/summary.md"
+      - name: AVX-512 disassembly audit (baseline and lanes8)
+        run: |
+          set -euo pipefail
+          work="$HOME/g7-final-safety"
+          audit_one() {
+            sha="$1"; tag="$2"; name="$3"
+            if [ "$tag" != g7-bench-baseline ]; then
+              git archive --format=tar "$sha" | docker build --platform linux/amd64 --load --tag "$tag" -
+            fi
+            cid=$(docker create "$tag")
+            docker cp "$cid:/pipeline" "$work/$name.pipeline"
+            docker rm "$cid"
+            objdump -d --no-show-raw-insn --demangle "$work/$name.pipeline" > "$work/$name.objdump"
+            python3 bench/avx512_audit.py --commit "$sha" --objdump "$work/$name.objdump" --output "$work/$name-avx512.md"
+            cat "$work/$name-avx512.md"
+          }
+          audit_one ed40599 g7-bench-baseline ed40599
+          audit_one 6fafb87 g7-bench-lanes8 6fafb87
+      - name: Fixed container overhead after audit
+        run: |
+          set -euo pipefail
+          work="$HOME/g7-final-safety"
+          mkdir -p "$work"/empty-out "$work"/empty-scratch "$work"/real20-out "$work"/real20-scratch
+          chmod -R 777 "$work"
+          docker_run() {
+            data="$1"; out="$2"; scratch="$3"; err="$4"
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges --memory 12g --memory-swap 12g --user 1000:1000 \
+              -v "$data:/data:ro" -v "$out:/output" -v "$scratch:/scratch" \
+              -e "NCPU=$NCPU" -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e XL_TIMING=1 \
+              --entrypoint /pipeline g7-bench-baseline 2>"$err"
+          }
+          seconds() { awk -v a="$1" -v b="$2" 'BEGIN {printf "%.6f", (b-a)/1000000000}'; }
+          # The scratch image deliberately has neither /bin/true nor a shell.
+          # An empty DATA_DIR makes /pipeline fail during its first lookup; it
+          # is still the closest start->exit proxy available in this image.
+          empty="$work/empty-input"; mkdir -p "$empty"
+          begin=$(date +%s%N)
+          set +e
+          docker_run "$empty" "$work/empty-out" "$work/empty-scratch" "$work/empty.stderr"
+          empty_exit=$?
+          set -e
+          end=$(date +%s%N)
+          empty_s=$(seconds "$begin" "$end")
+          find "$HOME/big20" -type f -exec cat {} + >/dev/null
+          begin=$(date +%s%N); docker_run "$HOME/big20" "$work/real20-out" "$work/real20-scratch" "$work/real20.stderr"; end=$(date +%s%N)
+          real20_s=$(seconds "$begin" "$end")
+          real20_engine=$(sed -n 's/.*exit at \([0-9.]*\) ms.*/\1/p' "$work/real20.stderr" | tail -1)
+          test -n "$real20_engine"
+          cat >> "$work/summary.md" <<EOF
           empty_input_container_seconds=$empty_s
+          empty_input_exit_code=$empty_exit
           warm_20m_container_seconds=$real20_s
           warm_20m_engine_ms=$real20_engine
           EOF
@@ -140,4 +181,5 @@ jobs:
             ~/g7-final-safety/summary.md
             ~/g7-final-safety/*.stderr
             ~/g7-final-safety/compare.txt
+            ~/g7-final-safety/*-avx512.md
           retention-days: 7
