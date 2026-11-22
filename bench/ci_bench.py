@@ -52,7 +52,9 @@ def build(sha):
 
 def cargo_test(sha):
     source, target = source_for(sha), WORK / "target-test" / sha
-    call(["cargo", "test", "--locked", "--manifest-path", str(source / "rust/Cargo.toml")], env=dict(os.environ, CARGO_TARGET_DIR=str(target)))
+    # AVX2/BMI2 scanner tests are cfg(target_feature) gated: build them like the image does.
+    env = dict(os.environ, RUSTFLAGS="-C target-cpu=x86-64-v3", CARGO_TARGET_DIR=str(target))
+    call(["cargo", "test", "--release", "--locked", "--manifest-path", str(source / "rust/Cargo.toml")], env=env)
 
 
 def fresh(path):
