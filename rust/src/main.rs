@@ -1582,6 +1582,21 @@ impl Click {
     }
 }
 
+#[cfg(test)]
+mod click_tag_tests {
+    use super::*;
+
+    #[test]
+    fn long_click_tag_does_not_change_time_or_tie_order() {
+        let first = Click { tag: 0, person: 0, ts: CLICK_LONG | 17, id_hi: 3 };
+        let second = Click { tag: 0, person: 0, ts: CLICK_LONG | 17, id_hi: 4 };
+        assert_eq!(first.time(), 17);
+        assert_eq!(second.time(), 17);
+        assert!(first.id_before(second));
+        assert!(!second.id_before(first));
+    }
+}
+
 struct PendingClick {
     click: Click,
     key: u64,
