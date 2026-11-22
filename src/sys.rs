@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 extern "C" {
     pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    pub fn readahead(fd: i32, off: i64, count: usize) -> isize;
     pub fn _exit(code: i32) -> !;
     fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> i32;
     static environ: *const *const c_char;

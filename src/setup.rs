@@ -413,6 +413,7 @@ pub fn setup(data: &str, outdir: &str, nt: usize, check: bool) -> G {
         files,
         queue,
         qnext: AtomicUsize::new(0),
+        ra_done: AtomicUsize::new(0),
         ev_bytes,
         row_cap,
         nb,

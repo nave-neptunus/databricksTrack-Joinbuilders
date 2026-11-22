@@ -1985,6 +1985,49 @@ fn work_queue_build(g: &G) -> Vec<Chunk> {
     }
 }
 
+pub fn start_readahead(g: &'static G) {
+    if std::env::var("XL_RA").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let n = std::env::var("XL_RA_THR").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).min(8);
+    let win = std::env::var("XL_RA_WIN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) << 20;
+    #[allow(static_mut_refs)]
+    let fds = unsafe { FDS.clone() };
+    let (q, _) = work_queue(g);
+    let mut pieces = Vec::new();
+    let mut planned = 0usize;
+    let mut i = 0;
+    while i < q.len() {
+        let c = q[i];
+        let f = c.file as usize;
+        let mut end = c.b;
+        i += 1;
+        while i < q.len() && q[i].file as usize == f && q[i].b - c.a <= 32 << 20 {
+            end = q[i].b;
+            i += 1;
+        }
+        let off = c.a & !4095;
+        let len = (end - off).min(32 << 20);
+        pieces.push((fds.get(f).copied().unwrap_or(-1), off, len, planned));
+        planned = planned.saturating_add(end - c.a);
+    }
+    let pieces: &'static [(i32, usize, usize, usize)] = Box::leak(pieces.into_boxed_slice());
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..n {
+        let next = next.clone();
+        std::thread::spawn(move || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(&(fd, off, len, gate)) = pieces.get(i) else { break };
+            while gate > g.ra_done.load(Ordering::Acquire).saturating_add(win) {
+                std::thread::yield_now();
+            }
+            if fd >= 0 {
+                unsafe { crate::sys::readahead(fd, off as i64, len) };
+            }
+        });
+    }
+}
+
 #[inline(always)]
 fn parse_buf(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, out: &mut Out, tb: &'static Tabs, tid: usize, f: &FileInfo, buf: &[u8], s: usize) {
     let mut ctx = Ctx { g, t, eb, cb, out, tabs: tb, tid: tid as u64, base: (f.off + s) as u64, fend: (f.off + f.len) as u64 };
@@ -2147,6 +2190,7 @@ pub fn stage1(g: &G, tid: usize) {
             first = false;
         }
         let c = q[i];
+        g.ra_done.fetch_add(c.b - c.a, Ordering::Release);
         let f = &g.files[c.file as usize];
         if use_rd && fds[c.file as usize] >= 0 {
             unsafe { chunk_rd(g, &mut *t, &mut eb, &mut cb, &mut out, tb, tid, f, &c, fds[c.file as usize], rb, rd) };
