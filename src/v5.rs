@@ -92,8 +92,9 @@ impl Users {
     #[inline]
     fn prefetch(&self, id: u64) {
         if id & ID_ODD == 0 {
-            let stripe = ids::shard(Id::Short(id).hash());
-            self.linked_short[stripe].prefetch(id);
+            let hash = Id::Short(id).hash();
+            self.linked_short[ids::shard(hash)].prefetch(id);
+            self.short.prefetch(hash);
         }
     }
 
@@ -230,6 +231,7 @@ struct Scan<'a> {
     user_values: [u32; USER_CACHE],
     claims: parse::Part,
     people: PersonEvents,
+    people_arena: &'a sys::Arena,
     worker: u32,
     clicks: [Vec<Click>; SHARDS],
     ev: Box<EvBatch>,
@@ -283,21 +285,25 @@ const PERSON_WORKER_SHIFT: u32 = 28;
 const PERSON_WORKER_MASK: u32 = (1 << PERSON_WORKER_SHIFT) - 1;
 
 struct PersonBlock {
-    rows: Box<[MaybeUninit<PersonEvent>]>,
+    rows: *mut MaybeUninit<PersonEvent>,
     len: usize,
 }
 
+// Rows live in a shared arena that outlives every Parsed value.
+unsafe impl Send for PersonBlock {}
+unsafe impl Sync for PersonBlock {}
+
 impl PersonBlock {
-    fn new() -> Self {
+    fn new(arena: &sys::Arena) -> Self {
         Self {
-            rows: Box::new_uninit_slice(PERSON_BLOCK_ROWS),
+            rows: arena.alloc(PERSON_BLOCK_ROWS * std::mem::size_of::<PersonEvent>()).cast(),
             len: 0,
         }
     }
 
     fn as_slice(&self) -> &[PersonEvent] {
         // Exactly the first len rows are initialized by PersonEvents::push.
-        unsafe { std::slice::from_raw_parts(self.rows.as_ptr().cast(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.rows.cast(), self.len) }
     }
 }
 
@@ -315,7 +321,7 @@ impl PersonEvents {
     }
 
     #[inline]
-    fn push(&mut self, worker: u32, event: PersonEvent) -> u32 {
+    fn push(&mut self, arena: &sys::Arena, worker: u32, event: PersonEvent) -> u32 {
         let bucket = &mut self.buckets[event.user as usize >> UB];
         let block = match bucket.last().copied() {
             Some(block) if self.blocks[block as usize].len < PERSON_BLOCK_ROWS => block,
@@ -324,14 +330,14 @@ impl PersonEvents {
                 if block >= (1 << (PERSON_WORKER_SHIFT - PERSON_BLOCK_SHIFT)) {
                     sys::fallback("worker exceeds event locator capacity");
                 }
-                self.blocks.push(PersonBlock::new());
+                self.blocks.push(PersonBlock::new(arena));
                 bucket.push(block);
                 block
             }
         };
         let dst = &mut self.blocks[block as usize];
         let index = dst.len;
-        dst.rows[index].write(event);
+        unsafe { (*dst.rows.add(index)).write(event) };
         dst.len += 1;
         let loc = worker << PERSON_WORKER_SHIFT | block << PERSON_BLOCK_SHIFT | index as u32;
         if loc == NO_PAYLOAD {
@@ -433,6 +439,7 @@ impl Scan<'_> {
             };
             let w0 = rel << 33 | (r.price as u64) << 9 | cat << 4;
             loc = self.people.push(
+                self.people_arena,
                 self.worker,
                 PersonEvent {
                     w0: AtomicU64::new(w0),
@@ -553,7 +560,7 @@ fn scan_reserve(g: &G, kind: Kind, stripes: usize) -> usize {
     (bytes / average).div_ceil(stripes * g.nt) * 5 / 4
 }
 
-fn scan(g: &G, users: &Users, arena: &sys::Arena) -> Vec<Parsed> {
+fn scan(g: &G, users: &Users, arena: &sys::Arena, people_arena: &sys::Arena) -> Vec<Parsed> {
     let click_reserve = scan_reserve(g, Kind::Ck, SHARDS);
     let workers: Vec<_> = (0..g.nt).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
@@ -576,6 +583,7 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena) -> Vec<Parsed> {
             user_values: [0; USER_CACHE],
             claims: parse::Part::new(arena, EVENT_SHARDS),
             people: PersonEvents::new(g.nub),
+            people_arena,
             worker: tid as u32,
             clicks: std::array::from_fn(|_| Vec::with_capacity(click_reserve)),
             ev: EvBatch::new(),
@@ -916,7 +924,12 @@ pub fn stage1(g: &mut G) {
     sys::lap("link_ids");
     let claim_arena =
         sys::Arena::new(g.ecap as usize * 16 + g.nt * (EVENT_SHARDS * parse::CHUNK + (2 << 20)));
-    let parsed = scan(g, &users, &claim_arena);
+    let people_arena = sys::Arena::new(
+        g.ecap as usize * std::mem::size_of::<PersonEvent>()
+            + g.nt * g.nub * PERSON_BLOCK_ROWS * std::mem::size_of::<PersonEvent>()
+            + (2 << 20),
+    );
+    let parsed = scan(g, &users, &claim_arena, &people_arena);
     sys::lap("scan_ids");
     unsafe {
         for (i, name) in ["x.thr_loop", "x.resolve_ev", "x.resolve_ck", "x.claims_finish", "x.ev_person", "x.ev_ppush", "x.ev_claim"].into_iter().enumerate() {
@@ -930,6 +943,7 @@ pub fn stage1(g: &mut G) {
     sys::lap("dedup_ids");
     order_events(g, &parsed);
     sys::lap("order_events");
+    sys::run_par(g.nt, |tid| people_arena.release_part(tid, g.nt));
     g.ids = Some(Dictionaries {
         users: users.into_names(),
         clicks,

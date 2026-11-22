@@ -407,7 +407,7 @@ impl PackedPeople {
 
 #[repr(align(128))]
 struct AtomicStripe {
-    slots: Box<[AtomicU64]>,
+    slots: &'static [AtomicU64],
     next: AtomicU32,
 }
 
@@ -416,8 +416,11 @@ pub struct PackedDictionary([AtomicStripe; SHARDS]);
 impl PackedDictionary {
     pub fn new(capacity: usize) -> Self {
         let slots = (2 * capacity.div_ceil(SHARDS)).next_power_of_two().max(64);
-        Self(std::array::from_fn(|_| AtomicStripe {
-            slots: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+        // One zeroed huge-page region (never freed) backs every stripe, so
+        // random probes cost one TLB entry per 2 MB instead of per 4 KB.
+        let base = crate::sys::anon(SHARDS * slots * 8) as *const AtomicU64;
+        Self(std::array::from_fn(|i| AtomicStripe {
+            slots: unsafe { std::slice::from_raw_parts(base.add(i * slots), slots) },
             next: AtomicU32::new(0),
         }))
     }
@@ -460,11 +463,21 @@ impl PackedDictionary {
         }
     }
 
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        let table = &self.0[shard(hash)];
+        let slot = hash as usize & (table.slots.len() - 1);
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(table.slots.as_ptr().add(slot).cast());
+        }
+    }
+
     pub fn into_names(self) -> PackedNames {
         PackedNames(self.0.map(|stripe| {
             let mut keys = vec![0; stripe.next.into_inner() as usize];
             for slot in stripe.slots {
-                let word = slot.into_inner();
+                let word = slot.load(Relaxed);
                 if word != 0 {
                     keys[(word >> 48) as usize - 1] = word & SHORT_MASK;
                 }
