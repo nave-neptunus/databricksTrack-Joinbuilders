@@ -190,6 +190,7 @@ pub struct G {
     pub files: Vec<FileInfo>,
     pub queue: Vec<Chunk>,
     pub qnext: AtomicUsize,
+    pub ra_done: AtomicUsize,
     pub ev_bytes: usize,
     pub row_cap: usize,
     pub nb: usize,
@@ -386,6 +387,7 @@ fn main() {
         links::sort_bench(g);
         unsafe { sys::_exit(0) };
     }
+    parse::start_readahead(g);
     {
         let gr: &G = g;
         run_par(nt, |tid| parse::stage1(gr, tid));
