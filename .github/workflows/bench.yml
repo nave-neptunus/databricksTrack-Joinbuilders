@@ -13,7 +13,6 @@ jobs:
       NCPU: '8'
       TIMING: '1'
       GLIBC_TUNABLES: glibc.malloc.hugetlb=1
-      PROFILE_ROOT: ${{ runner.temp }}/gum-profile
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -26,6 +25,7 @@ jobs:
           grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || { echo 'AMD/non-Intel runner refused' >&2; exit 1; }
           grep -qw avx512f /proc/cpuinfo || { echo 'AVX-512F unavailable' >&2; exit 1; }
           test "$(nproc)" -ge 4 || { echo "Need 4+ vCPUs, got $(nproc)" >&2; exit 1; }
+          echo "PROFILE_ROOT=$RUNNER_TEMP/gum-profile" >> "$GITHUB_ENV"
           mkdir -p bench-work
           lscpu > bench-work/host.txt
           uname -r >> bench-work/host.txt
@@ -68,7 +68,7 @@ jobs:
           retention-days: 7
 
       - name: Profile v5 seed 17 at 60M
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.PROFILE_ROOT != '' }}
         shell: bash
         run: |
           set -euo pipefail
