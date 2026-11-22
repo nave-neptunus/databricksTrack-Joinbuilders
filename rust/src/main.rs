@@ -2274,6 +2274,9 @@ fn pt<I, T: Send>(items: impl ParallelIterator<Item = I>, init: impl Fn() -> T +
     slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
 }
 
+/// Partitions with at most this many event records skip the gather copy.
+const GATHER_BYPASS_ROWS: usize = 1 << 18;
+
 struct PartitionState {
     cd: Vec<[i64; 4]>,
     counts: Vec<u32>,
@@ -2336,26 +2339,41 @@ impl PartitionState {
         // Count and capture the payload in one traversal of the EvP records.
         // Plain nested loops (not flattened iterators) keep this tight.
         let total: usize = event_folds.iter().map(|fold| fold.len(partition)).sum();
+        // Small and medium partitions stay in cache, so a second walk over the
+        // EvP records is cheaper than writing and re-reading a gather copy.
+        let bypass = total <= GATHER_BYPASS_ROWS;
         gather.clear();
-        gather.reserve(total);
-        let base = gather.as_mut_ptr();
-        let mut n = 0;
-        for fold in event_folds {
-            for records in fold.records(partition) {
-                for record in records {
-                    let ts = record.ts.load(Relaxed);
-                    if ts == TOMBSTONE {
-                        continue;
+        if bypass {
+            for fold in event_folds {
+                for records in fold.records(partition) {
+                    for record in records {
+                        if record.ts.load(Relaxed) != TOMBSTONE {
+                            event_ends[(record.person >> PB) as usize] += 1;
+                        }
                     }
-                    let person = record.person >> PB;
-                    // n < total <= capacity: every record is visited once.
-                    unsafe { base.add(n).write((person, (u64::from(ts) << 32) | u64::from(record.price))) };
-                    n += 1;
-                    event_ends[person as usize] += 1;
                 }
             }
+        } else {
+            gather.reserve(total);
+            let base = gather.as_mut_ptr();
+            let mut n = 0;
+            for fold in event_folds {
+                for records in fold.records(partition) {
+                    for record in records {
+                        let ts = record.ts.load(Relaxed);
+                        if ts == TOMBSTONE {
+                            continue;
+                        }
+                        let person = record.person >> PB;
+                        // n < total <= capacity: every record is visited once.
+                        unsafe { base.add(n).write((person, (u64::from(ts) << 32) | u64::from(record.price))) };
+                        n += 1;
+                        event_ends[person as usize] += 1;
+                    }
+                }
+            }
+            unsafe { gather.set_len(n) };
         }
-        unsafe { gather.set_len(n) };
         for fold in click_folds {
             for chunk in fold.chunks(partition) {
                 for click in chunk {
@@ -2381,10 +2399,25 @@ impl PartitionState {
         }
         events.resize(prefix_starts(event_ends), 0);
         // The prefix sums in event_ends are now exclusive write cursors.
-        for &(person, payload) in gather.iter() {
-            let next = &mut event_ends[person as usize];
-            events[*next] = payload;
-            *next += 1;
+        if bypass {
+            for fold in event_folds {
+                for records in fold.records(partition) {
+                    for record in records {
+                        let ts = record.ts.load(Relaxed);
+                        if ts != TOMBSTONE {
+                            let next = &mut event_ends[(record.person >> PB) as usize];
+                            events[*next] = (u64::from(ts) << 32) | u64::from(record.price);
+                            *next += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            for &(person, payload) in gather.iter() {
+                let next = &mut event_ends[person as usize];
+                events[*next] = payload;
+                *next += 1;
+            }
         }
     }
 
