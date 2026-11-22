@@ -259,6 +259,151 @@ impl Dictionary {
     }
 }
 
+// Lock-free interning for long IDs. A slot packs a 16-bit tag and a 1-based
+// local index; entries[local] packs a pointer and length of the stored bytes.
+// New keys are copied into per-thread bump chunks, so the table never moves.
+const LONG_PENDING: u64 = u32::MAX as u64;
+const LONG_CHUNK: usize = 1 << 20;
+
+struct LongStripe {
+    slots: &'static [AtomicU64],
+    entries: &'static [AtomicU64],
+    next: AtomicU32,
+}
+
+pub struct LongDictionary {
+    stripes: Vec<LongStripe>,
+    arena: crate::sys::Arena,
+}
+
+pub struct LongSink {
+    cur: *mut u8,
+    end: *mut u8,
+}
+
+impl LongSink {
+    pub fn new() -> Self {
+        Self { cur: std::ptr::null_mut(), end: std::ptr::null_mut() }
+    }
+}
+
+impl LongDictionary {
+    pub fn new(max_users: usize, byte_cap: usize) -> Self {
+        let slots = (2 * max_users.div_ceil(SHARDS)).next_power_of_two().max(1024);
+        let cap = slots / 2;
+        let base = crate::sys::anon(SHARDS * (slots + cap) * 8) as *const AtomicU64;
+        let stripes = (0..SHARDS)
+            .map(|i| unsafe {
+                let at = base.add(i * (slots + cap));
+                LongStripe {
+                    slots: std::slice::from_raw_parts(at, slots),
+                    entries: std::slice::from_raw_parts(at.add(slots), cap),
+                    next: AtomicU32::new(0),
+                }
+            })
+            .collect();
+        Self { stripes, arena: crate::sys::Arena::new(byte_cap + (64 << 20)) }
+    }
+
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        let table = &self.stripes[shard(hash)];
+        let slot = hash as usize & (table.slots.len() - 1);
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(table.slots.as_ptr().add(slot).cast());
+        }
+    }
+
+    fn store(&self, sink: &mut LongSink, bytes: &[u8]) -> u64 {
+        if bytes.len() > u16::MAX as usize {
+            fallback("ID too long");
+        }
+        if (sink.end as usize - sink.cur as usize) < bytes.len() {
+            let n = bytes.len().max(LONG_CHUNK);
+            sink.cur = self.arena.alloc(n);
+            sink.end = unsafe { sink.cur.add(n) };
+        }
+        let at = sink.cur;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len());
+            sink.cur = at.add(bytes.len());
+        }
+        (at as u64) << 16 | bytes.len() as u64
+    }
+
+    pub fn intern(&self, bytes: &[u8], hash: u64, sink: &mut LongSink) -> u32 {
+        let stripe = shard(hash);
+        let table = &self.stripes[stripe];
+        let mask = table.slots.len() - 1;
+        let tag = hash >> 48;
+        let start = hash as usize & mask;
+        let mut slot = start;
+        loop {
+            let cell = &table.slots[slot];
+            let mut word = cell.load(std::sync::atomic::Ordering::Acquire);
+            if word == 0 {
+                match cell.compare_exchange(
+                    0,
+                    tag << 48 | LONG_PENDING,
+                    std::sync::atomic::Ordering::Acquire,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        let local = table.next.fetch_add(1, Relaxed) as usize;
+                        if local >= table.entries.len() || local >= (1 << (32 - BITS)) - 1 {
+                            fallback("long user shard exceeds capacity");
+                        }
+                        table.entries[local].store(self.store(sink, bytes), Relaxed);
+                        cell.store(tag << 48 | (local as u64 + 1), std::sync::atomic::Ordering::Release);
+                        return ((local as u32) << BITS) | stripe as u32;
+                    }
+                    Err(current) => word = current,
+                }
+            }
+            if word >> 48 == tag {
+                while word & 0xFFFF_FFFF == LONG_PENDING {
+                    std::hint::spin_loop();
+                    word = cell.load(std::sync::atomic::Ordering::Acquire);
+                }
+                let local = (word & 0xFFFF_FFFF) as usize - 1;
+                let entry = table.entries[local].load(Relaxed);
+                let stored = unsafe {
+                    std::slice::from_raw_parts((entry >> 16) as *const u8, (entry & 0xFFFF) as usize)
+                };
+                if stored == bytes {
+                    return ((local as u32) << BITS) | stripe as u32;
+                }
+            }
+            slot = (slot + 1) & mask;
+            if slot == start {
+                fallback("long user shard is full");
+            }
+        }
+    }
+
+    pub fn into_names(self) -> LongNames {
+        let counts = self.stripes.iter().map(|s| s.next.load(Relaxed) as usize).collect();
+        LongNames { stripes: self.stripes, counts, _arena: self.arena }
+    }
+}
+
+pub struct LongNames {
+    stripes: Vec<LongStripe>,
+    counts: Vec<usize>,
+    _arena: crate::sys::Arena,
+}
+
+impl LongNames {
+    pub fn bytes<'a>(&'a self, index: u32, _prefix: u8, _buf: &'a mut [u8; 9]) -> &'a [u8] {
+        let stripe = index as usize & (SHARDS - 1);
+        let local = (index >> BITS) as usize;
+        assert!(local < self.counts[stripe]);
+        let entry = self.stripes[stripe].entries[local].load(Relaxed);
+        unsafe { std::slice::from_raw_parts((entry >> 16) as *const u8, (entry & 0xFFFF) as usize) }
+    }
+}
+
 pub struct FrozenDictionary([Shard; SHARDS]);
 
 impl FrozenDictionary {

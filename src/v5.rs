@@ -19,7 +19,7 @@ pub struct Dictionaries {
 pub struct UserNames {
     linked: Names,
     short: PackedNames,
-    long: Names,
+    long: ids::LongNames,
     boundary: u32,
 }
 
@@ -41,7 +41,7 @@ impl UserNames {
 struct Users {
     linked: FrozenDictionary,
     short: PackedDictionary,
-    long: Dictionary,
+    long: ids::LongDictionary,
     linked_short: [PackedPeople; SHARDS],
     roots: Vec<u32>,
     boundary: u32,
@@ -63,7 +63,10 @@ impl Users {
         Self {
             linked,
             short: PackedDictionary::new((g.ucap as usize - boundary as usize) / 2),
-            long: Dictionary::new(),
+            long: ids::LongDictionary::new(
+                g.ucap as usize - boundary as usize,
+                (g.ucap as usize * 128).max(64 << 20),
+            ),
             linked_short: maps.map(|m| m.into_inner().unwrap().unwrap()),
             roots,
             boundary,
@@ -71,7 +74,7 @@ impl Users {
     }
 
     #[inline]
-    fn person(&self, id: Id<'_>, hash: u64) -> u32 {
+    fn person(&self, id: Id<'_>, hash: u64, sink: &mut ids::LongSink) -> u32 {
         let linked = match id {
             Id::Short(key) => self.linked_short[ids::shard(hash)].get(key),
             Id::Long(_) => self
@@ -82,7 +85,7 @@ impl Users {
         linked.unwrap_or_else(|| {
             let index = match id {
                 Id::Short(key) => self.short.intern(key, hash) as u64 * 2,
-                Id::Long(_) => self.long.intern(id, hash).0 as u64 * 2 + 1,
+                Id::Long(bytes) => self.long.intern(bytes, hash, sink) as u64 * 2 + 1,
             };
             u32::try_from(index + self.boundary as u64)
                 .unwrap_or_else(|_| sys::fallback("IDs exceed user index capacity"))
@@ -90,11 +93,17 @@ impl Users {
     }
 
     #[inline]
-    fn prefetch(&self, id: u64) {
+    fn prefetch(&self, g: &G, base: usize, id: u64) {
         if id & ID_ODD == 0 {
             let hash = Id::Short(id).hash();
             self.linked_short[ids::shard(hash)].prefetch(id);
             self.short.prefetch(hash);
+        } else if id != ID_EMPTY && odd_len(id) != 255 {
+            let key = id_at(g, id, base);
+            let hash = key.hash();
+            self.long.prefetch(hash);
+            // Warm the frozen table's probe path; the result is discarded.
+            std::hint::black_box(self.linked.lookup(key, hash));
         }
     }
 
@@ -232,6 +241,7 @@ struct Scan<'a> {
     claims: parse::Part,
     people: PersonEvents,
     people_arena: &'a sys::Arena,
+    sink: ids::LongSink,
     worker: u32,
     clicks: [Vec<Click>; SHARDS],
     ev: Box<EvBatch>,
@@ -414,8 +424,8 @@ impl Scan<'_> {
     }
 
     #[inline]
-    fn intern_person(&self, key: Id<'_>, hash: u64) -> u32 {
-        let person = self.users.person(key, hash);
+    fn intern_person(&mut self, key: Id<'_>, hash: u64) -> u32 {
+        let person = self.users.person(key, hash, &mut self.sink);
         if person as u64 >= self.g.ucap {
             sys::fallback("IDs exceed user capacity");
         }
@@ -515,11 +525,11 @@ impl EventSink for Scan<'_> {
         self.n_ev += n as u64;
         const LOOKAHEAD: usize = 12;
         for &id in &self.ev.uid[..n.min(LOOKAHEAD)] {
-            self.users.prefetch(id);
+            self.users.prefetch(self.g, self.base, id);
         }
         for i in 0..n {
             if i + LOOKAHEAD < n {
-                self.users.prefetch(self.ev.uid[i + LOOKAHEAD]);
+                self.users.prefetch(self.g, self.base, self.ev.uid[i + LOOKAHEAD]);
             }
             self.event_row(self.ev.row(i));
         }
@@ -538,11 +548,11 @@ impl ClickSink for Scan<'_> {
         self.n_ck += n as u64;
         const LOOKAHEAD: usize = 12;
         for &id in &self.ck.uid[..n.min(LOOKAHEAD)] {
-            self.users.prefetch(id);
+            self.users.prefetch(self.g, self.base, id);
         }
         for i in 0..n {
             if i + LOOKAHEAD < n {
-                self.users.prefetch(self.ck.uid[i + LOOKAHEAD]);
+                self.users.prefetch(self.g, self.base, self.ck.uid[i + LOOKAHEAD]);
             }
             self.click_row(self.ck.row(i));
         }
@@ -597,6 +607,7 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena, people_arena: &sys::Arena) -> 
             claims: parse::Part::new(arena, EVENT_SHARDS),
             people: PersonEvents::new(g.nub),
             people_arena,
+            sink: ids::LongSink::new(),
             worker: tid as u32,
             clicks: std::array::from_fn(|_| Vec::with_capacity(click_reserve)),
             ev: EvBatch::new(),
