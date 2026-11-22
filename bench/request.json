@@ -1,10 +1,10 @@
 {
   "baseline": "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed",
-  "candidate": "e625135a54146c911c1c845523c4f3d2e8939179",
+  "candidate": "e155a17af386b49c634bcb7b26a1524c82913f6e",
   "additional_gate_baselines": ["6da0386b4ca6a001a5c7f747c68f40815fc14afb"],
   "timing": [
     "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed",
-    "e625135a54146c911c1c845523c4f3d2e8939179",
+    "e155a17af386b49c634bcb7b26a1524c82913f6e",
     "6da0386b4ca6a001a5c7f747c68f40815fc14afb"
   ],
   "rounds": {"20m": 5, "60m": 3}
