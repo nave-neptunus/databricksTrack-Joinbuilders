@@ -2319,6 +2319,7 @@ struct PartitionState {
     touched_categories: Vec<u32>,
     event_ends: Vec<usize>,
     click_ends: Vec<usize>,
+    grouped_people: Vec<u32>,
     events: Vec<u64>,
     clicks: Vec<Click>,
     /// One pass over the shared EvP records extracts (local person, packed
@@ -2385,6 +2386,7 @@ impl PartitionState {
             touched_categories: Vec::new(),
             event_ends: Vec::new(),
             click_ends: Vec::new(),
+            grouped_people: Vec::new(),
             events: Vec::new(),
             clicks: Vec::new(),
             gather: Vec::new(),
@@ -2404,13 +2406,17 @@ impl PartitionState {
         event_folds: &[People],
         click_folds: &[Box<nova::Streams<Click, P>>],
     ) {
-        let Self { event_ends, click_ends, events, clicks, gather, timing, .. } = self;
+        let Self { event_ends, click_ends, grouped_people, events, clicks, gather, timing, .. } = self;
         let timed = std::env::var_os("TIMING").is_some();
         let start = Instant::now();
-        event_ends.clear();
-        event_ends.resize(people as usize, 0);
-        click_ends.clear();
-        click_ends.resize(people as usize, 0);
+        if event_ends.len() < people as usize {
+            event_ends.resize(people as usize, 0);
+            click_ends.resize(people as usize, 0);
+        }
+        for person in grouped_people.drain(..) {
+            event_ends[person as usize] = 0;
+            click_ends[person as usize] = 0;
+        }
         if timed { timing.group_reset += start.elapsed(); }
         let event_rows = || event_folds.iter()
             .flat_map(|fold| fold.records(partition))
@@ -2424,6 +2430,9 @@ impl PartitionState {
         let start = Instant::now();
         for (person, payload) in event_rows() {
             let person = (person >> PB) as u32;
+            if event_ends[person as usize] == 0 {
+                grouped_people.push(person);
+            }
             gather.push((person, payload));
             event_ends[person as usize] += 1;
         }
@@ -2436,10 +2445,19 @@ impl PartitionState {
             }
         }
         if timed { timing.group_count_clicks += start.elapsed(); }
-        // Retain the original event counts until the click scatter is done.
-        // The prefix sums then become exclusive ends as records are placed.
+        // Only people with events can make sessions. Sorting restores the
+        // former ascending-person order without scanning every person in each
+        // partition, while the sparse reset above avoids zero-filling them.
+        grouped_people.sort_unstable();
+        let (mut event_total, mut click_total) = (0, 0);
+        for &person in grouped_people.iter() {
+            let person = person as usize;
+            event_total += std::mem::replace(&mut event_ends[person], event_total);
+            click_total += std::mem::replace(&mut click_ends[person], click_total);
+        }
+        // The prefix sums are exclusive write cursors.
         let start = Instant::now();
-        clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0 });
+        clicks.resize(click_total, Click { tag: 0, person: 0, ts: 0 });
         for &click in click_rows() {
             let person = (click.person >> PB) as usize;
             if event_ends[person] != 0 {
@@ -2450,8 +2468,7 @@ impl PartitionState {
         }
         if timed { timing.group_scatter_clicks += start.elapsed(); }
         let start = Instant::now();
-        events.resize(prefix_starts(event_ends), 0);
-        // The prefix sums in event_ends are now exclusive write cursors.
+        events.resize(event_total, 0);
         for &(person, payload) in gather.iter() {
             let next = &mut event_ends[person as usize];
             events[*next] = payload;
@@ -2472,11 +2489,13 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
-            event_ends, click_ends, events, clicks, gather: _, event_scratch, click_scratch, buckets,
+            event_ends, click_ends, grouped_people, events, clicks, gather: _, event_scratch, click_scratch, buckets,
             user, user_rows, timing,
         } = self;
         let (mut event_start, mut click_start) = (0, 0);
-        for (person, (&event_end, &click_end)) in event_ends.iter().zip(click_ends.iter()).enumerate() {
+        for &person in grouped_people.iter() {
+            let person = person as usize;
+            let (event_end, click_end) = (event_ends[person], click_ends[person]);
             let events = &mut events[event_start..event_end];
             let clicks = &mut clicks[click_start..click_end];
             (event_start, click_start) = (event_end, click_end);
