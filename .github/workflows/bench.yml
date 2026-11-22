@@ -2,7 +2,7 @@ name: g7 x86 benchmark
 
 on:
   push:
-    branches: [g7/bench-run, g7/bench-run2]
+    branches: [g7/bench-s6]
 
 env:
   DATA_SEED: "3"
@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - { label: baseline, ref: ed40599 }
-          - { label: core-purchase, ref: 88a2088 }
+          - { label: stagewait, ref: 0a003c6 }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -65,7 +65,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { label: core-purchase, candidate_ref: 88a2088, image: core-purchase, setting: '', run_tests: 'false', pairs: '8' }
+          - { label: stagewait, candidate_ref: 0a003c6, image: stagewait, setting: '', run_tests: 'false', pairs: '8' }
           # XL_ENDREL=1 is default conditional behavior; 2 actually forces release.
           # 5f08834 only fixes test data; 74d051a is the identical engine timed below.
     env:
