@@ -66,12 +66,14 @@ def fresh(path):
     path.mkdir(parents=True)
 
 
-def run(binary, data, label, *, timing=False):
+def run(binary, data, label, *, timing=False, cold=False):
     out, scratch = WORK / "outputs" / label, WORK / "scratch" / label
     fresh(out); fresh(scratch)
     env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out), SCRATCH_DIR=str(scratch), NCPU=NCPU)
     if timing:
         env["TIMING"] = "1"
+    if cold:
+        subprocess.run(["sudo", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"], check=False)
     started = time.perf_counter()
     result = subprocess.run([str(binary)], text=True, capture_output=True, env=env)
     elapsed = (time.perf_counter() - started) * 1000
@@ -127,6 +129,9 @@ def time_size(binaries, size, rounds):
         for sha in order:
             _, elapsed, laps = run(binaries[sha], HOME / f"v5-{size}", f"{size}-{number + 1}-{sha[:8]}", timing=True)
             row[sha] = (elapsed, laps)
+        for sha in order:
+            _, elapsed, laps = run(binaries[sha], HOME / f"v5-{size}", f"{size}-{number + 1}-{sha[:8]}-cold", timing=True, cold=True)
+            row.setdefault("cold", {})[sha] = elapsed
         rows.append(row)
     return rows
 
@@ -198,6 +203,9 @@ def main():
             med = statistics.median(row[sha][0] for row in rows)
             stage_text = "; ".join(f"{k}: {v:.1f}" for k, v in stages(rows, sha).items()) or "(no laps)"
             lines.append(f"| `{sha}` | {med:.1f} | {stage_text} |")
+        lines += ["", "| SHA | cold median wall ms (drop_caches before each run) |", "|---|---:|"]
+        for sha in TIMING:
+            lines.append(f"| `{sha}` | {statistics.median(row['cold'][sha] for row in rows):.1f} |")
         lines.append("")
     for size, rows in mem.items():
         lines += [f"## memory counters {size} (1 extra run each)", ""] + [f"- `{sha}`: {txt}" for sha, txt in rows] + [""]
