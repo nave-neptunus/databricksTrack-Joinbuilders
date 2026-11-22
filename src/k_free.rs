@@ -26,18 +26,7 @@ macro_rules! kernel {
         }
     };
 }
-pub struct Free;
-impl Kernel for Free {
-    const NAME: &'static str = "free";
-    fn events<S: EventSink>(buf: &[u8], sink: &mut S) {
-        unsafe { run_events::<S, PIPE>(buf, sink) }
-        sink.ev_flush();
-    }
-    fn clicks<S: ClickSink>(buf: &[u8], sink: &mut S) {
-        unsafe { run_clicks::<S, CHAIN>(buf, sink) }
-        sink.ck_flush();
-    }
-}
+kernel!(Free, "free", PIPE);
 kernel!(FreeN, "freen", CHAIN);
 
 #[cfg(feature = "stats")]
@@ -59,12 +48,12 @@ fn count(_r: usize) {
 struct IdShape {
     ctrl: [u8; 16],
     subv: [u8; 16],
-    lz: [u8; 16],
+    active: [u8; 16],
     orv: [u64; 2],
 }
 
 const fn id_shapes(prefix: u8, dig: usize, chk: usize, allow_empty: bool) -> [IdShape; 128] {
-    let mut t = [IdShape { ctrl: [0x80; 16], subv: [0; 16], lz: [0; 16], orv: [0; 2] }; 128];
+    let mut t = [IdShape { ctrl: [0x80; 16], subv: [0; 16], active: [0; 16], orv: [0; 2] }; 128];
     let mut raw = 0;
     while raw < 64 {
         let mut q = 0;
@@ -78,6 +67,7 @@ const fn id_shapes(prefix: u8, dig: usize, chk: usize, allow_empty: bool) -> [Id
                 while j < nd {
                     t[i].ctrl[dig + j] = (16 - q - nd + j) as u8;
                     t[i].subv[dig + j] = b'0';
+                    t[i].active[dig + j] = 0xFF;
                     j += 1;
                 }
                 t[i].ctrl[chk] = (16 - raw + q) as u8;
@@ -126,7 +116,7 @@ const fn id_shapes_raw(prefix: u8, dig: usize, chk: usize, allow_empty: bool) ->
 struct JidRow {
     ctrl: [u8; 32],
     subv: [u8; 32],
-    lz: [u8; 32],
+    active: [u8; 32],
     orv: [u64; 4],
 }
 const JID_ROWS: usize = 64 * 64;
@@ -137,7 +127,7 @@ const fn jid_rows() -> [JidRow; JID_ROWS] {
     let mut bad_u = u[0];
     bad_u.subv[8] = 1;
     bad_u.orv = [0; 2];
-    let mut t = [JidRow { ctrl: [0; 32], subv: [0; 32], lz: [0; 32], orv: [0; 4] }; JID_ROWS];
+    let mut t = [JidRow { ctrl: [0; 32], subv: [0; 32], active: [0; 32], orv: [0; 4] }; JID_ROWS];
     let mut c0 = 0;
     while c0 < 64 {
         let mut d = 0;
@@ -150,8 +140,8 @@ const fn jid_rows() -> [JidRow; JID_ROWS] {
                 r.ctrl[16 + i] = b.ctrl[i];
                 r.subv[i] = a.subv[i];
                 r.subv[16 + i] = b.subv[i];
-                r.lz[i] = a.lz[i];
-                r.lz[16 + i] = b.lz[i];
+                r.active[i] = a.active[i];
+                r.active[16 + i] = b.active[i];
                 i += 1;
             }
             r.orv = [a.orv[1], 0, b.orv[1], 0];
@@ -1212,7 +1202,7 @@ macro_rules! kcall {
             lateout("r8") _, lateout("r9") _, lateout("r10") _, lateout("r11") _,
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _, out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _, out("zmm14") _, out("zmm15") _,
-            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
+            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm23") _,
             out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
         );
         (r0, r1)
@@ -1323,9 +1313,16 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let kr = &*((T.kind2.as_ptr() as *const u8).add((here((r4 * 2 + (*rs4.wrapping_add(3) & 1) as usize) as u64) as usize) << 6) as *const KindRow2);
         let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.maskv.as_ptr()));
         *(s.byte_add(PP) as *mut u64) = *tr.pp.get_unchecked(qi) | kr.pp;
-        let ro = jid_off(c0 as u64, c1 as u64) as usize;
-        let jr = &*((T.jid.as_ptr() as *const u8).add(ro) as *const JidRow);
-        let (ids, bad_i) = ids2j(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
+        let (ids, bad_i) = if c0 > 11 || c1 - c0 > 12 {
+            let l = p.offset_from(cx.base) as usize;
+            let len = cx.end.offset_from(cx.base) as usize;
+            let (event, user) = cold_ids(cx.base, len, l, l + c0, b'e', l + c0 + 1, l + c1)?;
+            (_mm256_set_epi64x(0, user as i64, 0, event as i64), _mm256_setzero_si256())
+        } else {
+            let ro = jid_off(c0 as u64, c1 as u64) as usize;
+            let jr = &*((T.jid.as_ptr() as *const u8).add(ro) as *const JidRow);
+            ids2j(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr)
+        };
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, eid)) as *mut __m128i, _mm256_castsi256_si128(ids));
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, uid)) as *mut __m128i, _mm256_extracti128_si256::<1>(ids));
         let q3 = (u3 >> 1) as usize;
@@ -2013,7 +2010,7 @@ const _: () = assert!(
         && core::mem::offset_of!(DecShape, lz) == 32
         && core::mem::size_of::<IdShape>() == 64
         && core::mem::offset_of!(IdShape, subv) == 16
-        && core::mem::offset_of!(IdShape, lz) == 32
+        && core::mem::offset_of!(IdShape, active) == 32
         && core::mem::offset_of!(IdShape, orv) == 48
         && core::mem::size_of::<DateEnt>() == 32
         && core::mem::offset_of!(DateEnt, ms) == 16
@@ -2068,13 +2065,14 @@ macro_rules! cl_ms {
             "vpminub xmm5, xmm5, xmm6\n",
             "vmovdqu xmm6, xmmword ptr [{T} + rdi + {UID1} + 32]\n",
             "vpor xmm6, xmm6, xmmword ptr [{T} + r8 + {KID1} + 32]\n",
-            "vpsubusb xmm6, xmm6, xmm5\n",
-            "vpternlogq xmm3, xmm4, xmm6, 0xfe\n",
+            "vpsubb xmm5, xmm5, xmm6\n",
+            "vpor xmm3, xmm3, xmm4\n",
             "vpmaddubsw xmm5, xmm5, xmm20\n",
             "vpmaddwd xmm5, xmm5, xmm21\n",
-            "vpmuludq xmm1, xmm5, xmm22\n",
+            "vpsllq xmm1, xmm5, 32\n",
+            "vpsrlq xmm1, xmm1, 8\n",
             "vpsrlq xmm5, xmm5, 32\n",
-            "vpaddq xmm5, xmm1, xmm5\n",
+            "vpor xmm5, xmm1, xmm5\n",
             "vporq ", $ids, ", xmm5, xmmword ptr [{T} + rdi + {UID1} + 48]\n",
             "lea rdx, [", $b, " + r10]\n",
             "sub r10, ", $nlin, "\n",
@@ -2152,12 +2150,10 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
             "vmovdqa64 xmm24, xmm0",
             "mov eax, 0xd9d9d9d9",
             "vpbroadcastd xmm19, eax",
-            "mov eax, 0x01240124",
+            "mov eax, 0x01400140",
             "vpbroadcastd xmm20, eax",
-            "mov eax, 0x00010510",
+            "mov eax, 0x00011000",
             "vpbroadcastd xmm21, eax",
-            "mov eax, 1679616",
-            "vpbroadcastq xmm22, rax",
             "vpxord xmm23, xmm23, xmm23",
             "mov eax, 0x010a010a",
             "vmovd xmm0, eax",
@@ -2205,7 +2201,7 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
             out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("r12") _, out("r13") _, out("r14") _, out("r15") _,
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _, out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
             out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _,
-            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
+            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm23") _,
             out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
             out("k1") _,
             T = sym T, CTS = sym CTS, CAMP = sym CAMP5R,
