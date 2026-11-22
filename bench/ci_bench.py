@@ -131,6 +131,53 @@ def time_size(binaries, size, rounds):
     return rows
 
 
+def drop_caches():
+    subprocess.run("sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null", shell=True, check=True)
+
+
+def run_cold(binary, data, label, extra_env):
+    out, scratch = WORK / "outputs" / label, WORK / "scratch" / label
+    fresh(out); fresh(scratch)
+    env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out), SCRATCH_DIR=str(scratch), NCPU=NCPU, TIMING="1")
+    env.update(extra_env)
+    drop_caches()
+    started = time.perf_counter()
+    result = subprocess.run([str(binary)], text=True, capture_output=True, env=env)
+    elapsed = (time.perf_counter() - started) * 1000
+    (WORK / "logs").mkdir(exist_ok=True)
+    (WORK / "logs" / f"{label}.stderr").write_text(result.stderr)
+    if result.returncode:
+        raise SystemExit(f"{label} failed ({result.returncode}):\n{result.stderr[-4000:]}")
+    laps = [(float(ms), name) for ms, name in re.findall(r"^\s*([0-9.]+) ms\s+(.+)$", result.stderr, re.M)]
+    shutil.rmtree(out, ignore_errors=True)
+    return elapsed, laps
+
+
+def cold_timing(binaries):
+    cold = REQUEST.get("cold")
+    if not cold:
+        return []
+    variants = cold["variants"]
+    lines = ["# COLD (sync + drop_caches before every run) interleaved", ""]
+    for size, rounds in cold["rounds"].items():
+        samples = {v["label"]: [] for v in variants}
+        for number in range(rounds):
+            shift = number % len(variants)
+            for v in variants[shift:] + variants[:shift]:
+                elapsed, laps = run_cold(binaries[v["sha"]], HOME / f"v5-{size}", f"cold-{size}-{number + 1}-{v['label']}", v.get("env", {}))
+                samples[v["label"]].append((elapsed, laps))
+                print(f"cold {size} r{number + 1} {v['label']}: {elapsed:.0f} ms", flush=True)
+        lines += [f"## cold {size} ({rounds} rounds)", "", "| variant | sha | env | median ms | min | all | key laps (median) |", "|---|---|---|---:|---:|---|---|"]
+        for v in variants:
+            xs = [e for e, _ in samples[v["label"]]]
+            keep = ("links read", "events parsed", "clicks")
+            st = stages([{v["sha"]: (e, l)} for e, l in samples[v["label"]]], v["sha"])
+            laptxt = "; ".join(f"{k}: {x:.0f}" for k, x in st.items() if any(w in k for w in keep))
+            lines.append(f"| {v['label']} | `{v['sha'][:8]}` | `{v.get('env', {})}` | {statistics.median(xs):.0f} | {min(xs):.0f} | {', '.join(f'{x:.0f}' for x in xs)} | {laptxt} |")
+        lines.append("")
+    return lines
+
+
 def stages(rows, sha):
     keys = sorted({name for row in rows for _, name in row[sha][1]})
     return {key: statistics.median(next((ms for ms, name in row[sha][1] if name == key), 0.0) for row in rows) for key in keys}
@@ -159,6 +206,9 @@ def main():
             baseline, _, _ = run(binaries[sha], corpus, f"baseline-{size}-{sha[:8]}", timing=True)
             parquet_equal(candidate, baseline, f"{size} candidate vs {sha}")
     results = {size: time_size(binaries, size, int(ROUNDS[size])) for size in ("20m", "60m")}
+    for sha in {v["sha"] for v in REQUEST.get("cold", {}).get("variants", [])}:
+        binaries.setdefault(sha, build(sha))
+    cold_lines = cold_timing(binaries)
     gate = "PASS" if not GATE_FAILURES else "FAIL — " + "; ".join(GATE_FAILURES)
     baselines = ", ".join(f"`{sha}`" for sha in GATE_BASELINES)
     lines = ["# gum v5 Intel gate and timing", "", f"- gate baselines: {baselines}", f"- candidate: `{CAND}`", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
@@ -172,6 +222,7 @@ def main():
             stage_text = "; ".join(f"{k}: {v:.1f}" for k, v in stages(rows, sha).items()) or "(no laps)"
             lines.append(f"| `{sha}` | {med:.1f} | {stage_text} |")
         lines.append("")
+    lines += cold_lines
     (WORK / "summary.md").write_text("\n".join(lines))
     (WORK / "observations.json").write_text(json.dumps(results, indent=2))
     print((WORK / "summary.md").read_text())

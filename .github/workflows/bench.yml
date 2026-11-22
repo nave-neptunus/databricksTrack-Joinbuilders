@@ -2,7 +2,7 @@ name: gum v5 Intel gate and timing
 
 on:
   push:
-    branches: [ci/gum]
+    branches: [ci/gum-cold]
   workflow_dispatch:
 
 jobs:
