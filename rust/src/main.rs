@@ -17,6 +17,14 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const LOOK: i64 = 7 * DAY;
 
+#[inline]
+pub(crate) fn tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::x86_64::_rdtsc() }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 0 }
+}
+
 static mut T0: Option<Instant> = None;
 fn lap(name: &str) {
     if std::env::var_os("TIMING").is_some() {
@@ -2204,7 +2212,9 @@ fn fast(nova: bool) -> bool {
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each existing Rayon worker handles whole partitions and flushes its
     // own Parquet file as soon as it runs out of work.
+    let (tc0, ti0) = (tsc(), Instant::now());
     let states = rayon::broadcast(|worker| {
+        let wstart = tsc();
         let path = format!("{out}/user_daily/part-{}.parquet", worker.index());
         let user = user_parquet::UserParquet::new(path, user_schema.clone());
         let mut state = PartitionState::new(ncs, ndays, cat_names.len(), user);
@@ -2215,9 +2225,31 @@ fn fast(nova: bool) -> bool {
         for (total, &assisted) in state.cd.iter_mut().zip(&state.asst) {
             total[3] += i64::from(assisted);
         }
+        let tcl = tsc();
+        let flush_cycles = state.user.flush_cycles;
+        let (user_rows, cd) = (state.user_rows, std::mem::take(&mut state.cd));
+        let mut prof: [u64; 10] = [0; 10];
+        for i in 0..7 { prof[i] = state.prof[i].get(); }
+        prof[7] = flush_cycles;
         state.user.close();
-        (state.user_rows, state.cd)
+        prof[8] = tsc() - tcl;
+        prof[9] = tsc() - wstart;
+        ((user_rows, cd), prof, tsc())
     });
+    let ghz = (tsc() - tc0) as f64 / ti0.elapsed().as_nanos().max(1) as f64;
+    if std::env::var_os("TIMING").is_some() {
+        let names = ["count", "scatter", "sort clicks", "sort events", "per-person total", "write_day", "attribute", "flush", "close", "worker wall"];
+        for (i, n) in names.iter().enumerate() {
+            let sum: u64 = states.iter().map(|x| x.1[i]).sum();
+            let max: u64 = states.iter().map(|x| x.1[i]).max().unwrap_or(0);
+            eprintln!("{:8.1} ms  tailcpu sum {}", sum as f64 / ghz / 1e6, n);
+            eprintln!("{:8.1} ms  tailcpu max {}", max as f64 / ghz / 1e6, n);
+        }
+        let minend = states.iter().map(|x| x.2).min().unwrap_or(0);
+        let maxend = states.iter().map(|x| x.2).max().unwrap_or(0);
+        eprintln!("{:8.1} ms  tail worker end skew", (maxend - minend) as f64 / ghz / 1e6);
+    }
+    let states: Vec<_> = states.into_iter().map(|x| x.0).collect();
     std::mem::forget(paccs);
     std::mem::forget(caccs);
     lap("sessions + credit + aggregate + user parquet");
@@ -2286,6 +2318,7 @@ struct PartitionState {
     buckets: EventBuckets,
     user: user_parquet::UserParquet,
     user_rows: usize,
+    prof: [std::cell::Cell<u64>; 8],
 }
 
 impl PartitionState {
@@ -2308,6 +2341,7 @@ impl PartitionState {
             buckets: EventBuckets::default(),
             user,
             user_rows: 0,
+            prof: Default::default(),
         }
     }
 
@@ -2318,7 +2352,8 @@ impl PartitionState {
         event_folds: &[People],
         click_folds: &[Box<nova::Streams<Click, P>>],
     ) {
-        let Self { event_ends, click_ends, events, clicks, gather, .. } = self;
+        let Self { event_ends, click_ends, events, clicks, gather, prof, .. } = self;
+        let t0 = tsc();
         event_ends.clear();
         event_ends.resize(people as usize, 0);
         click_ends.clear();
@@ -2343,6 +2378,8 @@ impl PartitionState {
                 click_ends[person] += 1;
             }
         }
+        let t1 = tsc();
+        prof[0].set(prof[0].get() + (t1 - t0));
         // Retain the original event counts until the click scatter is done.
         // The prefix sums then become exclusive ends as records are placed.
         clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0 });
@@ -2361,6 +2398,7 @@ impl PartitionState {
             events[*next] = payload;
             *next += 1;
         }
+        prof[1].set(prof[1].get() + (tsc() - t1));
     }
 
     fn aggregate(
@@ -2376,7 +2414,7 @@ impl PartitionState {
         let Self {
             cd, counts, asst, in_active, active, catsum, touched_categories,
             event_ends, click_ends, events, clicks, gather: _, event_scratch, click_scratch, buckets,
-            user, user_rows,
+            user, user_rows, prof,
         } = self;
         let (mut event_start, mut click_start) = (0, 0);
         for (person, (&event_end, &click_end)) in event_ends.iter().zip(click_ends.iter()).enumerate() {
@@ -2394,16 +2432,21 @@ impl PartitionState {
             if events.is_empty() {
                 continue;
             }
+            let tp0 = tsc();
             sort_timeline(clicks, click_scratch, |click| click.ts);
+            prof[2].set(prof[2].get() + (tsc() - tp0));
             let name = pname[person * P + partition];
             let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
+                let tw = tsc();
                 let category = top_cat(sums, touched, categories);
                 user.append(name, row, categories.get(category as usize).copied());
                 *user_rows += 1;
+                prof[5].set(prof[5].get() + (tsc() - tw));
             };
             let (mut lo, mut hi, mut best_click) = (0, 0, None::<Click>);
             let has_clicks = !clicks.is_empty();
             let mut attribute = |start, session_day, revenue| {
+                let ta = tsc();
                 let day_index = (session_day - day0) as usize;
                 let mut campaign = organic;
                 if has_clicks {
@@ -2450,10 +2493,13 @@ impl PartitionState {
                 total[0] += 1;
                 total[1] += i64::from(revenue > 0);
                 total[2] += revenue;
+                prof[6].set(prof[6].get() + (tsc() - ta));
             };
 
+            let tg = tsc();
             if events.len() < BUCKET_MIN_LEN {
                 sort_events(events, event_scratch);
+                prof[3].set(prof[3].get() + (tsc() - tg));
                 aggregate_sessions(
                     events, origin, catsum, touched_categories,
                     |event| {
@@ -2465,6 +2511,7 @@ impl PartitionState {
                 );
             } else {
                 buckets.build(events);
+                prof[3].set(prof[3].get() + (tsc() - tg));
                 aggregate_sessions(
                     &buckets.used, origin, catsum, touched_categories,
                     |index| {
@@ -2479,6 +2526,7 @@ impl PartitionState {
                 counts[campaign as usize] = 0;
                 in_active[campaign as usize] = false;
             }
+            prof[4].set(prof[4].get() + (tsc() - tp0));
         }
     }
 }
