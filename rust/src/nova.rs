@@ -118,18 +118,15 @@ fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec
     if n < linked.len() || n >= crate::PERSON_SET as usize {
         return None;
     }
-    // Every name slot holds a direct reference (pointer + length) to the
-    // user's bytes, so no per-person decode or allocation is needed.
-    let names: Vec<&'static [u8]> = (linked.len()..n)
-        .into_par_iter()
-        .map(|id| {
-            let v = users.names[id].load(Relaxed);
-            if v == 0 { &[][..] } else { crate::unpack_ref(v) }
-        })
-        .collect();
+    // Every name slot holds a direct reference (pointer + length).  Fill the
+    // final vector directly: the previous temporary `names` vector doubled
+    // this cold copy at the end of the event phase.
     let mut all = Vec::with_capacity(n);
     all.extend_from_slice(linked);
-    all.extend(names);
+    for id in linked.len()..n {
+        let v = users.names[id].load(Relaxed);
+        all.push(if v == 0 { &[][..] } else { crate::unpack_ref(v) });
+    }
     Some((n.div_ceil(P) as u32, all))
 }
 

@@ -774,17 +774,25 @@ impl ExactIds {
 /// Open-addressing map from a 64-bit key (plus check) to a u32 value.
 struct Tab {
     slots: Vec<(u64, u64)>, // (key, (chk << 32) | val); key 0 = empty
-    mask: usize,
+    cap: usize,
+}
+#[inline]
+fn fast_range(key: u64, n: usize) -> usize {
+    ((u128::from(if key == 0 { 1 } else { key }) * n as u128) >> 64) as usize
 }
 impl Tab {
     fn new(n: usize) -> Tab {
-        let cap = (n * 2).next_power_of_two().max(16);
-        Tab { slots: vec![(0, 0); cap], mask: cap - 1 }
+        let cap = n.saturating_mul(3).div_ceil(2).max(LINK_SHARDS).next_multiple_of(LINK_SHARDS);
+        Tab { slots: vec![(0, 0); cap], cap }
+    }
+    #[inline]
+    fn index(&self, key: u64) -> usize {
+        fast_range(key, self.cap)
     }
     #[inline]
     #[allow(dead_code)]
     fn prefetch(&self, key: u64) {
-        let index = (if key == 0 { 1 } else { key }) as usize & self.mask;
+        let index = self.index(key);
         let ptr = self.slots.as_ptr().wrapping_add(index);
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -801,7 +809,7 @@ impl Tab {
     #[allow(dead_code)]
     fn get(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
         let k = if k == 0 { 1 } else { k };
-        let mut i = (k as usize) & self.mask;
+        let mut i = self.index(k);
         loop {
             let (kk, vv) = self.slots[i];
             if kk == 0 {
@@ -814,7 +822,8 @@ impl Tab {
                 }
                 return Some(vv as u32);
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+            if i == self.cap { i = 0; }
         }
     }
 }
@@ -1028,7 +1037,7 @@ const PERSON_SET: u64 = 1 << 31;
 /// inserted by another thread, which publishes the value right after its key.
 struct Users<'a> {
     sl: &'a [std::sync::atomic::AtomicU64],
-    mask: usize,
+    cap: usize,
     limit: usize,
     used: std::sync::atomic::AtomicUsize,
     next: std::sync::atomic::AtomicU32,
@@ -1036,19 +1045,21 @@ struct Users<'a> {
 }
 
 impl<'a> Users<'a> {
-    fn new(tab: &'a mut Tab, nids: usize, npersons: usize) -> Self {
+    fn new(tab: &'a mut Tab, nids: usize, npersons: usize) -> Option<Self> {
         use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
-        let cap = tab.mask + 1;
+        let cap = tab.cap;
         // The slots are not otherwise accessed until the table is dropped; AtomicU64 has u64's layout.
         let sl = unsafe { std::slice::from_raw_parts(tab.slots.as_mut_ptr() as *const AtomicU64, cap * 2) };
         // Dense ids never exceed: linked persons, one block of padding, one id per slot,
         // and one partial block per worker.
         let first = npersons.div_ceil(P) * P;
         let ids = first + cap + (rayon::current_num_threads() + 1) * P;
-        let v: Vec<u64> = vec![0; ids];
-        let names = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU64, ids) };
-        std::mem::forget(v);
-        Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names }
+        // Anonymous mappings are zero-filled by the kernel on first touch.
+        // Unlike Vec::with_capacity + set_len, this does not serially fault and
+        // write every future name slot before events claim it.
+        let names_map = Box::leak(Box::new(memmap2::MmapMut::map_anon(ids.checked_mul(8)?).ok()?));
+        let names = unsafe { std::slice::from_raw_parts(names_map.as_ptr() as *const AtomicU64, ids) };
+        Some(Users { sl, cap, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names })
     }
 
     #[inline]
@@ -1067,7 +1078,7 @@ impl<'a> Users<'a> {
     #[inline]
     #[allow(dead_code)]
     fn prefetch(&self, key: u64) {
-        let index = (if key == 0 { 1 } else { key }) as usize & self.mask;
+        let index = fast_range(key, self.cap);
         let ptr = self.sl.as_ptr().wrapping_add(2 * index);
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -1086,7 +1097,7 @@ impl<'a> Users<'a> {
     fn person(&self, k: u64, c: u32, name: u64, block: &mut (u32, u32), coll: &AtomicBool) -> u32 {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
         let k = if k == 0 { 1 } else { k };
-        let mut i = (k as usize) & self.mask;
+        let mut i = fast_range(k, self.cap);
         loop {
             let mut kk = self.sl[2 * i].load(Acquire);
             if kk == 0 {
@@ -1116,7 +1127,8 @@ impl<'a> Users<'a> {
                 }
                 return (v as u32) & (PERSON_SET as u32 - 1);
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+            if i == self.cap { i = 0; }
         }
     }
 
@@ -1125,7 +1137,7 @@ impl<'a> Users<'a> {
     #[inline]
     fn find(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
         let k = if k == 0 { 1 } else { k };
-        let mut i = (k as usize) & self.mask;
+        let mut i = fast_range(k, self.cap);
         loop {
             let kk = self.sl[2 * i].load(Relaxed);
             if kk == 0 {
@@ -1139,7 +1151,8 @@ impl<'a> Users<'a> {
                 }
                 return Some((v as u32) & (PERSON_SET as u32 - 1));
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+            if i == self.cap { i = 0; }
         }
     }
 
@@ -1150,16 +1163,12 @@ impl<'a> Users<'a> {
         if n >= PERSON_SET as usize {
             coll.store(true, Relaxed);
         }
-        let all: Vec<&'static [u8]> = (0..n).into_par_iter().map(|id| {
-            if id < linked.len() {
-                linked[id]
-            } else {
-                match self.names[id].load(Relaxed) {
-                    0 => &[][..],
-                    r => unpack_ref(r),
-                }
-            }
-        }).collect();
+        let mut all = Vec::with_capacity(n);
+        all.extend_from_slice(linked);
+        for id in linked.len()..n {
+            let r = self.names[id].load(Relaxed);
+            all.push(if r == 0 { &[][..] } else { unpack_ref(r) });
+        }
         ((n.div_ceil(P)) as u32, all)
     }
 }
@@ -1621,7 +1630,7 @@ enum LinkSlot {
 fn link_slot(
     slots: &mut [(u64, u64)],
     mut i: usize,
-    mask: usize,
+    cap: usize,
     e: LinkEnd,
     node: u32,
     names: &[LinkName],
@@ -1643,7 +1652,8 @@ fn link_slot(
             }
             return LinkSlot::Duplicate(other);
         }
-        i = (i + 1) & mask;
+        i += 1;
+        if i == cap { i = 0; }
     }
     LinkSlot::Spill
 }
@@ -1681,13 +1691,13 @@ fn build_links(
     if endpoint_bound >= PERSON_SET as usize {
         return None;
     }
-    let capacity_hint = (endpoint_bound + 16).max(estimated_users).max(LINK_SHARDS / 2);
+    let capacity_hint = estimated_users.max(LINK_SHARDS);
     if capacity_hint > 1 << 31 {
         return None;
     }
     let mut table = Tab::new(capacity_hint);
-    let range_len = (table.mask + 1) / LINK_SHARDS;
-    let shift = range_len.trailing_zeros();
+    let cap = table.cap;
+    let range_len = cap / LINK_SHARDS;
     let collision = AtomicBool::new(false);
 
     let batches: Vec<_> = chunks.par_iter().map(|chunk| {
@@ -1712,7 +1722,7 @@ fn build_links(
                     ids.user(s)
                 };
                 let key = if key == 0 { 1 } else { key };
-                let shard = ((key as usize) & table.mask) >> shift;
+                let shard = table.index(key) / range_len;
                 ends[shard].push(LinkEnd { key, name, check, endpoint: count });
                 count += 1;
             }
@@ -1742,7 +1752,6 @@ fn build_links(
         start
     }).collect();
     let names: Vec<_> = (0..nend).map(|_| LinkName::default()).collect();
-    let range_mask = range_len - 1;
     let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).zip(&mut buckets)
         .enumerate().map(|(shard, (slots, bucket))| {
             let mut nodes = Vec::new();
@@ -1750,7 +1759,7 @@ fn build_links(
             for (batch_id, batch) in bucket.iter_mut().enumerate() {
                 for (end_id, e) in batch.iter_mut().enumerate() {
                     let node = starts[shard] + nodes.len() as u32;
-                    let i = e.key as usize & range_mask;
+            let i = fast_range(e.key, cap) % range_len;
                     match link_slot(slots, i, usize::MAX, *e, node, &names, &collision) {
                         LinkSlot::Inserted(local) => {
                             nodes.push(((shard * range_len + local) as u32, node));
@@ -1770,15 +1779,15 @@ fn build_links(
         for (batch_id, end_id) in std::mem::take(&mut ranges[shard].1) {
             let e = &mut bucket[batch_id][end_id];
             let node = next[shard];
-            let i = e.key as usize & table.mask;
-            match link_slot(&mut table.slots, i, table.mask, *e, node, &names, &collision) {
+            let i = fast_range(e.key, cap);
+            match link_slot(&mut table.slots, i, cap, *e, node, &names, &collision) {
                 LinkSlot::Inserted(slot) => {
-                    ranges[slot >> shift].0.push((slot as u32, node));
+                    ranges[slot / range_len].0.push((slot as u32, node));
                     next[shard] += 1;
                     e.key = u64::from(node);
                 }
                 LinkSlot::Duplicate(other) => e.key = u64::from(other),
-                LinkSlot::Spill => unreachable!("all-uid table has spare slots"),
+                LinkSlot::Spill => return None,
             }
         }
     }
@@ -1865,7 +1874,7 @@ fn build_links(
                 0 => node,
                 p => p - 1,
             };
-            let value = &mut slots[slot as usize & range_mask].1;
+            let value = &mut slots[slot as usize % range_len].1;
             *value = (*value & !0xffff_ffff) | PERSON_SET | u64::from(person[r as usize].load(Relaxed));
         }
     });
@@ -1979,7 +1988,7 @@ fn fast(nova: bool) -> bool {
         let total: usize = evb.iter().map(|b| b.len()).sum();
         total / ((1 << 16) / rows).max(1)
     });
-    let est_users = estimated_rows / 12;
+    let est_users = estimated_rows / 14;
     for b in &lkb {
         ra.wait(b);
     }
@@ -1989,7 +1998,9 @@ fn fast(nova: bool) -> bool {
         return false;
     };
     let coll = AtomicBool::new(false);
-    let users = Users::new(&mut ltab, nids, pname.len());
+    let Some(users) = Users::new(&mut ltab, nids, pname.len()) else {
+        return false;
+    };
     lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
