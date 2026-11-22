@@ -524,11 +524,113 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
     event_rows(bytes, |line, fields| sink.row(line, fields));
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx512bw,avx512vl,bmi2")]
+unsafe fn event_rows_avx512<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
+    use std::arch::x86_64::*;
+
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let quote = _mm512_set1_epi8(b'"' as i8);
+    let newline = _mm512_set1_epi8(b'\n' as i8);
+    let mut start = 0;
+    let mut preceding_commas = 0u128;
+    let mut preceding_quotes = 0u128;
+
+    for base in (0..bytes.len() / 64).map(|block| block * 64) {
+        // Read each full block once, including when it straddles rows.
+        let block = unsafe { _mm512_loadu_si512(bytes.as_ptr().add(base).cast()) };
+        let commas = _mm512_cmpeq_epi8_mask(block, comma);
+        let quotes = _mm512_cmpeq_epi8_mask(block, quote);
+        let mut newlines = _mm512_cmpeq_epi8_mask(block, newline);
+        let mut prefix = base - start;
+        let mut offset = 0;
+
+        while newlines != 0 {
+            let end = newlines.trailing_zeros();
+            newlines &= newlines - 1;
+            let line = &bytes[start..base + end as usize];
+            let layout = if line.len() < 128 {
+                let row_commas = preceding_commas
+                    | (u128::from(_bzhi_u64(commas, end) >> offset) << prefix);
+                let row_quotes = preceding_quotes
+                    | (u128::from(_bzhi_u64(quotes, end) >> offset) << prefix);
+                event_layout_avx512(line, row_commas, row_quotes)
+            } else {
+                None
+            };
+            if let Some(fields) = layout {
+                sink.row(line, fields);
+            } else if let Some(fields) = crate::row_fields::<7>(line) {
+                sink.row(line, fields);
+            }
+            start = base + end as usize + 1;
+            offset = end + 1;
+            prefix = 0;
+            preceding_commas = 0;
+            preceding_quotes = 0;
+        }
+
+        // Keep the partial final row for the next block. At 128 bytes or
+        // longer, only the start offset is needed by the exact parser.
+        if offset < 64 && base + 64 - start < 128 {
+            preceding_commas |= u128::from(commas >> offset) << prefix;
+            preceding_quotes |= u128::from(quotes >> offset) << prefix;
+        }
+    }
+    event_rows(&bytes[start..], |line, fields| sink.row(line, fields));
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx512bw,avx512vl,bmi2")]
+#[inline]
+fn event_layout_avx512(line: &[u8], commas: u128, quotes: u128) -> Option<RowLayout<'_>> {
+    use std::arch::x86_64::*;
+
+    if commas.count_ones() != 6 {
+        return None;
+    }
+    let wrapped = if quotes == 0 {
+        0
+    } else {
+        if commas & 1 != 0 {
+            return None;
+        }
+        let opens = (commas << 1) | 1;
+        let closes = (commas | (1u128 << line.len())) >> 1;
+        if quotes & !(opens | closes) != 0 {
+            return None;
+        }
+        let extract = |positions: u128| {
+            let low = positions as u64;
+            _pext_u64(quotes as u64, low)
+                | (_pext_u64((quotes >> 64) as u64, (positions >> 64) as u64) << low.count_ones())
+        };
+        let wrapped = extract(opens);
+        if wrapped != extract(closes) || quotes.count_ones() != 2 * wrapped.count_ones() {
+            return None;
+        }
+        wrapped as u8
+    };
+
+    // Decode the six cuts together. The sink materializes only the fields
+    // needed for the row and retains its existing batch of semantic claims.
+    let mut cuts = [0u8; 8];
+    let mut remaining = commas;
+    for cut in &mut cuts[1..7] {
+        *cut = remaining.trailing_zeros() as u8 + 1;
+        remaining &= remaining - 1;
+    }
+    cuts[7] = line.len() as u8 + 1;
+    Some(RowLayout { line, cuts, wrapped })
+}
+
 #[inline]
 fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if std::is_x86_feature_detected!("bmi2") {
-        // AVX2 is required by this compilation and BMI2 was checked above.
+        if std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512vl") {
+            return unsafe { event_rows_avx512(bytes, sink) };
+        }
         return unsafe { fused_event_rows(bytes, sink) };
     }
     event_rows(bytes, |line, fields| sink.row(line, fields));
@@ -1313,6 +1415,17 @@ mod tests {
             corrupted[23] = b'"';
             input.extend(corrupted);
             input.extend_from_slice(b"too,short,\"\"\n\n");
+        }
+        for width in 0..=220 {
+            let id = "x".repeat(width);
+            for line in [
+                format!("{id},u,t,i,view,p,\n"),
+                format!("\"{id}\",\"\",t,i,view,p,\"\"\n"),
+                format!(",\"{id}\",t,i,view,p,\n"),
+                format!("{id},u,\",i,view,p,\n"),
+            ] {
+                input.extend_from_slice(line.as_bytes());
+            }
         }
         input.extend_from_slice(b"e9,u9,1,2026-10-01T00:00:00Z,view,p9,");
         let mut expected = Vec::new();
