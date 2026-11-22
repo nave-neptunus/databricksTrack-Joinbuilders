@@ -72,6 +72,16 @@ fn id_eq(ka: u64, la: u64, kb: u64, lb: u64) -> bool {
     ka == kb && (ka & ODD == 0 || unsafe { loc_bytes(la) == loc_bytes(lb) })
 }
 
+#[inline(always)]
+fn okey(h: u64) -> u64 {
+    let k = h | ODD;
+    if k == u64::MAX {
+        k - 1
+    } else {
+        k
+    }
+}
+
 /// Turns a kernel ID into (key, loc). `base` is the start of the buffer the kernel parsed.
 #[inline(always)]
 fn resolve(id: u64, base: *const u8) -> Option<(u64, u64)> {
@@ -84,7 +94,7 @@ fn resolve(id: u64, base: *const u8) -> Option<(u64, u64)> {
     }
     let p = unsafe { base.add(odd_offset(id)) };
     let h = hash(unsafe { std::slice::from_raw_parts(p, len) });
-    Some((h | ODD, loc_of(p, len)))
+    Some((okey(h), loc_of(p, len)))
 }
 
 fn id_bytes(key: u64, loc: u64, prefix: u8, out: &mut Vec<u8>) {
@@ -136,8 +146,18 @@ impl Arena {
 
 // ---------- links ----------
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Slot {
+    key: u64,
+    node: u32,
+    root: u32,
+}
+const EMPTY: u64 = u64::MAX;
+
 struct LinkTab {
-    tab: Tab,
+    slots: Vec<Slot>,
+    mask: usize,
     nkey: Vec<u64>,
     nloc: Vec<u64>,
     root: Vec<u32>,
@@ -159,8 +179,40 @@ fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
 
 impl LinkTab {
     #[inline(always)]
+    fn slot_of(&self, key: u64) -> usize {
+        (mixk(key) as usize) & self.mask
+    }
+    #[inline(always)]
+    fn prefetch(&self, key: u64) {
+        unsafe { core::arch::x86_64::_mm_prefetch(self.slots.as_ptr().add(self.slot_of(key)) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+    }
+    /// The root node of the person this ID belongs to, if the ID is in any link.
+    #[inline(always)]
+    fn find_root(&self, key: u64, loc: u64) -> Option<u32> {
+        let mut i = self.slot_of(key);
+        loop {
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s.key == EMPTY {
+                return None;
+            }
+            if s.key == key && (key & ODD == 0 || unsafe { loc_bytes(self.nloc[s.node as usize]) == loc_bytes(loc) }) {
+                return Some(s.root);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
     fn find(&self, key: u64, loc: u64) -> Option<u32> {
-        self.tab.find(mixk(key), |i| id_eq(self.nkey[i as usize], self.nloc[i as usize], key, loc)).ok().map(|x| x.1)
+        let mut i = self.slot_of(key);
+        loop {
+            let s = self.slots[i];
+            if s.key == EMPTY {
+                return None;
+            }
+            if s.key == key && id_eq(self.nkey[s.node as usize], self.nloc[s.node as usize], key, loc) {
+                return Some(s.node);
+            }
+            i = (i + 1) & self.mask;
+        }
     }
 }
 
@@ -172,32 +224,41 @@ fn classify(b: B, h: u64) -> R<(u64, u64)> {
     if v & ID_ODD == 0 {
         Ok((v, 0))
     } else {
-        Ok((h | ODD, loc_of(b.as_ptr(), b.len())))
+        Ok((okey(h), loc_of(b.as_ptr(), b.len())))
     }
 }
 
 fn build_links(parts: &[Vec<(B, u64, B, u64)>]) -> R<LinkTab> {
     let n: usize = parts.iter().map(|p| p.len()).sum();
-    let mut tab = Tab::with_capacity(2 * n + 16);
-    let mut nkey: Vec<u64> = Vec::with_capacity(n);
-    let mut nloc: Vec<u64> = Vec::with_capacity(n);
-    let mut parent: Vec<u32> = Vec::with_capacity(n);
+    let cap = (n * 3 + 16).next_power_of_two();
+    let mask = cap - 1;
+    let mut slots: Vec<Slot> = vec![Slot { key: EMPTY, node: 0, root: 0 }; cap];
+    let mut nkey: Vec<u64> = Vec::with_capacity(n + n / 2);
+    let mut nloc: Vec<u64> = Vec::with_capacity(n + n / 2);
+    let mut parent: Vec<u32> = Vec::with_capacity(n + n / 2);
     for p in parts {
         for &(a, ha, b, hb) in p {
             let mut ids = [0u32; 2];
             for (k, (s, h)) in [(a, ha), (b, hb)].into_iter().enumerate() {
                 let (key, loc) = classify(s, h)?;
-                let r = tab.find(mixk(key), |i| id_eq(nkey[i as usize], nloc[i as usize], key, loc));
-                ids[k] = match r {
-                    Ok((_, i)) => i,
-                    Err(slot) => {
-                        let i = nkey.len() as u32;
+                let mut i = (mixk(key) as usize) & mask;
+                ids[k] = loop {
+                    let sl = slots[i];
+                    if sl.key == EMPTY {
+                        if nkey.len() * 10 > cap * 8 {
+                            return why("link table full");
+                        }
+                        let id = nkey.len() as u32;
                         nkey.push(key);
                         nloc.push(loc);
-                        parent.push(i);
-                        tab.set(slot, mixk(key), i);
-                        i
+                        parent.push(id);
+                        slots[i] = Slot { key, node: id, root: 0 };
+                        break id;
                     }
+                    if sl.key == key && id_eq(sl.key, nloc[sl.node as usize], key, loc) {
+                        break sl.node;
+                    }
+                    i = (i + 1) & mask;
                 };
             }
             let rx = uf_find(&mut parent, ids[0]);
@@ -222,7 +283,12 @@ fn build_links(parts: &[Vec<(B, u64, B, u64)>]) -> R<LinkTab> {
             name[r as usize] = i;
         }
     }
-    Ok(LinkTab { tab, nkey, nloc, root, name })
+    for sl in slots.iter_mut() {
+        if sl.key != EMPTY {
+            sl.root = root[sl.node as usize];
+        }
+    }
+    Ok(LinkTab { slots, mask, nkey, nloc, root, name })
 }
 
 // ---------- records ----------
@@ -254,16 +320,46 @@ struct CPay {
     camp: u32,
 }
 
-#[derive(Default)]
+const SEG: usize = 1024;
+/// Append-only list in fixed segments: no copying on growth.
+struct Seg<T> {
+    segs: Vec<Vec<T>>,
+    n: usize,
+}
+impl<T: Copy> Seg<T> {
+    fn new() -> Self {
+        Seg { segs: Vec::new(), n: 0 }
+    }
+    #[inline(always)]
+    fn push(&mut self, v: T) {
+        self.n += 1;
+        if let Some(s) = self.segs.last_mut() {
+            if s.len() < SEG {
+                s.push(v);
+                return;
+            }
+        }
+        let mut s = Vec::with_capacity(SEG);
+        s.push(v);
+        self.segs.push(s);
+    }
+    fn len(&self) -> usize {
+        self.n
+    }
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.segs.iter().flatten()
+    }
+}
+
 struct TS {
-    claims: Vec<Vec<Claim>>,
-    pays: Vec<Vec<Pay>>,
-    cpays: Vec<Vec<CPay>>,
+    claims: Vec<Seg<Claim>>,
+    pays: Vec<Seg<Pay>>,
+    cpays: Vec<Seg<CPay>>,
     seq: u32,
 }
 impl TS {
     fn new() -> TS {
-        TS { claims: (0..ES).map(|_| Vec::new()).collect(), pays: (0..PS).map(|_| Vec::new()).collect(), cpays: (0..PS).map(|_| Vec::new()).collect(), seq: 0 }
+        TS { claims: (0..ES).map(|_| Seg::new()).collect(), pays: (0..PS).map(|_| Seg::new()).collect(), cpays: (0..PS).map(|_| Seg::new()).collect(), seq: 0 }
     }
 }
 
@@ -288,27 +384,62 @@ struct Sink<'a, 'b> {
     bad: Option<&'static str>,
 }
 
+#[inline(always)]
+fn pf<T>(p: *const T) {
+    unsafe { core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+}
+
 impl<'a, 'b> Sink<'a, 'b> {
+    /// Person key of an already resolved user ID.
     #[inline(always)]
-    fn person(&mut self, uid: u64) -> Option<(u64, u64)> {
-        let (key, loc) = match resolve(uid, self.base) {
-            Some(x) => x,
-            None => {
-                self.bad = Some("id too long");
-                return None;
-            }
-        };
+    fn person(&self, key: u64, loc: u64) -> (u64, u64) {
         if self.c.mode == 3 {
-            return Some((key, loc));
+            return (key, loc);
         }
-        if let Some(n) = self.c.links.find(key, loc) {
-            Some((LINKED | self.c.links.root[n as usize] as u64, 0))
-        } else {
-            Some((key, loc))
+        match self.c.links.find_root(key, loc) {
+            Some(r) => (LINKED | r as u64, 0),
+            None => (key, loc),
         }
     }
 
-    fn ev_row(&mut self, r: &EvRow) {
+    #[inline(always)]
+    fn res(&mut self, id: u64) -> (u64, u64) {
+        match resolve(id, self.base) {
+            Some(x) => x,
+            None => {
+                self.bad = Some("id too long");
+                (0, 0)
+            }
+        }
+    }
+
+    fn ev_batch(&mut self) {
+        let n = self.eb.n;
+        self.eb.n = 0;
+        if self.c.mode == 1 || n == 0 {
+            return;
+        }
+        let mut ek = [(0u64, 0u64); NB];
+        let mut uk = [(0u64, 0u64); NB];
+        for i in 0..n {
+            let eid = self.eb.eid[i];
+            let uid = self.eb.uid[i];
+            if eid != ID_EMPTY {
+                ek[i] = self.res(eid);
+            }
+            if uid != ID_EMPTY {
+                uk[i] = self.res(uid);
+                self.c.links.prefetch(uk[i].0);
+            }
+        }
+        for i in 0..n {
+            let r = self.eb.row(i);
+            self.ev_row(&r, ek[i], uk[i]);
+        }
+    }
+
+    #[inline(always)]
+    fn ev_row(&mut self, r: &EvRow, (ekey, eloc): (u64, u64), (ukey, uloc): (u64, u64)) {
         if r.eid == ID_EMPTY {
             return;
         }
@@ -316,10 +447,6 @@ impl<'a, 'b> Sink<'a, 'b> {
             self.bad = Some("ingest not F1");
             return;
         }
-        let Some((ekey, eloc)) = resolve(r.eid, self.base) else {
-            self.bad = Some("id too long");
-            return;
-        };
         if self.ridx >= (1 << 20) {
             self.bad = Some("too many rows in a chunk");
             return;
@@ -348,15 +475,36 @@ impl<'a, 'b> Sink<'a, 'b> {
             price = r.price;
             cat = if (r.product as usize) < c.cat_of.len() { c.cat_of[r.product as usize] } else { c.unknown_cat };
         }
-        if self.c.mode == 2 {
+        if c.mode == 2 {
             return;
         }
-        let Some((pkey, ploc)) = self.person(r.uid) else { return };
+        let (pkey, ploc) = self.person(ukey, uloc);
         let p = shard_h(mixk(pkey));
         self.st.pays[p].push(Pay { pkey, ploc, ts: rel as u32, pp: price | (r.kind as u32) << 24, seq, cat });
     }
 
-    fn ck_row(&mut self, r: &ClRow) {
+    fn ck_batch(&mut self) {
+        let n = self.cb.n;
+        self.cb.n = 0;
+        if self.c.mode == 1 || n == 0 {
+            return;
+        }
+        let mut uk = [(0u64, 0u64); NB];
+        for i in 0..n {
+            let uid = self.cb.uid[i];
+            if uid != ID_EMPTY {
+                uk[i] = self.res(uid);
+                self.c.links.prefetch(uk[i].0);
+            }
+        }
+        for i in 0..n {
+            let r = self.cb.row(i);
+            self.ck_row(&r, uk[i]);
+        }
+    }
+
+    #[inline(always)]
+    fn ck_row(&mut self, r: &ClRow, (ukey, uloc): (u64, u64)) {
         let c = self.c;
         if r.uid == ID_EMPTY || r.cid == ID_EMPTY {
             return;
@@ -369,11 +517,8 @@ impl<'a, 'b> Sink<'a, 'b> {
         if camp == u32::MAX {
             return;
         }
-        let Some((ckey, cloc)) = resolve(r.cid, self.base) else {
-            self.bad = Some("id too long");
-            return;
-        };
-        let Some((pkey, ploc)) = self.person(r.uid) else { return };
+        let (ckey, cloc) = self.res(r.cid);
+        let (pkey, ploc) = self.person(ukey, uloc);
         let p = shard_h(mixk(pkey));
         self.st.cpays[p].push(CPay { pkey, ploc, ckey, cloc, ts: (r.ts - lo) as u32, camp });
     }
@@ -384,15 +529,7 @@ impl<'a, 'b> EventSink for Sink<'a, 'b> {
         &mut *self.eb
     }
     fn ev_flush(&mut self) {
-        let n = self.eb.n;
-        self.eb.n = 0;
-        if self.c.mode == 1 {
-            return;
-        }
-        for i in 0..n {
-            let r = self.eb.row(i);
-            self.ev_row(&r);
-        }
+        self.ev_batch();
     }
 }
 impl<'a, 'b> ClickSink for Sink<'a, 'b> {
@@ -400,15 +537,7 @@ impl<'a, 'b> ClickSink for Sink<'a, 'b> {
         &mut *self.cb
     }
     fn ck_flush(&mut self) {
-        let n = self.cb.n;
-        self.cb.n = 0;
-        if self.c.mode == 1 {
-            return;
-        }
-        for i in 0..n {
-            let r = self.cb.row(i);
-            self.ck_row(&r);
-        }
+        self.ck_batch();
     }
 }
 
@@ -602,6 +731,10 @@ fn canon_num(d: &[u8]) -> Option<u32> {
     Some(d.iter().fold(0u32, |a, &b| a * 10 + (b - b'0') as u32))
 }
 
+extern "C" {
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
 fn lap(log: bool, last: &mut std::time::Instant, t0: std::time::Instant, what: &str) {
     if log {
         let now = std::time::Instant::now();
@@ -741,6 +874,10 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
             } else {
                 buf
             };
+            unsafe {
+                let a = (buf.as_ptr() as usize) & !4095;
+                madvise(a as *mut u8, buf.as_ptr() as usize + buf.len() - a, 22);
+            }
             let eb = std::mem::replace(eb, EvBatch::new());
             let cb = std::mem::replace(cb, CkBatch::new());
             let mut sink = Sink { c: &ctx, st: ts, eb, cb, base: buf.as_ptr(), chunk: i as u32, ridx: 0, bad: None };
@@ -776,7 +913,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
         |(tab, cl), s| {
             cl.clear();
             for (t, st) in ts_states.iter().enumerate() {
-                for c in &st.claims[s] {
+                for c in st.claims[s].iter() {
                     cl.push((*c, t as u32));
                 }
             }
@@ -823,12 +960,14 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
             tab.reset(n_ev);
             let mut pk: Vec<(u64, u64)> = Vec::new();
             let mut pid: Vec<u32> = Vec::with_capacity(n_ev);
-            let mut kept: Vec<Pay> = Vec::with_capacity(n_ev);
+            let mut nkept = 0usize;
             for (t, st) in ts_states.iter().enumerate() {
-                for y in &st.pays[p] {
+                for y in st.pays[p].iter() {
                     if lost[t][y.seq as usize].load(Ordering::Relaxed) != 0 {
+                        pid.push(u32::MAX);
                         continue;
                     }
+                    nkept += 1;
                     let h = mixk(y.pkey);
                     let id = match tab.find(h, |i| {
                         let q = pk[i as usize];
@@ -843,30 +982,38 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
                         }
                     };
                     pid.push(id);
-                    kept.push(*y);
                 }
             }
             let np = pk.len();
             let mut off = vec![0u32; np + 1];
             for &i in &pid {
-                off[i as usize + 1] += 1;
+                if i != u32::MAX {
+                    off[i as usize + 1] += 1;
+                }
             }
             for i in 0..np {
                 off[i + 1] += off[i];
             }
             let mut pos: Vec<u32> = off[..np].to_vec();
-            let mut pe = vec![PE { ts: 0, pt: 0, cat: 0 }; kept.len()];
-            for (k, y) in kept.iter().enumerate() {
-                let q = &mut pos[pid[k] as usize];
-                pe[*q as usize] = PE { ts: ws + y.ts as i64, pt: y.pp, cat: y.cat };
-                *q += 1;
+            let mut pe = vec![PE { ts: 0, pt: 0, cat: 0 }; nkept];
+            let mut k = 0usize;
+            for st in ts_states.iter() {
+                for y in st.pays[p].iter() {
+                    let i = pid[k];
+                    k += 1;
+                    if i != u32::MAX {
+                        let q = &mut pos[i as usize];
+                        pe[*q as usize] = PE { ts: ws + y.ts as i64, pt: y.pp, cat: y.cat };
+                        *q += 1;
+                    }
+                }
             }
             // clicks of known people
             let lo = ws - WEEK_MS;
             let mut cid: Vec<u32> = Vec::new();
             let mut coff = vec![0u32; np + 1];
             for st in &ts_states {
-                for x in &st.cpays[p] {
+                for x in st.cpays[p].iter() {
                     let h = mixk(x.pkey);
                     let id = match tab.find(h, |i| {
                         let q = pk[i as usize];
@@ -888,7 +1035,7 @@ pub fn run(data_dir: &Path, out_dir: &Path, ncpu: usize) -> R<()> {
             let mut pc = vec![PC { ts: 0, ckey: 0, cloc: 0, camp: 0 }; coff[np] as usize];
             let mut k = 0usize;
             for st in &ts_states {
-                for x in &st.cpays[p] {
+                for x in st.cpays[p].iter() {
                     let i = cid[k];
                     k += 1;
                     if i != u32::MAX {
