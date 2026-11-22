@@ -1,11 +1,12 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::scatter::{EV_STAGE, EvRec, PARTS, Scatter, part_of};
-use crate::{DAY, EvP, LazyChunks, P, PB, People, ReadAhead, Users, event_rows, lap, parse_price};
+use crate::scatter::{EV_STAGE, EvRec, PART_BITS, PARTS, Scatter, part_of};
+use crate::{DAY, EvP, LazyChunks, P, PB, People, ReadAhead, event_rows, lap, parse_price};
 use ahash::AHashMap;
 use rayon::prelude::*;
-use std::mem::{MaybeUninit, size_of};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::mem::size_of;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 const SHARDS: usize = 2048;
 const SHARD_BITS: u32 = SHARDS.trailing_zeros();
@@ -78,7 +79,9 @@ pub(super) fn user_ident(uid: &[u8]) -> (u64, u32) {
         Some(key) => (key, 0),
         None => {
             let (key, check) = crate::hs(uid, USER_ID_SEED);
-            (key & (u64::MAX >> 1), check)
+            // Zero marks an empty table slot, so a (vanishingly rare) zero hash becomes 1:
+            // every partition and table then sees the same key.
+            ((key & (u64::MAX >> 1)).max(1), check)
         }
     }
 }
@@ -114,25 +117,6 @@ impl PersonName {
     }
 }
 
-fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec<&'static [u8]>)> {
-    let n = (users.next.load(Relaxed) as usize).min(users.names.len());
-    if n < linked.len() || n >= crate::PERSON_SET as usize {
-        return None;
-    }
-    // Every name slot holds a direct reference (pointer + length) to the
-    // user's bytes, so no per-person decode or allocation is needed.
-    let names: Vec<&'static [u8]> = (linked.len()..n)
-        .into_par_iter()
-        .map(|id| {
-            let v = users.names[id].load(Relaxed);
-            if v == 0 { &[][..] } else { crate::unpack_ref(v) }
-        })
-        .collect();
-    let mut all = Vec::with_capacity(n);
-    all.extend_from_slice(linked);
-    all.extend(names);
-    Some((n.div_ceil(P) as u32, all))
-}
 
 /// A producer owns disjoint blocks within demand-paged slabs. Stream order is
 /// described by its block IDs. No initialized record moves when a stream grows.
@@ -267,128 +251,28 @@ struct Folds {
 }
 
 impl Folds {
+    #[cfg(test)]
     fn new() -> Self {
         Self { short: Streams::new(), long: Streams::new() }
     }
 }
 
-const LOC_INDEX_BITS: u32 = 28 - PB;
+// A copy's location tells dedup which payload to tombstone. Bit 31 picks its home:
+//  - clear: a row already in its final person partition, written by the worker
+//    that resolved it: worker (4 bits), person partition (PB bits), index.
+//  - set: a row in the move list of its uid partition (its person lives in
+//    another partition): uid partition (PART_BITS bits), index. Stage 5
+//    re-scatters only the rows that survive dedup.
+const LOC_INDEX_BITS: u32 = 27 - PB;
 const LOC_PART_SHIFT: u32 = LOC_INDEX_BITS;
 const LOC_WORKER_SHIFT: u32 = LOC_PART_SHIFT + PB;
 const INDEX_MASK: u32 = (1 << LOC_INDEX_BITS) - 1;
+const MAX_WORKERS: u32 = 1 << (31 - LOC_WORKER_SHIFT);
+const MOVED: u32 = 1 << 31;
+const MOVE_INDEX_BITS: u32 = 31 - PART_BITS;
+const MOVE_INDEX_MASK: u32 = (1 << MOVE_INDEX_BITS) - 1;
 const NO_LOC: u32 = u32::MAX;
-
-// Sixteen 12-byte rows fill three 64-byte lines. All 512 buffers occupy 96 KiB
-// per worker. A location is assigned on enqueue, before its payload is flushed.
-const PAYLOAD_ROWS: usize = 16;
-
-#[repr(align(64))]
-struct PayloadBatch([MaybeUninit<EvP>; PAYLOAD_ROWS]);
-
-struct PeopleWriter<'a> {
-    batches: [PayloadBatch; P],
-    positions: [usize; P],
-    base: *mut EvP,
-    stride: usize,
-    lengths: &'a mut [usize; P],
-    overflow: &'a mut [Vec<EvP>; P],
-}
-
-impl<'a> PeopleWriter<'a> {
-    fn new(people: &'a mut People) -> Self {
-        assert!(people.lengths.iter().all(|&n| n == 0));
-        assert!(people.overflow.iter().all(Vec::is_empty));
-        let base = people.storage.as_mut().map_or(std::ptr::null_mut(), |map| map.as_mut_ptr().cast());
-        Self {
-            batches: std::array::from_fn(|_| PayloadBatch([const { MaybeUninit::uninit() }; PAYLOAD_ROWS])),
-            positions: [0; P],
-            base,
-            stride: people.stride,
-            lengths: &mut people.lengths,
-            overflow: &mut people.overflow,
-        }
-    }
-
-    #[inline]
-    fn push(&mut self, part: usize, person: u32, ts: u32, price: u32) -> usize {
-        let index = self.positions[part];
-        let slot = index % PAYLOAD_ROWS;
-        self.batches[part].0[slot].write(EvP { person, ts: AtomicU32::new(ts), price });
-        self.positions[part] = index + 1;
-        if slot + 1 == PAYLOAD_ROWS {
-            self.flush(part, PAYLOAD_ROWS);
-        }
-        index
-    }
-
-    #[inline]
-    fn flush(&mut self, part: usize, count: usize) {
-        let src = self.batches[part].0.as_ptr().cast::<EvP>();
-        let start = self.lengths[part];
-        let mapped = count.min(self.stride - start);
-        if mapped != 0 {
-            // This prefix of the batch is initialized. The destination follows
-            // all previous batches and is exclusively owned by this producer.
-            unsafe {
-                copy_people(src, self.base.add(part * self.stride + start), mapped);
-            }
-            self.lengths[part] = start + mapped;
-        }
-        if mapped != count {
-            let tail = &mut self.overflow[part];
-            let added = count - mapped;
-            let len = tail.len();
-            tail.reserve(added);
-            // The rest of the initialized batch fits in reserved, uninitialized
-            // space after the tail. No row needs to be dropped from the staging buffer.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.add(mapped), tail.as_mut_ptr().add(len), added);
-                tail.set_len(len + added);
-            }
-        }
-    }
-
-    fn finish(mut self) {
-        for part in 0..P {
-            let pending = self.positions[part] % PAYLOAD_ROWS;
-            if pending != 0 {
-                self.flush(part, pending);
-            }
-        }
-    }
-}
-
-impl Drop for PeopleWriter<'_> {
-    fn drop(&mut self) {
-        // All streaming destinations are disjoint. Fence before the borrow
-        // ends so dedup can read or tombstone these rows on any thread.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
-        #[allow(unused_unsafe)]
-        // Older compilers require an unsafe call. AVX implies SSE.
-        unsafe {
-            std::arch::x86_64::_mm_sfence();
-        }
-    }
-}
-
-#[inline]
-unsafe fn copy_people(src: *const EvP, dst: *mut EvP, count: usize) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
-    if count == PAYLOAD_ROWS && dst as usize % 64 == 0 {
-        use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
-        let src = src.cast::<__m256i>();
-        let dst = dst.cast::<__m256i>();
-        // The staging buffer and destination are line-aligned. No destination
-        // is reused, and the producer fences its stores before exposing People.
-        unsafe {
-            for lane in 0..PAYLOAD_ROWS * size_of::<EvP>() / size_of::<__m256i>() {
-                _mm256_stream_si256(dst.add(lane), _mm256_load_si256(src.add(lane)));
-            }
-        }
-        return;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(src, dst, count) };
-}
+const _: () = assert!(PARTS >= P);
 
 trait Fields<'a> {
     fn field<const I: usize>(&self) -> &'a [u8];
@@ -849,104 +733,349 @@ fn scatter_events(
     })
 }
 
-/// Stub for stages 4-7 of the redesign: until P2 exists, resolve each record
-/// against the shared person table and place it exactly where the previous
-/// parser did, so today's dedup, sessionize and write stages run unchanged.
-/// Workers take whole uid-hash partitions, so the table lookups of one
-/// partition stay close together.
+/// Resolves a click's user to a person: (uid partition, key, check).
+pub(super) type Resolve<'a> = dyn Fn(usize, u64, u32) -> Option<u32> + Sync + 'a;
+
+/// Stage 2: the all-uid link map split by hash(uid) into the uid partitions
+/// that events and clicks use. Each entry is a (key, value) pair of the link
+/// table, where the value holds the check and the person.
+pub(super) struct LinkShards {
+    start: Vec<usize>,
+    entries: Vec<(u64, u64)>,
+}
+
+impl LinkShards {
+    pub(super) fn build(table: &[(u64, u64)]) -> Self {
+        const CHUNK: usize = 1 << 16;
+        let counts: Vec<Vec<u32>> = table
+            .par_chunks(CHUNK)
+            .map(|chunk| {
+                let mut n = vec![0u32; PARTS];
+                for &(key, _) in chunk {
+                    if key != 0 {
+                        n[part_of(key)] += 1;
+                    }
+                }
+                n
+            })
+            .collect();
+        let mut start = vec![0usize; PARTS + 1];
+        for n in &counts {
+            for part in 0..PARTS {
+                start[part + 1] += n[part] as usize;
+            }
+        }
+        for part in 0..PARTS {
+            start[part + 1] += start[part];
+        }
+        // Each chunk writes its entries after those of earlier chunks, so
+        // every write goes to a distinct slot of a distinct (chunk, part) range.
+        let mut cursors = Vec::with_capacity(counts.len());
+        let mut running = start[..PARTS].to_vec();
+        for n in &counts {
+            cursors.push(running.clone());
+            for part in 0..PARTS {
+                running[part] += n[part] as usize;
+            }
+        }
+        let mut entries = vec![(0u64, 0u64); start[PARTS]];
+        let base = entries.as_mut_ptr() as usize;
+        table.par_chunks(CHUNK).zip(cursors).for_each(|(chunk, mut cursor)| {
+            for &(key, value) in chunk {
+                if key != 0 {
+                    let part = part_of(key);
+                    // The ranges computed above are disjoint and in bounds.
+                    unsafe { (base as *mut (u64, u64)).add(cursor[part]).write((key, value)) };
+                    cursor[part] += 1;
+                }
+            }
+        });
+        Self { start, entries }
+    }
+
+    fn shard(&self, part: usize) -> &[(u64, u64)] {
+        &self.entries[self.start[part]..self.start[part + 1]]
+    }
+}
+
+/// How many dense ids a partition takes from its person partition at a time.
+const ID_BLOCK: u32 = 16;
+
+/// Hands out ids of unlinked people. Id = first + k * P + q puts the person in
+/// person partition q with local index first / P + k. Two uid partitions share
+/// each person partition, so they draw their k from one counter, in blocks.
+struct IdBlock<'a> {
+    next: &'a AtomicU32,
+    first: u64,
+    q: u64,
+    cur: u32,
+    end: u32,
+}
+
+impl IdBlock<'_> {
+    #[inline]
+    fn fresh(&mut self, declined: &AtomicBool) -> u32 {
+        if self.cur == self.end {
+            self.cur = self.next.fetch_add(ID_BLOCK, Relaxed);
+            self.end = self.cur.wrapping_add(ID_BLOCK);
+        }
+        let id = self.first + u64::from(self.cur) * P as u64 + self.q;
+        self.cur = self.cur.wrapping_add(1);
+        if id >= crate::PERSON_SET {
+            declined.store(true, Relaxed);
+            return 0;
+        }
+        id as u32
+    }
+}
+
+/// One uid partition's map from user key to person: the partition's link
+/// shard, plus every unlinked user seen on a valid event. Only this
+/// partition's worker writes it, so no atomics are needed. A user with no
+/// link is its own person.
+struct PartTab {
+    slots: Vec<(u64, u64)>,
+    mask: usize,
+    used: usize,
+    /// Unlinked people created here: (person id, packed reference to the uid bytes).
+    fresh: Vec<(u32, u64)>,
+}
+
+impl PartTab {
+    fn new(shard: &[(u64, u64)], extra: usize) -> Self {
+        let cap = ((shard.len() + extra) * 2).next_power_of_two().max(16);
+        let mut tab = Self { slots: vec![(0, 0); cap], mask: cap - 1, used: 0, fresh: Vec::new() };
+        for &(key, value) in shard {
+            tab.place(key, value);
+        }
+        tab
+    }
+
+    #[inline]
+    fn place(&mut self, key: u64, value: u64) {
+        let mut i = key as usize & self.mask;
+        while self.slots[i].0 != 0 {
+            i = (i + 1) & self.mask;
+        }
+        self.slots[i] = (key, value);
+        self.used += 1;
+    }
+
+    fn grow(&mut self) {
+        let old = std::mem::replace(&mut self.slots, vec![(0, 0); (self.mask + 1) * 2]);
+        self.mask = self.slots.len() - 1;
+        self.used = 0;
+        for (key, value) in old {
+            if key != 0 {
+                self.place(key, value);
+            }
+        }
+    }
+
+    /// The person of a user that is linked or has a valid event.
+    #[inline]
+    fn find(&self, key: u64, check: u32, declined: &AtomicBool) -> Option<u32> {
+        let key = key.max(1);
+        let mut i = key as usize & self.mask;
+        loop {
+            let (k, value) = self.slots[i];
+            if k == 0 {
+                return None;
+            }
+            if k == key {
+                if (value >> 32) as u32 != check {
+                    declined.store(true, Relaxed);
+                    return None;
+                }
+                return Some(value as u32 & (crate::PERSON_SET as u32 - 1));
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// The person of a user on a valid event copy, creating an unlinked one.
+    #[inline]
+    fn person(&mut self, key: u64, check: u32, name: u64, ids: &mut IdBlock<'_>, declined: &AtomicBool) -> u32 {
+        if self.used * 2 > self.slots.len() {
+            self.grow();
+        }
+        let key = key.max(1);
+        let mut i = key as usize & self.mask;
+        loop {
+            let (k, value) = self.slots[i];
+            if k == 0 {
+                let id = ids.fresh(declined);
+                self.slots[i] = (key, (u64::from(check) << 32) | crate::PERSON_SET | u64::from(id));
+                self.used += 1;
+                self.fresh.push((id, name));
+                return id;
+            }
+            if k == key {
+                if (value >> 32) as u32 != check {
+                    declined.store(true, Relaxed);
+                }
+                return value as u32 & (crate::PERSON_SET as u32 - 1);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// Output of stage 4: dedup claims by event key, the rows already in their
+/// person partition, the move lists and each uid partition's user map.
+struct Resolved {
+    claims: Vec<Folds>,
+    people: Vec<People>,
+    moves: Vec<OnceLock<Vec<EvP>>>,
+    tabs: Vec<OnceLock<PartTab>>,
+    /// Next unused local index of each person partition's unlinked people.
+    next_local: Vec<AtomicU32>,
+}
+
+/// Stage 4a and 4c, per uid partition and in cache: resolve each user to its
+/// person from the partition's link shard (an unlinked user is its own
+/// person), keep rows whose person partition is this partition's home in
+/// place, and put the rest in the partition's move list. Every well-formed
+/// event ID also leaves a claim for the dedup by event key.
 fn resolve_events(
     scatters: &[Scatter<EvRec, EV_STAGE>],
-    users: &Users<'_>,
+    shards: &LinkShards,
+    first_id: usize,
     declined: &AtomicBool,
     estimated_rows: usize,
-) -> (Vec<Folds>, Vec<People>) {
+) -> Resolved {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
-    let reservation = (rows_per_partition + rows_per_partition / 4)
-        .clamp(PAYLOAD_ROWS, INDEX_MASK as usize + 1)
-        .next_multiple_of(PAYLOAD_ROWS);
+    let reservation = (rows_per_partition + rows_per_partition / 4).clamp(16, INDEX_MASK as usize + 1);
+    let moves: Vec<OnceLock<Vec<EvP>>> = (0..PARTS).map(|_| OnceLock::new()).collect();
+    let tabs: Vec<OnceLock<PartTab>> = (0..PARTS).map(|_| OnceLock::new()).collect();
+    let next_local: Vec<AtomicU32> = (0..P).map(|_| AtomicU32::new(0)).collect();
     let mut parsed: Vec<_> = rayon::broadcast(|_| {
         let worker = workers.fetch_add(1, Relaxed) as u32;
-        let too_many = worker >= 1 << (32 - LOC_WORKER_SHIFT);
+        let too_many = worker >= MAX_WORKERS;
         if too_many {
             declined.store(true, Relaxed);
         }
         let mut people = People::new(if too_many { 0 } else { reservation });
-        let streams = {
-            let mut writer = PeopleWriter::new(&mut people);
-            let mut short = Streams::<Claim, SHARDS>::new();
-            let mut long = Streams::<LongClaim, SHARDS>::new();
-            let mut ids = (0u32, 0u32);
-            loop {
-                let part = next.fetch_add(1, Relaxed);
-                if part >= PARTS {
-                    break;
-                }
-                for scatter in scatters {
-                    for rows in scatter.records(part) {
-                        for (i, rec) in rows.iter().enumerate() {
-                            if let Some(ahead) = rows.get(i + 8) {
-                                if ahead.ts != INVALID {
-                                    users.prefetch(ahead.ukey);
-                                }
-                            }
-                            let loc = if rec.ts != INVALID {
-                                let person = users.person(rec.ukey, rec.uchk, rec.name, &mut ids, declined);
-                                let part = person as usize & (P - 1);
-                                let index = writer.push(part, person, rec.ts, rec.price);
-                                if index >= INDEX_MASK as usize {
+        let mut short = Streams::<Claim, SHARDS>::new();
+        let mut long = Streams::<LongClaim, SHARDS>::new();
+        loop {
+            let part = next.fetch_add(1, Relaxed);
+            if part >= PARTS {
+                break;
+            }
+            let home = part & (P - 1);
+            let total: usize = scatters.iter().map(|s| s.records(part).iter().map(|r| r.len()).sum::<usize>()).sum();
+            let mut tab = PartTab::new(shards.shard(part), total / 16);
+            let mut ids = IdBlock { next: &next_local[home], first: first_id as u64, q: home as u64, cur: 0, end: 0 };
+            let mut moved: Vec<EvP> = Vec::new();
+            for scatter in scatters {
+                for rows in scatter.records(part) {
+                    for rec in rows {
+                        let loc = if rec.ts != INVALID {
+                            let person = tab.person(rec.ukey, rec.uchk, rec.name, &mut ids, declined);
+                            let q = person as usize & (P - 1);
+                            let row = EvP { person, ts: AtomicU32::new(rec.ts), price: rec.price };
+                            if q == home {
+                                let index = people.len(q);
+                                if index >= INDEX_MASK as usize || too_many {
                                     declined.store(true, Relaxed);
                                     continue;
                                 }
-                                (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
+                                people.push(q, row);
+                                (worker << LOC_WORKER_SHIFT) | ((q as u32) << LOC_PART_SHIFT) | index as u32
                             } else {
-                                // Invalid copies still compete for the earliest
-                                // ingest, but have no payload to keep or tombstone.
-                                NO_LOC
-                            };
-                            let shard = shard_of(rec.ekey);
-                            if rec.eref != 0 {
-                                long.push(shard, LongClaim { key: rec.ekey, eref: rec.eref, ingest: rec.ingest, loc });
-                            } else {
-                                short.push(shard, Claim { key: rec.ekey, ingest: rec.ingest, loc });
+                                let index = moved.len();
+                                if index >= MOVE_INDEX_MASK as usize {
+                                    declined.store(true, Relaxed);
+                                    continue;
+                                }
+                                moved.push(row);
+                                MOVED | ((part as u32) << MOVE_INDEX_BITS) | index as u32
                             }
+                        } else {
+                            // Invalid copies still compete for the earliest
+                            // ingest, but have no payload to keep or tombstone.
+                            NO_LOC
+                        };
+                        let shard = shard_of(rec.ekey);
+                        if rec.eref != 0 {
+                            long.push(shard, LongClaim { key: rec.ekey, eref: rec.eref, ingest: rec.ingest, loc });
+                        } else {
+                            short.push(shard, Claim { key: rec.ekey, ingest: rec.ingest, loc });
                         }
                     }
                 }
             }
-            writer.finish();
-            Folds { short, long }
-        };
-        (worker, streams, people)
+            let _ = moves[part].set(moved);
+            let _ = tabs[part].set(tab);
+        }
+        (worker, Folds { short, long }, people)
     });
     // `broadcast` returns results in completion order, but locations encode
     // the assigned worker id, so restore that order before indexing.
     parsed.sort_unstable_by_key(|(worker, _, _)| *worker);
-    let mut streams = Vec::with_capacity(parsed.len());
+    let mut claims = Vec::with_capacity(parsed.len());
     let mut people = Vec::with_capacity(parsed.len());
-    for (_, s, p) in parsed {
-        streams.push(s);
+    for (_, c, p) in parsed {
+        claims.push(c);
         people.push(p);
     }
-    (streams, people)
+    Resolved { claims, people, moves, tabs, next_local }
 }
 
-fn events(
-    work: &LazyChunks<'_>,
-    read_ahead: &ReadAhead,
-    users: &Users<'_>,
-    input: &EventInput<'_>,
-    declined: &AtomicBool,
-    estimated_rows: usize,
-) -> (Vec<Folds>, Vec<People>) {
-    let scatters = scatter_events(work, read_ahead, input, declined, estimated_rows);
-    lap("  events scattered");
-    let result = resolve_events(&scatters, users, declined, estimated_rows);
-    lap("  events resolved");
-    // The process exits right after the run; skip unmapping the arenas.
-    std::mem::forget(scatters);
-    result
+/// Names of all dense person ids: the linked people (by root, in order), then
+/// the unlinked ones. Ids no one used are empty and have no events.
+fn person_names(
+    tabs: &[OnceLock<PartTab>],
+    next_local: &[AtomicU32],
+    linked: &[&'static [u8]],
+) -> Option<(u32, Vec<&'static [u8]>)> {
+    let first = linked.len().div_ceil(P) * P;
+    let used = next_local.iter().map(|k| k.load(Relaxed) as usize).max().unwrap_or(0);
+    let n = first + used * P;
+    if n >= crate::PERSON_SET as usize {
+        return None;
+    }
+    let refs_owner: Vec<u64> = vec![0; n - first];
+    // Every id is written by exactly one partition (ids are unique); zero pages stay lazy.
+    let refs = unsafe { std::slice::from_raw_parts(refs_owner.as_ptr().cast::<AtomicU64>(), n - first) };
+    tabs.par_iter().for_each(|tab| {
+        for &(id, name) in &tab.get().unwrap().fresh {
+            refs[id as usize - first].store(name, Relaxed);
+        }
+    });
+    let mut names = Vec::with_capacity(n);
+    names.extend_from_slice(linked);
+    names.resize(first, &[][..]);
+    let fresh: Vec<&'static [u8]> = (0..n - first)
+        .into_par_iter()
+        .map(|i| match refs[i].load(Relaxed) {
+            0 => &[][..],
+            r => crate::unpack_ref(r),
+        })
+        .collect();
+    names.extend(fresh);
+    Some(((n / P) as u32, names))
+}
+
+/// Stage 5: re-scatter the move lists to their person partitions in one pass.
+/// Only rows that survived dedup move. Worker `w` takes every `W`th uid
+/// partition and appends to its own `People`, so nothing is shared.
+fn rescatter(people: &mut [People], moves: &[OnceLock<Vec<EvP>>]) {
+    let workers = people.len().max(1);
+    people.par_iter_mut().enumerate().for_each(|(worker, people)| {
+        for part in (worker..PARTS).step_by(workers) {
+            for row in moves[part].get().map_or(&[][..], |list| list.as_slice()) {
+                let ts = row.ts.load(Relaxed);
+                if ts != INVALID {
+                    let q = row.person as usize & (P - 1);
+                    people.push(q, EvP { person: row.person, ts: AtomicU32::new(ts), price: row.price });
+                }
+            }
+        }
+    });
 }
 
 // One 16-byte cell holds the full event key, the winning ingest time and the
@@ -962,6 +1091,12 @@ struct Slot {
     key: u64,
     meta: u32,
     loc: u32,
+}
+
+/// Where dedup finds a claim's payload to tombstone.
+struct Placed<'a> {
+    people: &'a [People],
+    moves: &'a [OnceLock<Vec<EvP>>],
 }
 
 struct Router {
@@ -986,18 +1121,24 @@ impl Router {
     }
 
     #[inline]
-    fn tombstone(people: &[People], loc: u32) {
+    fn tombstone(placed: &Placed<'_>, loc: u32) {
         if loc == NO_LOC {
+            return;
+        }
+        // The payload is already in its slot; only its timestamp changes.
+        if loc & MOVED != 0 {
+            let part = ((loc & !MOVED) >> MOVE_INDEX_BITS) as usize;
+            let index = (loc & MOVE_INDEX_MASK) as usize;
+            placed.moves[part].get().unwrap()[index].ts.store(INVALID, Relaxed);
             return;
         }
         let worker = (loc >> LOC_WORKER_SHIFT) as usize;
         let part = ((loc >> LOC_PART_SHIFT) as usize) & (P - 1);
         let index = (loc & INDEX_MASK) as usize;
-        // The payload is already in its final slot; only its timestamp changes.
-        people[worker].get(part, index).ts.store(INVALID, Relaxed);
+        placed.people[worker].get(part, index).ts.store(INVALID, Relaxed);
     }
 
-    fn route(&mut self, people: &[People], claims: &[Folds], shard: usize) {
+    fn route(&mut self, people: &Placed<'_>, claims: &[Folds], shard: usize) {
         let begin = std::time::Instant::now();
         // Every record is one logical claim, so physical counts size the table.
         let count: usize = claims.iter().map(|fold| fold.short.len(shard) + fold.long.len(shard)).sum();
@@ -1096,32 +1237,41 @@ impl Router {
 pub(super) fn run_events<C: Send>(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
-    users: &Users<'_>,
+    shards: &LinkShards,
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
     estimated_rows: usize,
-    parse_clicks: impl FnOnce() -> C + Send,
+    parse_clicks: impl FnOnce(&Resolve<'_>) -> C + Send,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>, C)> {
-    let (claims, people) = events(work, read_ahead, users, input, declined, estimated_rows);
+    let scatters = scatter_events(work, read_ahead, input, declined, estimated_rows);
+    lap("  events scattered");
+    let mut resolved = resolve_events(&scatters, shards, linked_names.len().div_ceil(P) * P, declined, estimated_rows);
+    lap("  events resolved");
+    // The process exits right after the run; skip unmapping the arenas.
+    std::mem::forget(scatters);
     if declined.load(Relaxed) {
         return None;
     }
-    let (local_count, names) = person_names(users, linked_names)?;
+    let (local_count, names) = person_names(&resolved.tabs, &resolved.next_local, linked_names)?;
     lap(&format!(
         "events parsed (nova, {} folds, {} persons)",
-        claims.len(),
+        resolved.claims.len(),
         names.len()
     ));
     if declined.load(Relaxed) {
         return None;
     }
-    // Event parsing finished populating Users. Dedup only touches the event
-    // payloads, so click parsing can now resolve users while we tombstone.
+    // Resolution finished building every partition's user map. Dedup only
+    // touches event payloads, so click parsing can resolve users meanwhile.
+    let resolve = |part: usize, key: u64, check: u32| {
+        resolved.tabs[part].get().and_then(|tab| tab.find(key, check, declined))
+    };
     let ((), clicks) = rayon::join(
         || {
+            let placed = Placed { people: &resolved.people, moves: &resolved.moves };
             let routers = crate::pt((0..SHARDS).into_par_iter(), Router::new, |mut router, shard| {
-                router.route(&people, &claims, shard);
+                router.route(&placed, &resolved.claims, shard);
                 router
             });
             if std::env::var_os("TIMING").is_some() {
@@ -1130,42 +1280,22 @@ pub(super) fn run_events<C: Send>(
                 }
             }
             lap("  dedup tombstoned");
-            drop(claims);
             lap("events dedup + validate");
         },
-        parse_clicks,
+        || parse_clicks(&resolve),
     );
     if declined.load(Relaxed) {
         return None;
     }
-    Some((local_count, names, people, clicks))
+    drop(resolved.claims);
+    rescatter(&mut resolved.people, &resolved.moves);
+    lap("  moves re-scattered");
+    Some((local_count, names, resolved.people, clicks))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn place_long(
-        people: &mut PeopleWriter<'_>,
-        claims: &mut [Folds],
-        key: u64,
-        eref: u64,
-        ingest: i32,
-        person: u32,
-        ts: u32,
-        price: u32,
-    ) {
-        let part = person as usize & (P - 1);
-        let index = people.push(part, person, ts, price);
-        let loc = ((part as u32) << LOC_PART_SHIFT) | index as u32;
-        claims[0].long.push(0, LongClaim { key, eref, ingest, loc });
-    }
-
-    fn live_rows(people: &People, part: usize) -> Vec<(u32, u32)> {
-        people.records(part).into_iter().flatten()
-            .filter_map(|r| r.live().map(|ts| (ts, r.price)))
-            .collect()
-    }
 
     fn leak(b: &[u8]) -> &'static [u8] {
         Box::leak(b.to_vec().into_boxed_slice())
@@ -1177,26 +1307,49 @@ mod tests {
         EvRec { ekey, eref, ukey, name: crate::pack_ref(leak(user)).unwrap(), ingest, ts, price, uchk }
     }
 
-    /// Run records through the P1 stub and today's dedup, and return the live
-    /// (person name, ts, price) rows, sorted.
-    fn run_stub(recs: &[EvRec], force_part: Option<usize>) -> (Vec<(Vec<u8>, u32, u32)>, bool) {
-        let mut tab = crate::Tab::new(16);
-        let users = Users::new(&mut tab, 0, 0);
+    type Live = Vec<(Vec<u8>, u32, u32)>;
+
+    /// Run records through stage 4 (resolve), dedup and stage 5 (re-scatter)
+    /// and return the live (person name, ts, price) rows, sorted. `links` are
+    /// (user ID, linked person) pairs and `linked_names` the names of the
+    /// linked people, as stage 2 would produce them.
+    fn run_pipeline(
+        recs: &[EvRec],
+        force_part: Option<usize>,
+        links: &[(&[u8], u32)],
+        linked_names: &[&'static [u8]],
+    ) -> (Live, bool) {
+        let mut table = vec![(0u64, 0u64); 64];
+        for &(uid, person) in links {
+            let (key, check) = user_ident(uid);
+            let mut i = key as usize & 63;
+            while table[i].0 != 0 {
+                i = (i + 1) & 63;
+            }
+            table[i] = (key, (u64::from(check) << 32) | crate::PERSON_SET | u64::from(person));
+        }
+        let shards = LinkShards::build(&table);
         let declined = AtomicBool::new(false);
         let mut scatter = Scatter::<EvRec, EV_STAGE>::new(4);
         for r in recs {
             scatter.push(force_part.unwrap_or_else(|| part_of(r.ukey)), *r);
         }
         scatter.finish();
-        let (claims, people) = resolve_events(&[scatter], &users, &declined, recs.len());
+        let first = linked_names.len().div_ceil(P) * P;
+        let mut resolved = resolve_events(&[scatter], &shards, first, &declined, recs.len());
+        let placed = Placed { people: &resolved.people, moves: &resolved.moves };
         for shard in 0..SHARDS {
-            Router::new().route(&people, &claims, shard);
+            Router::new().route(&placed, &resolved.claims, shard);
         }
-        let (_, names) = person_names(&users, &[]).unwrap();
+        rescatter(&mut resolved.people, &resolved.moves);
+        let Some((_, names)) = person_names(&resolved.tabs, &resolved.next_local, linked_names) else {
+            return (Vec::new(), true);
+        };
         let mut live = Vec::new();
-        for p in &people {
+        for p in &resolved.people {
             for part in 0..P {
                 for r in p.records(part).into_iter().flatten() {
+                    assert_eq!(r.person as usize & (P - 1), part, "row in the wrong person partition");
                     if let Some(ts) = r.live() {
                         live.push((names[r.person as usize].to_vec(), ts, r.price));
                     }
@@ -1205,6 +1358,10 @@ mod tests {
         }
         live.sort();
         (live, declined.load(Relaxed))
+    }
+
+    fn run_stub(recs: &[EvRec], force_part: Option<usize>) -> (Live, bool) {
+        run_pipeline(recs, force_part, &[], &[])
     }
 
     #[test]
@@ -1259,6 +1416,61 @@ mod tests {
     }
 
     #[test]
+    fn linked_users_share_a_person_and_moved_copies_dedup_across_partitions() {
+        // Aliases a and b of one person live in different uid partitions, and the
+        // person's partition is neither. Copies of one event ID under both aliases
+        // (the later copy names another user) must leave exactly the earliest.
+        let a: &[u8] = b"u0000001";
+        let b: &[u8] = b"u0000002";
+        let c: &[u8] = b"u0000003";
+        let person = 5u32;
+        let links = [(a, person), (b, person)];
+        let linked_names: Vec<&'static [u8]> = vec![leak(a); 6];
+        let e = |s: &[u8]| permute_short(short_key(s, b'e').unwrap());
+        let (ka, kb) = (user_ident(a).0, user_ident(b).0);
+        assert_ne!(part_of(ka) & (P - 1), person as usize & (P - 1));
+        assert_ne!(part_of(kb) & (P - 1), person as usize & (P - 1));
+        let recs = [
+            event(e(b"e1"), b"", a, 10, 100, 1),
+            // Same event ID, later ingest, other alias: loses to the copy above.
+            event(e(b"e1"), b"", b, 20, 200, 2),
+            // Earliest copy is invalid (no payload): the later valid copy is dropped.
+            event(e(b"e2"), b"", b, 5, INVALID, 0),
+            event(e(b"e2"), b"", a, 9, 300, 3),
+            event(e(b"e3"), b"", b, 7, 400, 4),
+            // An unlinked user stays its own person.
+            event(e(b"e4"), b"", c, 7, 500, 5),
+        ];
+        let (live, declined) = run_pipeline(&recs, None, &links, &linked_names);
+        assert!(!declined);
+        assert_eq!(live, vec![
+            (a.to_vec(), 100, 1),
+            (a.to_vec(), 400, 4),
+            (c.to_vec(), 500, 5),
+        ]);
+    }
+
+    #[test]
+    fn clicks_resolve_linked_users_without_events_in_their_partition() {
+        let a: &[u8] = b"u0000001";
+        let c: &[u8] = b"u0000003";
+        let mut table = vec![(0u64, 0u64); 16];
+        let (key, check) = user_ident(a);
+        table[key as usize & 15] = (key, (u64::from(check) << 32) | crate::PERSON_SET | 3);
+        let shards = LinkShards::build(&table);
+        let part = part_of(key);
+        let tab = PartTab::new(shards.shard(part), 0);
+        let declined = AtomicBool::new(false);
+        assert_eq!(tab.find(key, check, &declined), Some(3));
+        let (ck, cc) = user_ident(c);
+        assert_eq!(tab.find(ck, cc, &declined), None);
+        assert!(!declined.load(Relaxed));
+        // A different check for a known key is a hash collision: decline.
+        assert_eq!(tab.find(key, check ^ 1, &declined), None);
+        assert!(declined.load(Relaxed));
+    }
+
+    #[test]
     fn long_user_ids_hash_disjoint_from_short_keys() {
         let long = b"u_0123456789abcdef0123456789abcdef";
         let (key, check) = user_ident(long);
@@ -1269,6 +1481,43 @@ mod tests {
         assert_eq!((short & SHORT_KEY, zero), (SHORT_KEY, 0));
     }
 
+    fn place(
+        people: &mut [People],
+        claims: &mut [Folds],
+        worker: usize,
+        key: u64,
+        eref: u64,
+        ingest: i32,
+        person: u32,
+        ts: u32,
+        price: u32,
+    ) {
+        let loc = if ts == INVALID {
+            NO_LOC
+        } else {
+            let part = person as usize & (P - 1);
+            let index = people[worker].len(part);
+            people[worker].push(part, EvP { person, ts: AtomicU32::new(ts), price });
+            ((worker as u32) << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
+        };
+        if eref == 0 {
+            // Short keys carry SHORT_KEY in production; route only that shard here.
+            claims[worker].short.push(0, Claim { key: key | SHORT_KEY, ingest, loc });
+        } else {
+            claims[worker].long.push(0, LongClaim { key, eref, ingest, loc });
+        }
+    }
+
+    fn live_rows(people: &[People], part: usize) -> Vec<(u32, u32)> {
+        people.iter().flat_map(|p| p.records(part).into_iter().flatten())
+            .filter_map(|r| r.live().map(|ts| (ts, r.price))).collect()
+    }
+
+    fn route_shard0(people: &[People], claims: &[Folds]) {
+        let moves: Vec<OnceLock<Vec<EvP>>> = Vec::new();
+        Router::new().route(&Placed { people, moves: &moves }, claims, 0);
+    }
+
     #[test]
     fn router_keeps_distinct_long_ids_with_equal_hash_keys() {
         let a: &'static [u8] = Box::leak(b"e_alpha_long_identifier".to_vec().into_boxed_slice());
@@ -1277,13 +1526,11 @@ mod tests {
         // verification the second event would be tombstoned as a duplicate.
         let key = 0x0123_4567_89ab_cdefu64 & (u64::MAX >> 1);
         let mut people = [People::new(32)];
-        let mut writer = PeopleWriter::new(&mut people[0]);
         let mut claims = vec![Folds::new()];
-        place_long(&mut writer, &mut claims, key, crate::pack_ref(a).unwrap(), 10, 3, 100, 1);
-        place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
-        writer.finish();
-        Router::new().route(&people, &claims, 0);
-        assert_eq!(live_rows(&people[0], 3), vec![(100, 1), (200, 2)]);
+        place(&mut people, &mut claims, 0, key, crate::pack_ref(a).unwrap(), 10, 3, 100, 1);
+        place(&mut people, &mut claims, 0, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
+        route_shard0(&people, &claims);
+        assert_eq!(live_rows(&people, 3), vec![(100, 1), (200, 2)]);
     }
 
     #[test]
@@ -1293,57 +1540,29 @@ mod tests {
         assert_ne!(a.as_ptr(), b.as_ptr());
         let key = crate::hs(a, EVENT_ID_SEED).0 & (u64::MAX >> 1);
         let mut people = [People::new(32)];
-        let mut writer = PeopleWriter::new(&mut people[0]);
         let mut claims = vec![Folds::new()];
-        place_long(&mut writer, &mut claims, key, crate::pack_ref(a).unwrap(), 30, 3, 300, 3);
-        place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 10, 3, 100, 1);
-        place_long(&mut writer, &mut claims, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
-        writer.finish();
-        Router::new().route(&people, &claims, 0);
-        assert_eq!(live_rows(&people[0], 3), vec![(100, 1)]);
+        place(&mut people, &mut claims, 0, key, crate::pack_ref(a).unwrap(), 30, 3, 300, 3);
+        place(&mut people, &mut claims, 0, key, crate::pack_ref(b).unwrap(), 10, 3, 100, 1);
+        place(&mut people, &mut claims, 0, key, crate::pack_ref(b).unwrap(), 20, 3, 200, 2);
+        route_shard0(&people, &claims);
+        assert_eq!(live_rows(&people, 3), vec![(100, 1)]);
     }
 
     #[test]
     fn router_keeps_earliest_invalid_and_changed_person_copies() {
-        fn place(
-            people: &mut PeopleWriter<'_>,
-            claims: &mut [Folds],
-            worker: u32,
-            key: u64,
-            ingest: i32,
-            person: u32,
-            ts: u32,
-            price: u32,
-        ) {
-            let loc = if ts == INVALID {
-                NO_LOC
-            } else {
-                let part = person as usize & (P - 1);
-                let index = people.push(part, person, ts, price);
-                (worker << LOC_WORKER_SHIFT) | ((part as u32) << LOC_PART_SHIFT) | index as u32
-            };
-            // Short keys carry SHORT_KEY in production; route only that shard here.
-            claims[worker as usize].short.push(0, Claim { key: key | SHORT_KEY, ingest, loc });
-        }
-
         let mut people = [People::new(32), People::new(1)];
-        let [first, second] = &mut people;
-        let mut first = PeopleWriter::new(first);
-        let mut second = PeopleWriter::new(second);
         let mut claims = vec![Folds::new(), Folds::new()];
-        // Exercise full lines, overflow, a partial final batch and a claim block boundary.
+        // Exercise overflow and a claim block boundary.
         for i in 0..300u64 {
-            place(&mut first, &mut claims, 0, i + 1, 20, 3, 10, 1);
+            place(&mut people, &mut claims, 0, i + 1, 0, 20, 3, 10, 1);
         }
-        place(&mut second, &mut claims, 1, 1, 10, 7, INVALID, 0);
-        place(&mut second, &mut claims, 1, 2, 10, 7, 5, 2);
-        place(&mut second, &mut claims, 1, 2, 30, 3, 20, 3);
-        place(&mut second, &mut claims, 1, 3, 20, 3, 10, 1);
-        first.finish();
-        second.finish();
+        place(&mut people, &mut claims, 1, 1, 0, 10, 7, INVALID, 0);
+        place(&mut people, &mut claims, 1, 2, 0, 5, 7, 5, 2);
+        place(&mut people, &mut claims, 1, 2, 0, 30, 3, 20, 3);
+        place(&mut people, &mut claims, 1, 3, 0, 20, 3, 10, 1);
         assert_eq!(people[0].len(3), 300);
         assert_eq!(people[1].len(7), 1);
-        Router::new().route(&people, &claims, 0);
+        route_shard0(&people, &claims);
         let live = |part| people.iter().flat_map(|p| p.records(part).into_iter().flatten())
             .filter_map(|r| r.live().map(|ts| (r.person, ts, r.price))).collect::<Vec<_>>();
         assert_eq!(live(3), vec![(3, 10, 1); 298]);

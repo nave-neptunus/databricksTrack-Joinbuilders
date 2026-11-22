@@ -1991,12 +1991,14 @@ fn fast(nova: bool) -> bool {
         return false;
     };
     let coll = AtomicBool::new(false);
-    let users = Users::new(&mut ltab, nids, pname.len());
+    // Stage 2 (nova): the link map split by hash(uid) into the event partitions.
+    let shards = nova.then(|| nova::LinkShards::build(&ltab.slots));
+    let users_table = (!nova).then(|| Users::new(&mut ltab, nids, pname.len()));
     lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
-    let parse_clicks = || {
+    let parse_clicks = |resolve: &nova::Resolve<'_>| {
         let cch = LazyChunks::new(&ckb, 4 << 20);
         let click_bytes: usize = ckb.iter().map(|b| b.len()).sum();
         let rows = nova::rows_per_slice(click_bytes / 40, rayon::current_num_threads());
@@ -2044,18 +2046,15 @@ fn fast(nova: bool) -> bool {
             scatter.finish();
         }
         lap("clicks scattered");
-        // Stub for stages 4-7: copies of a click are identical, so a duplicate can change
-        // neither the chosen click nor the set of assisting campaigns (no dedup needed).
-        // Route each record to its person's partition for the current session stage.
+        // Copies of a click are identical, so a duplicate can change neither the chosen click
+        // nor the set of assisting campaigns (no dedup needed). Resolve each record in its uid
+        // partition and route it to its person's partition for the session stage.
         let clicks = pt((0..PARTS).into_par_iter(), || Box::new(nova::Streams::<Click, P>::new()), |mut acc, part| {
             for scatter in &scatters {
                 for rows in scatter.records(part) {
-                    for (i, rec) in rows.iter().enumerate() {
-                        if let Some(ahead) = rows.get(i + 8) {
-                            users.prefetch(ahead.ukey);
-                        }
+                    for rec in rows {
                         // A user id not in the table has no valid event, so no session to credit.
-                        let Some(person) = users.find(rec.ukey, rec.uchk, &coll) else { continue };
+                        let Some(person) = resolve(part, rec.ukey, rec.uchk) else { continue };
                         acc.push(person as usize & (P - 1), Click { tag: rec.tag, person, ts: rec.ts });
                     }
                 }
@@ -2071,11 +2070,13 @@ fn fast(nova: bool) -> bool {
     let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs, caccs) = if nova {
         let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll, estimated_rows, parse_clicks) else {
+        let shards = shards.as_ref().unwrap();
+        let Some(result) = nova::run_events(&ech, ra, shards, &input, &pname, &coll, estimated_rows, parse_clicks) else {
             return false;
         };
         result
     } else {
+        let users = users_table.as_ref().unwrap();
         let shard_capacity = evb.iter().find(|b| b.len() >= 1 << 17).map_or(0, |b| {
             let sample = &b[1 << 16..1 << 17];
             let rows = memchr::memchr_iter(b'\n', sample).count();
@@ -2204,7 +2205,8 @@ fn fast(nova: bool) -> bool {
         }
         let paccs: Vec<_> = folds.into_par_iter().map(|fold| fold.people).collect();
         lap("events dedup + validate");
-        (linked_count, pname, paccs, parse_clicks())
+        let resolve = |_: usize, key: u64, check: u32| users.find(key, check, &coll);
+        (linked_count, pname, paccs, parse_clicks(&resolve))
     };
 
     if coll.load(Relaxed) {
