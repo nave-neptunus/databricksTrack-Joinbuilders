@@ -130,7 +130,8 @@ def main():
         raise SystemExit("request must name baseline, candidate, and one comparison SHA")
     for sha in TIMING:
         call(["git", "cat-file", "-e", f"{sha}^{{commit}}"])
-    cargo_test(CAND)
+    if not REQUEST.get('skip_test'):
+        cargo_test(CAND)
     binaries = {sha: build(sha) for sha in TIMING}
     fixture_gate(binaries[CAND])
     dev, _, _ = run(binaries[CAND], HOME / "v5-dev", "candidate-1m")
