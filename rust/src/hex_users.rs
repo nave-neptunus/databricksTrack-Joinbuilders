@@ -61,7 +61,9 @@ impl HexUsers {
         }
         let (high, low) = identity(bytes)?;
         let mask = self.entries.len() - 1;
-        let mixed = high.wrapping_mul(0xd6e8_feb8_6659_fd93) ^ low.rotate_left(29);
+        // Mix both halves before choosing a slot. Sequential low halves would
+        // otherwise share most home slots when the high half is constant.
+        let mixed = (high ^ low.rotate_left(29)).wrapping_mul(0xd6e8_feb8_6659_fd93);
         let start = (mixed ^ (mixed >> 32)) as usize & mask;
         for step in 0..self.entries.len() {
             let index = (start + step) & mask;
