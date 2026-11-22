@@ -2389,6 +2389,14 @@ impl PartitionState {
         } = self;
         let (mut event_start, mut click_start) = (0, 0);
         for (person, (&event_end, &click_end)) in event_ends.iter().zip(click_ends.iter()).enumerate() {
+            // The person's name entry (16 B at an 8 KiB stride) and then the
+            // name bytes in the mapped CSV are cache misses; fetch both early.
+            if let Some(entry) = pname.get((person + 16) * P + partition) {
+                prefetch_read((entry as *const &[u8]).cast());
+            }
+            if let Some(entry) = pname.get((person + 6) * P + partition) {
+                prefetch_read(entry.as_ptr());
+            }
             let events = &mut events[event_start..event_end];
             let clicks = &mut clicks[click_start..click_end];
             (event_start, click_start) = (event_end, click_end);
