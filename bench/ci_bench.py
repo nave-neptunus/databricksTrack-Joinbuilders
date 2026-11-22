@@ -21,6 +21,7 @@ REQUEST = json.loads((ROOT / "bench/request.json").read_text())
 BASE, CAND, TIMING, ROUNDS = (REQUEST[k] for k in ("baseline", "candidate", "timing", "rounds"))
 GATE_BASELINES = [BASE, *REQUEST.get("additional_gate_baselines", [])]
 NCPU = os.environ.get("NCPU", "8")
+RUNNER_VENDOR = os.environ.get("RUNNER_VENDOR", "unknown")
 WORK.mkdir(parents=True, exist_ok=True)
 GATE_FAILURES = []
 
@@ -172,7 +173,13 @@ def main():
     results = {size: time_size(binaries, size, int(ROUNDS[size])) for size in ("20m", "60m")}
     gate = "PASS" if not GATE_FAILURES else "FAIL — " + "; ".join(GATE_FAILURES)
     baselines = ", ".join(f"`{sha}`" for sha in GATE_BASELINES)
-    lines = ["# gum v5 Intel gate and timing", "", f"- gate baselines: {baselines}", f"- candidate: `{CAND}`", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
+    timing_note = " (indicative timing only)" if RUNNER_VENDOR == "amd" else ""
+    lines = [
+        "# gum v5 gate and timing", "",
+        f"- gate baselines: {baselines}", f"- candidate: `{CAND}`",
+        f"- runner vendor: {RUNNER_VENDOR}{timing_note}",
+        f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", "",
+    ]
     for size, rows in results.items():
         lines += [f"## {size} ({len(rows)} interleaved rounds)", "", "| round | order | " + " | ".join(s[:8] for s in TIMING) + " |", "|---:|---|" + "---:|" * len(TIMING)]
         for row in rows:
