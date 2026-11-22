@@ -1945,6 +1945,28 @@ fn fast(nova: bool) -> bool {
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
 
+    let evf = csv_files(&format!("{data}/events"));
+    let ckf = csv_files(&format!("{data}/clicks"));
+    let lkf = csv_files(&format!("{data}/links"));
+    // Mappings live for the whole run (the process exits right after), so the read-ahead
+    // threads can hold them.
+    let evm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&evf).into_boxed_slice());
+    let ckm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&ckf).into_boxed_slice());
+    let lkm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&lkf).into_boxed_slice());
+    let smf = [format!("{data}/products.csv"), format!("{data}/campaigns.csv")];
+    let smm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&smf).into_boxed_slice());
+    // Start the cold-cache read-ahead before anything else touches the inputs, in the order
+    // the phases consume them: products/campaigns, links, events, clicks.
+    let ra = {
+        let files: Vec<&'static str> = smf.iter().chain(lkf.iter()).chain(evf.iter()).chain(ckf.iter()).map(|f| &*Box::leak(f.clone().into_boxed_str())).collect();
+        let maps: Vec<(&'static memmap2::Mmap, &'static str)> = smm.iter().chain(lkm.iter()).chain(evm.iter()).chain(ckm.iter()).zip(files)
+            .filter_map(|(m, f)| m.as_ref().map(|m| (m, f))).collect();
+        let (maps, paths) = maps.into_iter().unzip();
+        ReadAhead::start(maps, paths)
+    };
+    if !event_sources_fit(evf.len()) {
+        return false;
+    }
     let man = std::fs::read_to_string(format!("{data}/manifest.json")).unwrap();
     let w0 = manifest_ts(&man, "\"window_start\"");
     let w1 = manifest_ts(&man, "\"window_end\"");
@@ -1955,33 +1977,13 @@ fn fast(nova: bool) -> bool {
     let day0 = w0.div_euclid(DAY);
     let ndays = ((w1 - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    let evf = csv_files(&format!("{data}/events"));
-    if !event_sources_fit(evf.len()) {
-        return false;
-    }
-    let ckf = csv_files(&format!("{data}/clicks"));
-    let lkf = csv_files(&format!("{data}/links"));
-    // Mappings live for the whole run (the process exits right after), so the read-ahead
-    // threads can hold them.
-    let evm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&evf).into_boxed_slice());
-    let ckm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&ckf).into_boxed_slice());
-    let lkm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&lkf).into_boxed_slice());
-    // Start the cold-cache read-ahead before anything else touches the inputs.
-    let ra = {
-        let files: Vec<&'static str> = lkf.iter().chain(evf.iter()).chain(ckf.iter()).map(|f| &*Box::leak(f.clone().into_boxed_str())).collect();
-        let maps: Vec<(&'static memmap2::Mmap, &'static str)> = lkm.iter().chain(evm.iter()).chain(ckm.iter()).zip(files)
-            .filter_map(|(m, f)| m.as_ref().map(|m| (m, f))).collect();
-        let (maps, paths) = maps.into_iter().unzip();
-        ReadAhead::start(maps, paths)
-    };
-    let smm = map_all(&[format!("{data}/products.csv"), format!("{data}/campaigns.csv")]);
     let evb = as_slices(evm);
     if evb.iter().any(|file| file.len() > u32::MAX as usize) {
         return false;
     }
     let ckb = as_slices(ckm);
     let lkb = as_slices(lkm);
-    let smb = as_slices(&smm);
+    let smb = as_slices(smm);
     lap("mapped files");
 
     // products / campaigns
