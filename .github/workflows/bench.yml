@@ -34,7 +34,7 @@ jobs:
       - name: Build baseline first
         run: |
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          git archive --format=tar ed40599 | docker build --platform linux/amd64 --load --tag g7-v5-baseline -
+          git archive --format=tar 6da0386b4ca6a001a5c7f747c68f40815fc14afb | docker build --platform linux/amd64 --load --tag g7-v5-baseline -
       - name: Baseline v5 fast-path report
         run: |
           mkdir -p "$HOME/v5-baseline/out" "$HOME/v5-baseline/scratch"
@@ -49,10 +49,7 @@ jobs:
       - name: Build valid candidates
         run: |
           for spec in \
-            s60-ev3a-lpt:c26ce00f384baad7461ec9232a3cf618c6c40344 \
-            s60-cx-reserve:d60f04e3f237d058288910dba29374ee86bd54e8 \
-            s60-uf-parent:285050fa5798b7c452f959160015174a32e2abe6 \
-            stack1:96572eb5bd532675e025554369d69f4266f03685
+            gum-agg:1f568fa2a27ff5cd1c19fc136b17e5ff4b3038c6
           do
             label=${spec%%:*}; sha=${spec#*:}
             git archive --format=tar "$sha" | docker build --platform linux/amd64 --load --tag "g7-v5-$label" -
@@ -61,14 +58,11 @@ jobs:
         run: |
           set -o pipefail
           for spec in \
-            s60-ev3a-lpt:c26ce00f384baad7461ec9232a3cf618c6c40344 \
-            s60-cx-reserve:d60f04e3f237d058288910dba29374ee86bd54e8 \
-            s60-uf-parent:285050fa5798b7c452f959160015174a32e2abe6 \
-            stack1:96572eb5bd532675e025554369d69f4266f03685
+            gum-agg:1f568fa2a27ff5cd1c19fc136b17e5ff4b3038c6
           do
             label=${spec%%:*}; sha=${spec#*:}
             work="$HOME/v5-$label"; mkdir -p "$work"
-            BASELINE_REF=ed40599 CANDIDATE_REF="$sha" CANDIDATE_LABEL="$sha" BASELINE_IMAGE=g7-v5-baseline CANDIDATE_IMAGE="g7-v5-$label" PAIRS=8 NCPU="$NCPU" python3 bench/ci_bench.py "$HOME/big60" "$work" 2>&1 | tee "$work.log"
+            BASELINE_REF=6da0386b4ca6a001a5c7f747c68f40815fc14afb CANDIDATE_REF="$sha" CANDIDATE_LABEL="$sha" BASELINE_IMAGE=g7-v5-baseline CANDIDATE_IMAGE="g7-v5-$label" PAIRS=8 NCPU="$NCPU" python3 bench/ci_bench.py "$HOME/big60" "$work" 2>&1 | tee "$work.log"
           done
       - if: always()
         run: |
