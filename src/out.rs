@@ -523,6 +523,7 @@ pub fn stage45(g: &mut G, outdir: &str) {
         ca_done.fetch_add(1, Ordering::AcqRel);
         let mut sc = crate::complex::PScratch::default();
         let mut kbuf = Vec::new();
+        let mut idle = 0u32;
         loop {
             if ca_done.load(Ordering::Acquire) == nt && sh_next.load(Ordering::Relaxed) < ns {
                 let i = sh_next.fetch_add(1, Ordering::Relaxed);
@@ -538,6 +539,7 @@ pub fn stage45(g: &mut G, outdir: &str) {
                         crate::sys::tl::TASK[63] = (crate::sys::tl::TASK[63].0.max(crate::sys::tl::now()), 0, 0);
                     }
                     sh_done.fetch_add(1, Ordering::AcqRel);
+                    idle = 0;
                     continue;
                 }
             }
@@ -561,11 +563,13 @@ pub fn stage45(g: &mut G, outdir: &str) {
                         unsafe {
                             crate::sys::tl::TASK[(16 + i).min(47)] = (t0, crate::sys::tl::now(), tid as u64);
                         }
+                        idle = 0;
                         continue;
                     }
                 }
                 if !shards_done {
-                    std::hint::spin_loop();
+                    idle = idle.wrapping_add(1);
+                    if idle & 255 == 0 { std::thread::yield_now(); } else { std::hint::spin_loop(); }
                     continue;
                 }
             }
