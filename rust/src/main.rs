@@ -2332,35 +2332,50 @@ impl PartitionState {
         event_ends.resize(people as usize, 0);
         click_ends.clear();
         click_ends.resize(people as usize, 0);
-        let event_rows = || event_folds.iter()
-            .flat_map(|fold| fold.records(partition))
-            .flatten()
-            .filter_map(EvP::session_input);
-        let click_rows = || click_folds.iter().flat_map(|fold| fold.chunks(partition)).flatten();
         // Count and capture the payload in one traversal of the EvP records.
-        // The old code walked those records twice (once to count, once to
-        // scatter), reloading each atomic timestamp on both passes.
+        // Plain nested loops (not flattened iterators) keep this tight.
+        let total: usize = event_folds.iter().map(|fold| fold.len(partition)).sum();
         gather.clear();
-        for (person, payload) in event_rows() {
-            let person = (person >> PB) as u32;
-            gather.push((person, payload));
-            event_ends[person as usize] += 1;
+        gather.reserve(total);
+        let base = gather.as_mut_ptr();
+        let mut n = 0;
+        for fold in event_folds {
+            for records in fold.records(partition) {
+                for record in records {
+                    let ts = record.ts.load(Relaxed);
+                    if ts == TOMBSTONE {
+                        continue;
+                    }
+                    let person = record.person >> PB;
+                    // n < total <= capacity: every record is visited once.
+                    unsafe { base.add(n).write((person, (u64::from(ts) << 32) | u64::from(record.price))) };
+                    n += 1;
+                    event_ends[person as usize] += 1;
+                }
+            }
         }
-        for click in click_rows() {
-            let person = (click.person >> PB) as usize;
-            if event_ends[person] != 0 {
-                click_ends[person] += 1;
+        unsafe { gather.set_len(n) };
+        for fold in click_folds {
+            for chunk in fold.chunks(partition) {
+                for click in chunk {
+                    let person = (click.person >> PB) as usize;
+                    click_ends[person] += usize::from(event_ends[person] != 0);
+                }
             }
         }
         // Retain the original event counts until the click scatter is done.
         // The prefix sums then become exclusive ends as records are placed.
         clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0 });
-        for &click in click_rows() {
-            let person = (click.person >> PB) as usize;
-            if event_ends[person] != 0 {
-                let next = &mut click_ends[person];
-                clicks[*next] = click;
-                *next += 1;
+        for fold in click_folds {
+            for chunk in fold.chunks(partition) {
+                for &click in chunk {
+                    let person = (click.person >> PB) as usize;
+                    if event_ends[person] != 0 {
+                        let next = &mut click_ends[person];
+                        clicks[*next] = click;
+                        *next += 1;
+                    }
+                }
             }
         }
         events.resize(prefix_starts(event_ends), 0);
