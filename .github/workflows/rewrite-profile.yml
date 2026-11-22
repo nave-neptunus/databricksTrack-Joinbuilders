@@ -1,0 +1,33 @@
+name: Profile the validated rewrite
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/gum-rewrite]
+    paths: [.github/workflows/rewrite-profile.yml, bench/profile_rewrite.sh]
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Build the validated candidate and one profiling corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          lscpu
+          mkdir -p bench-work/source bench-work/binaries
+          git archive 4d60ad81023876d8df9a0f8ade7f95bf3449d1d8 | tar -x -C bench-work/source
+          RUSTFLAGS='-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=1' cargo build --release --locked --features nova-shards-1024 --manifest-path bench-work/source/rust/Cargo.toml
+          cp bench-work/source/rust/target/release/rproto bench-work/binaries/combined1024
+          unzip -q bench/assets/generator.zip -d "$HOME/gum-v5-generator"
+          cargo build --release --locked --manifest-path "$HOME/gum-v5-generator/generator/Cargo.toml"
+          "$HOME/gum-v5-generator/generator/target/release/generate" --seed 17 --events 20000000 --clicks 5000000 --output "$HOME/v5-20m" --threads 8
+      - name: Collect CPU sample
+        run: bash bench/profile_rewrite.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rewrite-profile-${{ github.run_id }}
+          path: bench-work/logs/
+          retention-days: 7

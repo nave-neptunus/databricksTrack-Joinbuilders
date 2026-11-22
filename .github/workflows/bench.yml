@@ -3,6 +3,7 @@ name: gum rewrite gate and timing
 on:
   push:
     branches: [ci/gum-rewrite]
+    paths-ignore: [.github/workflows/rewrite-profile.yml, bench/profile_rewrite.sh]
   workflow_dispatch:
 
 jobs:

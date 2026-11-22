@@ -6,7 +6,11 @@ if ! timeout 180 sudo apt-get install -y -qq linux-tools-common linux-tools-gene
   echo 'Profiling tools unavailable' > bench-work/logs/profile.txt
   exit 0
 fi
-perf_binary=$(rg --files /usr/lib/linux-tools | rg '/perf$' | head -1)
+perf_binary=$(python3 - <<'PERF'
+from pathlib import Path
+print(next((str(path) for path in Path('/usr/lib/linux-tools').rglob('perf') if path.is_file()), ''))
+PERF
+)
 if test -z "$perf_binary"; then
   echo 'Profiling binary unavailable' > bench-work/logs/profile.txt
   exit 0
