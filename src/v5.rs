@@ -675,12 +675,49 @@ impl EventSlots {
     }
 }
 
+#[derive(Default)]
+struct ShortClaims {
+    seen: Vec<u64>,
+    repeated: Vec<u64>,
+}
+
+impl ShortClaims {
+    fn reset(&mut self, claims: usize) {
+        let words = (16 * claims).next_power_of_two().div_ceil(64);
+        self.seen.resize(words, 0);
+        self.repeated.resize(words, 0);
+        self.seen.fill(0);
+        self.repeated.fill(0);
+    }
+
+    #[inline]
+    fn bit(&self, key: u64) -> (usize, u64) {
+        ((key as usize >> 6) & (self.seen.len() - 1), 1 << (key & 63))
+    }
+
+    #[inline]
+    fn record(&mut self, key: u64) -> bool {
+        let (i, mask) = self.bit(key);
+        let collision = self.seen[i] & mask;
+        self.seen[i] |= mask;
+        self.repeated[i] |= collision;
+        collision != 0
+    }
+
+    #[inline]
+    fn needs_lookup(&self, key: u64) -> bool {
+        let (i, mask) = self.bit(key);
+        self.repeated[i] & mask != 0
+    }
+}
+
 fn dedup(g: &G, parsed: &[Parsed]) -> Names {
     let click_names: [Mutex<Option<Shard>>; SHARDS] = std::array::from_fn(|_| Mutex::new(None));
     let next = AtomicUsize::new(0);
     sys::run_par(g.nt, |tid| {
         let clicks = &mut g.t(tid).us;
         let mut short = EventSlots { slots: Vec::new() };
+        let mut filter = ShortClaims::default();
         let mut long_slots = Vec::<CopyLocation>::new();
         loop {
             let shard = next.fetch_add(1, Ordering::Relaxed);
@@ -694,20 +731,35 @@ fn dedup(g: &G, parsed: &[Parsed]) -> Names {
                 continue;
             }
             let total: usize = parsed.iter().map(|p| p.claims.0.count(shard)).sum();
-            short.reset(total);
+            filter.reset(total);
+            let mut collisions = 0usize;
+            for p in parsed {
+                p.claims.0.for_each(shard, |part| {
+                    for row in part {
+                        if row.w0 & ID_ODD == 0 {
+                            collisions += filter.record(row.w0) as usize;
+                        }
+                    }
+                });
+            }
+            // Every repeated bit has at least two claims. Two slots per
+            // additional claim bound the exact table size, even on collisions.
+            short.reset(2 * collisions);
             let mut long = Shard::with_capacity(total / 8);
             long_slots.clear();
             long_slots.reserve(total / 8);
             for p in parsed {
                 p.claims.0.for_each(shard, |part| {
                     for (i, row) in part.iter().enumerate() {
-                        if let Some(next) = part.get(i + 10) {
-                            short.prefetch(next.w0);
-                        }
-                        let copy = CopyLocation::unpack(row.w1);
                         if row.w0 & ID_ODD == 0 {
-                            short.copy(g, parsed, row.w0, copy);
+                            if filter.needs_lookup(row.w0) {
+                                if let Some(next) = part.get(i + 10) {
+                                    short.prefetch(next.w0);
+                                }
+                                short.copy(g, parsed, row.w0, CopyLocation::unpack(row.w1));
+                            }
                         } else {
+                            let copy = CopyLocation::unpack(row.w1);
                             let id = id_at(g, row.w0, 0);
                             let (index, is_new) = long.intern(id, id.hash());
                             if is_new {
