@@ -64,6 +64,7 @@ jobs:
           name: gum-perf-20m-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             bench-work/host.txt
+            bench-work/binaries.json
             bench-work/20m/
           retention-days: 7
 
@@ -90,5 +91,6 @@ jobs:
           name: gum-perf-60m-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             bench-work/host.txt
+            bench-work/binaries.json
             bench-work/60m/
           retention-days: 7

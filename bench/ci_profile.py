@@ -3,6 +3,7 @@
 import argparse
 import bisect
 from collections import Counter, defaultdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,14 +22,17 @@ EVENTS = (
 )
 LAP = re.compile(r"^\s*([0-9.]+) ms\s+(.+)$")
 SAMPLE = re.compile(
-    r"^\s*(\d+)\s+(\d+\.\d+):\s+(\d+)\s+[\da-f]+\s+(.*?)\s+\((.*?)\)(.*)$"
+    r"^\s*(\d+)\s+(\d+\.\d+):\s+(\d+)\s+[\da-f]+\s+(.*?)\s+\((\S+)\)(.*)$"
 )
 LOCATION = re.compile(r"([^\s]+:\d+)(?:\b|$)")
 
 
-def build(work):
-    target = work / "engine-target"
+def build(work, evidence):
+    digests = {}
     for sha in REQUEST["timing"]:
+        # Isolate Cargo fingerprints for same-name packages from separate git
+        # archives. Their checked-in mtimes can predate an existing build.
+        target = work / "engine-target" / sha
         source = work / "sources" / sha
         source.mkdir(parents=True, exist_ok=True)
         with subprocess.Popen(["git", "archive", sha, "rust"], cwd=ROOT,
@@ -44,7 +48,14 @@ def build(work):
         binary = work / "bin" / sha / "rproto"
         binary.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(target / "release/rproto", binary)
-    shutil.rmtree(target)
+        with binary.open("rb") as stream:
+            digests[sha] = hashlib.file_digest(stream, "sha256").hexdigest()
+        shutil.rmtree(target)
+    (evidence / "binaries.json").write_text(json.dumps(digests, indent=2) + "\n")
+    for sha, digest in digests.items():
+        print(f"{sha} binary SHA-256 {digest}", flush=True)
+    if len(set(digests.values())) != len(digests):
+        raise RuntimeError("The requested revisions produced identical profiling binaries")
 
 
 def drop_caches():
@@ -187,8 +198,15 @@ def summarize_samples(evidence, label, record, profile, event, detailed):
                     "locations": locations[key].most_common(3),
                     "stages": {s: counts[key] for s, counts in symbol_stages.items()
                                if counts[key]}})
+    event_stage = symbol_stages["events parsed"]
+    event_symbols = [
+        {"symbol": key[0], "dso": key[1], "percent": 100 * weight / event_stage.total(),
+         "period": weight, "locations": locations[key].most_common(3)}
+        for key, weight in event_stage.most_common(30)
+    ]
     result = {"event": event, "period_total": total, "by_stage_and_thread": windows,
-              "top_symbols": top}
+              "top_symbols": top, "event_parse_symbols": event_symbols,
+              "lap_clock_origin": origin, "lap_clock_boundaries": dict(zip(stages, bounds))}
     if not total:
         print(f"{label}: perf script had no parseable samples", flush=True)
     if detailed:
@@ -308,7 +326,7 @@ def main():
     parser.add_argument("evidence", type=Path)
     args = parser.parse_args()
     if args.action == "build":
-        build(args.work.resolve())
+        build(args.work.resolve(), args.evidence.resolve())
     else:
         evidence = args.evidence.resolve() / args.action
         evidence.mkdir(parents=True, exist_ok=True)
