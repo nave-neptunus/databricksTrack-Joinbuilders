@@ -731,7 +731,7 @@ struct Parser<'a, 'catalog, 'table> {
     ids: (u32, u32),
     batch: [Pending; 16],
     count: usize,
-    streams: Streams<Claim, SHARDS>,
+    streams: ClaimStream,
     people: PeopleWriter<'a>,
     worker: u32,
 }
@@ -869,7 +869,7 @@ fn events(
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
-) -> (Vec<Streams<Claim, SHARDS>>, Vec<People>) {
+) -> (Vec<ClaimStream>, Vec<People>) {
     let next = AtomicUsize::new(0);
     let workers = AtomicUsize::new(0);
     let rows_per_partition = estimated_rows.div_ceil(P * rayon::current_num_threads());
@@ -895,7 +895,7 @@ fn events(
                 ids: (0, 0),
                 batch: [Pending::EMPTY; 16],
                 count: 0,
-                streams: Streams::new(),
+                streams: ClaimStream::new(),
                 people: PeopleWriter::new(&mut people),
                 worker,
             };
@@ -925,7 +925,31 @@ fn events(
     (streams, people)
 }
 
-type ClaimStream = Streams<Claim, SHARDS>;
+struct ClaimStream {
+    records: Streams<Claim, SHARDS>,
+    counts: [usize; SHARDS],
+}
+
+impl ClaimStream {
+    fn new() -> Self {
+        Self { records: Streams::new(), counts: [0; SHARDS] }
+    }
+
+    #[inline]
+    fn push(&mut self, shard: usize, claim: Claim) {
+        self.counts[shard] += usize::from(claim.ingest != CARRIER);
+        self.records.push(shard, claim);
+    }
+
+    fn chunks(&self, shard: usize) -> impl Iterator<Item = &[Claim]> {
+        self.records.chunks(shard)
+    }
+
+    fn len(&self, shard: usize) -> usize {
+        // Full-ID carriers occupy stream space but never occupy a hash slot.
+        self.counts[shard]
+    }
+}
 
 // One 16-byte cell holds the full event key, the winning ingest time and the
 // location of the payload parse already wrote into its final person partition.
@@ -1136,6 +1160,36 @@ mod tests {
         people.records(part).into_iter().flatten()
             .filter_map(|r| r.live().map(|ts| (ts, r.price)))
             .collect()
+    }
+
+    #[test]
+    fn router_counts_claims_and_reads_carriers_across_blocks() {
+        let id = b"e_long_boundary_identifier";
+        let reference = crate::pack_ref(id).unwrap();
+        let key = crate::hs(id, EVENT_ID_SEED).0 & (SHORT_KEY - 1);
+        let mut claims = vec![ClaimStream::new()];
+        // Place the long claim in the last slot of the first physical block.
+        for short in 0..Streams::<Claim, SHARDS>::ROWS - 1 {
+            claims[0].push(0, Claim { key: SHORT_KEY | short as u64, ingest: 20, loc: NO_LOC });
+        }
+        claims[0].push(0, Claim { key, ingest: 30, loc: NO_LOC });
+        claims[0].push(0, Claim { key: reference, ingest: CARRIER, loc: 0 });
+        assert_eq!(claims[0].len(0), 256);
+        assert_eq!(claims[0].records.len(0), 257);
+        let mut router = Router::new();
+        router.table_percent = 200;
+        router.route(&[], &claims, 0);
+        assert_eq!(router.slots.len(), 512);
+
+        let mut other = ClaimStream::new();
+        other.push(0, Claim { key, ingest: 10, loc: NO_LOC });
+        other.push(0, Claim { key: reference, ingest: CARRIER, loc: 0 });
+        claims.push(other);
+        router.route(&[], &claims, 0);
+        let winner = router.slots.iter().find(|slot| {
+            slot.key == key && slot.meta >> META_GEN_SHIFT == router.generation
+        }).unwrap();
+        assert_eq!((winner.meta & META_INGEST_MASK) as i32 - INGEST_BIAS, 10);
     }
 
     #[test]
