@@ -93,7 +93,7 @@ struct LazyChunks<'a> {
 
 impl<'a> LazyChunks<'a> {
     fn new(bufs: &[&'a [u8]], target: usize) -> Self {
-        let mut raw = vec![];
+        let mut raw = Vec::with_capacity(bufs.iter().map(|b| b.len().div_ceil(target)).sum());
         for (f, b) in bufs.iter().enumerate() {
             let mut s = 0;
             while s < b.len() {
@@ -1995,12 +1995,12 @@ fn fast(nova: bool) -> bool {
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
     let parse_clicks = || {
-        let cch = LazyChunks::new(&ckb, 1 << 20);
+        let cch = LazyChunks::new(&ckb, 4 << 20);
         let parse_chunk = |mut acc: Box<nova::Streams<Click, P>>, ci| {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
             let mut dates = nova::Dates::default();
-            let mut batch = Vec::with_capacity(16);
+            let mut batch = Vec::with_capacity(64);
             let mut flush = |batch: &mut Vec<PendingClick>| {
                 for PendingClick { mut click, key, check } in batch.drain(..) {
                     // A user id not in the table has no valid event, so no session to credit.
@@ -2031,7 +2031,7 @@ fn fast(nova: bool) -> bool {
                 users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
                 batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
-                if batch.len() == 16 {
+                if batch.len() == 64 {
                     flush(&mut batch);
                 }
             });
