@@ -1,0 +1,19 @@
+{
+  "baseline": "5e262d2e7cbeb6ee80a875119d4e32eed10ac8de",
+  "candidate": "daa85dd7b27c9387dcb366b2244772ec77e6f01a",
+  "timing": [
+    "5e262d2e7cbeb6ee80a875119d4e32eed10ac8de",
+    "daa85dd7b27c9387dcb366b2244772ec77e6f01a"
+  ],
+  "rounds": {
+    "20m": 5,
+    "60m": 3
+  },
+  "cold": {
+    "rounds": {"20m": 3, "60m": 3},
+    "variants": [
+      {"label": "base", "sha": "5e262d2e7cbeb6ee80a875119d4e32eed10ac8de"},
+      {"label": "overlap", "sha": "daa85dd7b27c9387dcb366b2244772ec77e6f01a"}
+    ]
+  }
+}
