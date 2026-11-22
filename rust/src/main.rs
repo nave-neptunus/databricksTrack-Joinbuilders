@@ -1084,11 +1084,24 @@ impl<'a> Users<'a> {
     /// The person of a user id on a valid event copy, inserting an unlinked id.
     #[inline]
     fn person(&self, k: u64, c: u32, name: u64, block: &mut (u32, u32), coll: &AtomicBool) -> u32 {
-        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
         loop {
-            let mut kk = self.sl[2 * i].load(Acquire);
+            let kk = self.sl[2 * i].load(Relaxed);
+            if kk == k {
+                let mut v = self.sl[2 * i + 1].load(Acquire);
+                if v == 0 {
+                    while v == 0 {
+                        std::hint::spin_loop();
+                        v = self.sl[2 * i + 1].load(Acquire);
+                    }
+                }
+                if (v >> 32) as u32 != c {
+                    coll.store(true, Relaxed);
+                }
+                return (v as u32) & (PERSON_SET as u32 - 1);
+            }
             if kk == 0 {
                 match self.sl[2 * i].compare_exchange(0, k, AcqRel, Acquire) {
                     Ok(_) => {
@@ -1102,19 +1115,22 @@ impl<'a> Users<'a> {
                         self.sl[2 * i + 1].store(v, Release);
                         return id & (PERSON_SET as u32 - 1);
                     }
-                    Err(x) => kk = x,
+                    Err(x) => {
+                        if x == k {
+                            let mut v = self.sl[2 * i + 1].load(Acquire);
+                            if v == 0 {
+                                while v == 0 {
+                                    std::hint::spin_loop();
+                                    v = self.sl[2 * i + 1].load(Acquire);
+                                }
+                            }
+                            if (v >> 32) as u32 != c {
+                                coll.store(true, Relaxed);
+                            }
+                            return (v as u32) & (PERSON_SET as u32 - 1);
+                        }
+                    }
                 }
-            }
-            if kk == k {
-                let mut v = self.sl[2 * i + 1].load(Acquire);
-                while v == 0 {
-                    std::hint::spin_loop();
-                    v = self.sl[2 * i + 1].load(Acquire);
-                }
-                if (v >> 32) as u32 != c {
-                    coll.store(true, Relaxed);
-                }
-                return (v as u32) & (PERSON_SET as u32 - 1);
             }
             i = (i + 1) & self.mask;
         }
@@ -1128,9 +1144,6 @@ impl<'a> Users<'a> {
         let mut i = (k as usize) & self.mask;
         loop {
             let kk = self.sl[2 * i].load(Relaxed);
-            if kk == 0 {
-                return None;
-            }
             if kk == k {
                 let v = self.sl[2 * i + 1].load(Relaxed);
                 if (v >> 32) as u32 != c {
@@ -1138,6 +1151,9 @@ impl<'a> Users<'a> {
                     return None;
                 }
                 return Some((v as u32) & (PERSON_SET as u32 - 1));
+            }
+            if kk == 0 {
+                return None;
             }
             i = (i + 1) & self.mask;
         }
@@ -1533,6 +1549,7 @@ impl Click {
     }
 }
 
+#[derive(Clone, Copy)]
 struct PendingClick {
     click: Click,
     key: u64,
@@ -2000,11 +2017,13 @@ fn fast(nova: bool) -> bool {
             ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
             let mut dates = nova::Dates::default();
-            let mut batch = Vec::with_capacity(16);
-            let mut flush = |batch: &mut Vec<PendingClick>| {
-                for PendingClick { mut click, key, check } in batch.drain(..) {
+            let mut batch = [PendingClick { click: Click { tag: 0, person: 0, ts: 0 }, key: 0, check: 0 }; 16];
+            let mut count = 0;
+            let mut flush = |acc: &mut Box<nova::Streams<Click, P>>, batch: &[PendingClick], count: usize| {
+                for item in &batch[..count] {
                     // A user id not in the table has no valid event, so no session to credit.
-                    let Some(person) = users.find(key, check, &coll) else { continue };
+                    let Some(person) = users.find(item.key, item.check, &coll) else { continue };
+                    let mut click = item.click;
                     click.person = person;
                     acc.push(person as usize & (P - 1), click);
                 }
@@ -2030,12 +2049,14 @@ fn fast(nova: bool) -> bool {
                 };
                 users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
-                batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
-                if batch.len() == 16 {
-                    flush(&mut batch);
+                batch[count] = PendingClick { click: Click { tag, person: 0, ts }, key, check };
+                count += 1;
+                if count == 16 {
+                    flush(&mut acc, &batch, count);
+                    count = 0;
                 }
             });
-            flush(&mut batch);
+            flush(&mut acc, &batch, count);
             acc
         };
         let init = || Box::new(nova::Streams::new());
