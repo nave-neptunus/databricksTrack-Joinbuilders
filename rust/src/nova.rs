@@ -162,6 +162,16 @@ impl<T: Copy, const N: usize> Streams<T, N> {
         }
     }
 
+    /// Release slab pages before the process exits.  The caller owns the
+    /// stream and runs this on a Rayon worker after every consumer is done.
+    pub(super) fn release(mut self) {
+        for slab in &self.slabs {
+            let _ = slab.advise(memmap2::Advice::DontNeed);
+        }
+        self.slabs.clear();
+        self.blocks = std::array::from_fn(|_| Vec::new());
+    }
+
     #[cold]
     fn extend(&mut self, stream: usize) {
         let next = self.next;
