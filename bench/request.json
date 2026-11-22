@@ -4,14 +4,13 @@
     "6da0386b4ca6a001a5c7f747c68f40815fc14afb"
   ],
   "candidates": [
-    "c3d03873e4d81886e1996887c2d2bb0797e4b1fe",
-    "fb0a2a8e372c662460cc0cbb660670f0c3183ae4"
+    "b6ed8a5be435bcc642bf8bb5ae47f995d3c9cc44",
+    "f72f4e9586ddc84e839a87a866626cebd9574f1f"
   ],
   "timing": [
     "5a03a3ae7b65491b05c9dc09bcb6efbb098ee7ed",
-    "c3d03873e4d81886e1996887c2d2bb0797e4b1fe",
-    "fb0a2a8e372c662460cc0cbb660670f0c3183ae4",
-    "6da0386b4ca6a001a5c7f747c68f40815fc14afb"
+    "b6ed8a5be435bcc642bf8bb5ae47f995d3c9cc44",
+    "f72f4e9586ddc84e839a87a866626cebd9574f1f"
   ],
   "rounds": {
     "20m": 5,
