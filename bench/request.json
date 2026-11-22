@@ -1,0 +1,13 @@
+{
+  "baseline": "c3ecbd97207be0881c76ef87d01e594a61ab28be",
+  "candidate": "8b10c4b19d9dcd558387547d984b2936706c2c62",
+  "timing": [
+    "69c292df0f63fefaee724ac4034afce8df4ddf10",
+    "c3ecbd97207be0881c76ef87d01e594a61ab28be",
+    "8b10c4b19d9dcd558387547d984b2936706c2c62"
+  ],
+  "rounds": {
+    "20m": 5,
+    "60m": 3
+  }
+}
