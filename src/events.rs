@@ -1733,7 +1733,7 @@ unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize,
     r
 }
 
-fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
+fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share, order: &[usize]) {
     let t = g.t(tid);
     let mut fx = Fast::new(g.nc, g.nd, sh);
     unsafe {
@@ -1772,10 +1772,11 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
         let iota8q = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
         let iota16 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         loop {
-            let b = g.next.fetch_add(1, Ordering::Relaxed);
-            if b >= g.nb {
+            let i = g.next.fetch_add(1, Ordering::Relaxed);
+            if i >= order.len() {
                 break;
             }
+            let b = order[i];
             let ta = std::time::Instant::now();
             xp.ph(9);
             gen += 1;
@@ -2263,6 +2264,8 @@ pub fn stage3(g: &mut G) {
         let pool = Pool::new(gr);
         let pool0 = pool.next.load(Ordering::Relaxed);
         let shares = shares(gr, &pool, old);
+        let mut order: Vec<usize> = (0..gr.nb).collect();
+        order.sort_unstable_by_key(|&b| std::cmp::Reverse((0..gr.nt).map(|t| gr.t(t).ev.count(b)).sum::<usize>()));
         run_par(gr.nt, |tid| {
             if tid == gr.nt - 1 {
                 crate::links::uf_tail(gr);
@@ -2270,7 +2273,7 @@ pub fn stage3(g: &mut G) {
             if old {
                 stage3a_old(gr, tid)
             } else {
-                stage3a(gr, tid, &pool, &shares[tid])
+                stage3a(gr, tid, &pool, &shares[tid], &order)
             }
         });
         if XR {
