@@ -2,6 +2,8 @@ name: v5 hex-key timing
 
 on:
   workflow_dispatch:
+  push:
+    branches: [gum-hexkey2]
 
 permissions:
   contents: read
