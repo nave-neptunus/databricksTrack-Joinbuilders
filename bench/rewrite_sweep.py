@@ -46,6 +46,25 @@ for size, corpus in [('1m', 'v5-dev'), ('20m', 'v5-20m'), ('60m', 'v5-60m')]:
         bench.parquet_equal(output, reference, f'{label} {size}')
         shutil.rmtree(output)
     shutil.rmtree(reference)
+# Verify a seed outside the timed corpus and the legacy engine entry point.
+heldout = bench.HOME / 'v5-heldout'
+bench.call([str(bench.HOME / 'gum-v5-generator/generator/target/release/generate'), '--seed', '23', '--events', '1000000', '--clicks', '250000', '--output', str(heldout), '--threads', bench.NCPU])
+reference, _, _ = bench.run(binaries['control'], heldout, 'heldout-control')
+for label, binary in binaries.items():
+    if label == 'control':
+        continue
+    output, _, _ = bench.run(binary, heldout, f'heldout-{label}')
+    bench.parquet_equal(output, reference, f'{label} heldout seed 23')
+    shutil.rmtree(output)
+os.environ['NOVA'] = '0'
+try:
+    output, _, _ = bench.run(binaries['combined2048'], heldout, 'heldout-legacy-entry')
+    bench.parquet_equal(output, reference, 'combined2048 legacy entry')
+    shutil.rmtree(output)
+finally:
+    os.environ.pop('NOVA')
+shutil.rmtree(reference)
+
 if bench.GATE_FAILURES:
     raise SystemExit('gate failed: ' + '; '.join(bench.GATE_FAILURES))
 
