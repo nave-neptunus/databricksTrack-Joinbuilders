@@ -1343,8 +1343,9 @@ mod tests {
                         }
                     }
                     input.push(b'\n');
+                    let end = input.len();
                     for position in [23, 70, 100, 120] {
-                        let mut corrupt = input[start..].to_vec();
+                        let mut corrupt = input[start..end].to_vec();
                         let at = position.min(corrupt.len() - 2);
                         corrupt[at] = b'"';
                         input.extend(corrupt);
@@ -1353,6 +1354,11 @@ mod tests {
             }
         }
         input.extend_from_slice(b"too,short,\"\"\n\n");
-        assert_eq!(fused_event_rows_for_test(&input), scalar_event_rows(&input));
+        let actual = fused_event_rows_for_test(&input);
+        let expected = scalar_event_rows(&input);
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(actual.len(), expected.len());
     }
 }
