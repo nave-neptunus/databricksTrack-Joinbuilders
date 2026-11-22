@@ -137,8 +137,8 @@ def stages(rows, sha):
 
 
 def main():
-    if len(set(TIMING)) != 3 or BASE not in TIMING or CAND not in TIMING:
-        raise SystemExit("request must name baseline, candidate, and one comparison SHA")
+    if len(set(TIMING)) < 2 or BASE not in TIMING or CAND not in TIMING:
+        raise SystemExit("request must name baseline and candidate")
     if len(GATE_BASELINES) != len(set(GATE_BASELINES)) or CAND in GATE_BASELINES or not set(GATE_BASELINES) <= set(TIMING):
         raise SystemExit("gate baselines must be distinct, non-candidate SHAs listed in timing")
     for sha in TIMING:
