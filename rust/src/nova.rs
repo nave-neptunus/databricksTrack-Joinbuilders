@@ -345,6 +345,7 @@ struct Pending {
 }
 
 const PERSON_CACHE_SIZE: usize = 1024;
+const PENDING_BATCH_SIZE: usize = 32;
 
 #[derive(Clone, Copy, Default)]
 struct CachedPerson {
@@ -700,7 +701,9 @@ struct Parser<'a, 'catalog, 'table> {
     dates: Dates,
     ids: (u32, u32),
     person_cache: [CachedPerson; PERSON_CACHE_SIZE],
-    batch: [Pending; 16],
+    batches: [[Pending; PENDING_BATCH_SIZE]; 2],
+    active_batch: usize,
+    previous_ready: bool,
     count: usize,
     streams: Streams<Claim, SHARDS>,
     people: PeopleWriter<'a>,
@@ -713,8 +716,8 @@ impl Parser<'_, '_, '_> {
     }
 
     #[inline]
-    fn flush(&mut self) {
-        for pending in &self.batch[..self.count] {
+    fn flush(&mut self, batch: usize, count: usize) {
+        for pending in &self.batches[batch][..count] {
             let loc = if pending.ts != INVALID {
                 let person = if pending.name == 0 {
                     // Cache hits carry the resolved person in place of the UID.
@@ -748,7 +751,13 @@ impl Parser<'_, '_, '_> {
                 Claim { key: pending.key, ingest: pending.ingest, loc },
             );
         }
-        self.count = 0;
+    }
+
+    fn finish_pending(&mut self) {
+        if self.previous_ready {
+            self.flush(self.active_batch ^ 1, PENDING_BATCH_SIZE);
+        }
+        self.flush(self.active_batch, self.count);
     }
 }
 
@@ -820,10 +829,16 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
             }
             pending.ts = relative as u32;
         }
-        self.batch[self.count] = pending;
+        self.batches[self.active_batch][self.count] = pending;
         self.count += 1;
-        if self.count == self.batch.len() {
-            self.flush();
+        if self.count == PENDING_BATCH_SIZE {
+            // Resolve the previous batch after a full batch of intervening scans.
+            if self.previous_ready {
+                self.flush(self.active_batch ^ 1, PENDING_BATCH_SIZE);
+            }
+            self.previous_ready = true;
+            self.active_batch ^= 1;
+            self.count = 0;
         }
     }
 }
@@ -861,7 +876,9 @@ fn events(
                 dates: Dates::default(),
                 ids: (0, 0),
                 person_cache: [CachedPerson::default(); PERSON_CACHE_SIZE],
-                batch: [Pending::EMPTY; 16],
+                batches: [[Pending::EMPTY; PENDING_BATCH_SIZE]; 2],
+                active_batch: 0,
+                previous_ready: false,
                 count: 0,
                 streams: Streams::new(),
                 people: PeopleWriter::new(&mut people),
@@ -875,7 +892,7 @@ fn events(
                 read_ahead.wait(work.raw(index));
                 parser.parse_chunk(work.get(index));
             }
-            parser.flush();
+            parser.finish_pending();
             parser.people.finish();
             parser.streams
         };
