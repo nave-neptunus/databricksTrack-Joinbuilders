@@ -1589,6 +1589,7 @@ struct LinkEnd {
 }
 
 #[derive(Default)]
+#[repr(C)]
 struct LinkName {
     reference: std::sync::atomic::AtomicU64,
     prefix: std::sync::atomic::AtomicU64,
@@ -1646,6 +1647,13 @@ fn link_slot(
         i = (i + 1) & mask;
     }
     LinkSlot::Spill
+}
+
+/// `n` zeroed AtomicU32s from calloc'd (lazily faulted) memory; leaked, the process exits.
+fn zeroed_atomics(n: usize) -> &'static [AtomicU32] {
+    let v = std::mem::ManuallyDrop::new(vec![0u32; n]);
+    // AtomicU32 has the size, alignment and bit validity of u32.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU32, v.len()) }
 }
 
 #[inline]
@@ -1741,7 +1749,15 @@ fn build_links(
         node_start += bucket.iter().map(|batch| batch.len() as u32).sum::<u32>();
         start
     }).collect();
-    let names: Vec<_> = (0..nend).map(|_| LinkName::default()).collect();
+    // Zeroed (lazily faulted) storage: the range workers touch the pages in parallel
+    // instead of one thread initializing every name up front.
+    let names: &[LinkName] = {
+        let v: Vec<[u64; 2]> = vec![[0; 2]; nend as usize];
+        let v = std::mem::ManuallyDrop::new(v);
+        // LinkName is repr(C) { AtomicU64, AtomicU64 }: same size and alignment as [u64; 2],
+        // and all-zero is its default. The process exits without freeing it.
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const LinkName, v.len()) }
+    };
     let range_mask = range_len - 1;
     let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).zip(&mut buckets)
         .enumerate().map(|(shard, (slots, bucket))| {
@@ -1751,7 +1767,7 @@ fn build_links(
                 for (end_id, e) in batch.iter_mut().enumerate() {
                     let node = starts[shard] + nodes.len() as u32;
                     let i = e.key as usize & range_mask;
-                    match link_slot(slots, i, usize::MAX, *e, node, &names, &collision) {
+                    match link_slot(slots, i, usize::MAX, *e, node, names, &collision) {
                         LinkSlot::Inserted(local) => {
                             nodes.push(((shard * range_len + local) as u32, node));
                             e.key = u64::from(node);
@@ -1771,7 +1787,7 @@ fn build_links(
             let e = &mut bucket[batch_id][end_id];
             let node = next[shard];
             let i = e.key as usize & table.mask;
-            match link_slot(&mut table.slots, i, table.mask, *e, node, &names, &collision) {
+            match link_slot(&mut table.slots, i, table.mask, *e, node, names, &collision) {
                 LinkSlot::Inserted(slot) => {
                     ranges[slot >> shift].0.push((slot as u32, node));
                     next[shard] += 1;
@@ -1795,7 +1811,7 @@ fn build_links(
         }
     }
 
-    let parent: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
+    let parent = zeroed_atomics(nend as usize);
     batches.into_par_iter().zip(sizes).for_each(|(batch, size)| {
         let mut ends = vec![0u32; size as usize];
         for lane in &batch {
@@ -1848,7 +1864,7 @@ fn build_links(
         npersons += roots.len() as u32;
         start
     }).collect();
-    let person: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
+    let person = zeroed_atomics(nend as usize);
     let name_groups: Vec<Vec<_>> = roots.par_iter().zip(offsets).map(|(roots, start)| {
         roots.iter().enumerate().map(|(i, &r)| {
             person[r as usize].store(start + i as u32, Relaxed);
