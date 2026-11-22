@@ -237,6 +237,15 @@ struct Scan<'a> {
     base: usize,
     n_ev: u64,
     n_ck: u64,
+    tsc_ev: u64,
+    tsc_ck: u64,
+}
+
+static LAP_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[inline(always)]
+fn tsc() -> u64 {
+    unsafe { std::arch::x86_64::_rdtsc() }
 }
 
 #[derive(Clone, Copy)]
@@ -472,6 +481,7 @@ impl EventSink for Scan<'_> {
     }
 
     fn ev_flush(&mut self) {
+        let t_start = tsc();
         let n = std::mem::take(&mut self.ev.n);
         self.n_ev += n as u64;
         const LOOKAHEAD: usize = 12;
@@ -484,6 +494,7 @@ impl EventSink for Scan<'_> {
             }
             self.event_row(self.ev.row(i));
         }
+        self.tsc_ev += tsc() - t_start;
     }
 }
 
@@ -493,6 +504,7 @@ impl ClickSink for Scan<'_> {
     }
 
     fn ck_flush(&mut self) {
+        let t_start = tsc();
         let n = std::mem::take(&mut self.ck.n);
         self.n_ck += n as u64;
         const LOOKAHEAD: usize = 12;
@@ -505,6 +517,7 @@ impl ClickSink for Scan<'_> {
             }
             self.click_row(self.ck.row(i));
         }
+        self.tsc_ck += tsc() - t_start;
     }
 }
 
@@ -561,7 +574,10 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena) -> Vec<Parsed> {
             base: 0,
             n_ev: 0,
             n_ck: 0,
+            tsc_ev: 0,
+            tsc_ck: 0,
         };
+        let (wall0, tsc0) = (std::time::Instant::now(), tsc());
         while let Some(chunk) = g.queue.get(next.fetch_add(1, Ordering::Relaxed)) {
             let f = &g.files[chunk.file as usize];
             if f.kind == Kind::Lk {
@@ -582,7 +598,14 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena) -> Vec<Parsed> {
         }
         t.n_ev_rows = s.n_ev;
         t.n_ck_rows = s.n_ck;
+        let loop_us = wall0.elapsed().as_secs_f64() * 1e6;
+        let per_tsc = loop_us / (tsc() - tsc0).max(1) as f64;
+        LAP_US[0].fetch_add(loop_us as u64, Ordering::Relaxed);
+        LAP_US[1].fetch_add((s.tsc_ev as f64 * per_tsc) as u64, Ordering::Relaxed);
+        LAP_US[2].fetch_add((s.tsc_ck as f64 * per_tsc) as u64, Ordering::Relaxed);
+        let fin0 = std::time::Instant::now();
         s.claims.finish();
+        LAP_US[3].fetch_add(fin0.elapsed().as_micros() as u64, Ordering::Relaxed);
         *workers[tid].lock().unwrap() = Some(Parsed {
             claims: FinishedClaims(s.claims),
             people: s.people,
@@ -880,6 +903,11 @@ pub fn stage1(g: &mut G) {
         sys::Arena::new(g.ecap as usize * 16 + g.nt * (EVENT_SHARDS * parse::CHUNK + (2 << 20)));
     let parsed = scan(g, &users, &claim_arena);
     sys::lap("scan_ids");
+    unsafe {
+        for (i, name) in ["x.thr_loop", "x.resolve_ev", "x.resolve_ck", "x.claims_finish"].into_iter().enumerate() {
+            sys::LAPS.push((name, LAP_US[i].load(Ordering::Relaxed) as f64 / 1e3 / g.nt as f64));
+        }
+    }
     let clicks = dedup(g, &parsed);
     sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
     sys::lap("dedup_ids");
