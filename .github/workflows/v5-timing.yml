@@ -1,0 +1,61 @@
+name: v5 hex-key timing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Require Intel
+        run: grep -qm1 GenuineIntel /proc/cpuinfo || { echo 'refusing AMD/non-Intel runner' >&2; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { toolchain: stable }
+      - name: Build baseline, candidate, and v5 generator
+        run: |
+          cargo build --manifest-path rust/Cargo.toml --release --locked
+          cp rust/target/release/rproto "$RUNNER_TEMP/candidate"
+          git worktree add --detach "$RUNNER_TEMP/base" 6da0386b4ca6a001a5c7f747c68f40815fc14afb
+          cargo build --manifest-path "$RUNNER_TEMP/base/rust/Cargo.toml" --release --locked
+          cp "$RUNNER_TEMP/base/rust/target/release/rproto" "$RUNNER_TEMP/baseline"
+          cargo build --manifest-path generator/Cargo.toml --release --locked
+      - name: Generate v5 timing corpora
+        run: |
+          generator/target/release/generate --seed 17 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/v5-20m"
+          generator/target/release/generate --seed 19 --events 60000000 --clicks 15000000 --output "$RUNNER_TEMP/v5-60m"
+      - name: ABAB pairs with stage laps
+        run: |
+          run_one() {
+            corpus=$1 label=$2 binary=$3 trial=$4
+            output="$RUNNER_TEMP/out-$label-$trial"
+            mkdir "$output"
+            start=$(date +%s%N)
+            TIMING=1 NCPU=8 DATA_DIR="$corpus" OUTPUT_DIR="$output" SCRATCH_DIR="$RUNNER_TEMP/scratch-$label-$trial" "$binary" 2>"$RUNNER_TEMP/$label-$trial.log"
+            end=$(date +%s%N)
+            awk -v a="$start" -v b="$end" -v l="$label" -v t="$trial" 'BEGIN { printf "WALL label=%s trial=%s seconds=%.6f\n", l, t, (b-a)/1000000000 }'
+            sed "s/^/LAP label=$label trial=$trial /" "$RUNNER_TEMP/$label-$trial.log"
+          }
+          for pair in 1 2 3 4 5; do
+            if [ $((pair % 2)) -eq 1 ]; then
+              run_one "$RUNNER_TEMP/v5-20m" baseline "$RUNNER_TEMP/baseline" "20m-$pair"
+              run_one "$RUNNER_TEMP/v5-20m" candidate "$RUNNER_TEMP/candidate" "20m-$pair"
+            else
+              run_one "$RUNNER_TEMP/v5-20m" candidate "$RUNNER_TEMP/candidate" "20m-$pair"
+              run_one "$RUNNER_TEMP/v5-20m" baseline "$RUNNER_TEMP/baseline" "20m-$pair"
+            fi
+          done
+          for pair in 1 2 3; do
+            if [ $((pair % 2)) -eq 1 ]; then
+              run_one "$RUNNER_TEMP/v5-60m" baseline "$RUNNER_TEMP/baseline" "60m-$pair"
+              run_one "$RUNNER_TEMP/v5-60m" candidate "$RUNNER_TEMP/candidate" "60m-$pair"
+            else
+              run_one "$RUNNER_TEMP/v5-60m" candidate "$RUNNER_TEMP/candidate" "60m-$pair"
+              run_one "$RUNNER_TEMP/v5-60m" baseline "$RUNNER_TEMP/baseline" "60m-$pair"
+            fi
+          done
