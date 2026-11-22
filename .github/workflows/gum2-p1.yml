@@ -47,6 +47,13 @@ jobs:
       - name: Build generator
         run: cargo build --release --locked --manifest-path generator/Cargo.toml
 
+      - name: Start memory log
+        shell: bash
+        run: |
+          mkdir -p p1-results
+          nproc; free -m
+          nohup bash -c 'while true; do echo "$(date +%T) $(free -m | awk "/Mem/{print \$3\" used / \"\$2\" MB\"}")"; sleep 5; done' > p1-results/mem.log 2>&1 &
+
       - name: Dataset 20M (seed 3), compare, time
         shell: bash
         run: |
@@ -54,6 +61,14 @@ jobs:
           generator/target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output "$HOME/d20" --threads "$NCPU"
           python3 .github/workflows/gum2-p1-bench.py "$HOME/d20" 20M "$HOME/bins" "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/p1-results"
           rm -rf "$HOME/d20"
+
+      - name: Upload 20M table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gum2-p1-table-20M-${{ github.run_id }}
+          path: p1-results/table-20M.md
+          if-no-files-found: ignore
 
       - name: Dataset 60M (seed 17), compare, time
         shell: bash
