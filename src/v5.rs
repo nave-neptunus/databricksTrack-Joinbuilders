@@ -319,7 +319,8 @@ impl CopyLocation {
 
 struct PersonEvent {
     w0: AtomicU64,
-    user: u32,
+    // The raw absolute user key until resolve_people, then the person index.
+    key: AtomicU64,
 }
 
 const PERSON_BLOCK_SHIFT: u32 = 9;
@@ -393,8 +394,7 @@ impl PersonEvents {
     }
 
     #[inline]
-    fn push(&mut self, arena: &sys::Arena, worker: u32, event: PersonEvent) -> u32 {
-        let bucket = event.user as usize >> UB;
+    fn push(&mut self, arena: &sys::Arena, worker: u32, bucket: usize, event: PersonEvent) -> u32 {
         if self.tails[bucket].len as usize == PERSON_BLOCK_ROWS {
             let block = self.blocks.len() as u32;
             if block >= (1 << (PERSON_WORKER_SHIFT - PERSON_BLOCK_SHIFT)) {
@@ -517,7 +517,8 @@ impl Scan<'_> {
             && r.ingest.wrapping_sub(r.ts) <= DAY_MS;
         let mut loc = NO_PAYLOAD;
         if valid {
-            let user = self.person(r.uid);
+            let key = self.absolute_id(r.uid);
+            let bucket = ids::shard(id_at(g, r.uid, self.base).hash());
             let cat = if r.price == 0 {
                 0
             } else {
@@ -527,9 +528,10 @@ impl Scan<'_> {
             loc = self.people.push(
                 self.people_arena,
                 self.worker,
+                bucket,
                 PersonEvent {
                     w0: AtomicU64::new(w0),
-                    user,
+                    key: AtomicU64::new(key),
                 },
             );
         }
@@ -583,14 +585,7 @@ impl EventSink for Scan<'_> {
         let t_start = tsc();
         let n = std::mem::take(&mut self.ev.n);
         self.n_ev += n as u64;
-        const LOOKAHEAD: usize = 12;
-        for &id in &self.ev.uid[..n.min(LOOKAHEAD)] {
-            self.users.prefetch(self.g, self.base, id);
-        }
         for i in 0..n {
-            if i + LOOKAHEAD < n {
-                self.users.prefetch(self.g, self.base, self.ev.uid[i + LOOKAHEAD]);
-            }
             self.event_row(self.ev.row(i));
         }
         self.tsc_ev += tsc() - t_start;
@@ -665,7 +660,7 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena, people_arena: &sys::Arena) -> 
             user_keys: [0; USER_CACHE],
             user_values: [0; USER_CACHE],
             claims: parse::Part::new(arena, EVENT_SHARDS),
-            people: PersonEvents::new(g.nub),
+            people: PersonEvents::new(SHARDS),
             people_arena,
             sink: ids::LongSink::new(),
             worker: tid as u32,
@@ -730,7 +725,8 @@ fn choose(winner: &mut CopyLocation, copy: CopyLocation, parsed: &[Parsed]) {
         if copy.ingest == winner.ingest && winner.loc != copy.loc {
             let same = match (event_at(parsed, winner.loc), event_at(parsed, copy.loc)) {
                 (Some(a), Some(b)) => {
-                    a.w0.load(Ordering::Relaxed) == b.w0.load(Ordering::Relaxed) && a.user == b.user
+                    a.w0.load(Ordering::Relaxed) == b.w0.load(Ordering::Relaxed)
+                        && a.key.load(Ordering::Relaxed) == b.key.load(Ordering::Relaxed)
                 }
                 (None, None) => true,
                 _ => false,
@@ -946,14 +942,85 @@ fn dedup_clicks(g: &G, parsed: &[Parsed], stripe: usize, clicks: &mut parse::Par
 
 // Express consumes contiguous runs in event-slot order. Assign those slots
 // after dedup so opaque event IDs and shuffled input cannot split a person.
-fn order_events(g: &G, parsed: &[Parsed]) {
+// Resolves every person row one hash partition at a time, so each pass only
+// touches that stripe of the user tables.
+fn resolve_people(g: &G, users: &Users, parsed: &[Parsed]) {
+    let next = AtomicUsize::new(0);
+    sys::run_par(g.nt, |_| {
+        let mut sink = ids::LongSink::new();
+        loop {
+            let stripe = next.fetch_add(1, Ordering::Relaxed);
+            if stripe >= SHARDS {
+                break;
+            }
+            for p in parsed {
+                for rows in p.people.bucket(stripe) {
+                    for (i, row) in rows.iter().enumerate() {
+                        if let Some(ahead) = rows.get(i + 8) {
+                            users.prefetch(g, 0, ahead.key.load(Ordering::Relaxed));
+                        }
+                        let id = id_at(g, row.key.load(Ordering::Relaxed), 0);
+                        let user = users.person(id, id.hash(), &mut sink);
+                        if user as u64 >= g.ucap {
+                            sys::fallback("IDs exceed user capacity");
+                        }
+                        row.key.store(user as u64, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn order_events(g: &G, parsed: &[Parsed], scatter_arena: &sys::Arena) {
+    // Regroup the surviving resolved rows by user bucket.
+    let t_scatter = std::time::Instant::now();
+    let slots: Vec<Mutex<Option<PersonEvents>>> = (0..g.nt).map(|_| Mutex::new(None)).collect();
+    let next_p = AtomicUsize::new(0);
+    sys::run_par(g.nt, |tid| {
+        let mut out = PersonEvents::new(g.nub);
+        loop {
+            let stripe = next_p.fetch_add(1, Ordering::Relaxed);
+            if stripe >= SHARDS {
+                break;
+            }
+            for p in parsed {
+                for rows in p.people.bucket(stripe) {
+                    for row in rows {
+                        let w0 = row.w0.load(Ordering::Relaxed);
+                        if w0 == u64::MAX {
+                            continue;
+                        }
+                        let user = row.key.load(Ordering::Relaxed);
+                        out.push(
+                            scatter_arena,
+                            tid as u32,
+                            (user >> UB) as usize,
+                            PersonEvent {
+                                w0: AtomicU64::new(w0),
+                                key: AtomicU64::new(user),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        out.finish();
+        *slots[tid].lock().unwrap() = Some(out);
+    });
+    let groups: Vec<PersonEvents> = slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+    unsafe { sys::LAPS.push(("x.order_scatter", t_scatter.elapsed().as_secs_f64() * 1e3)) };
+    order_grouped(g, &groups);
+}
+
+fn order_grouped(g: &G, parsed: &[PersonEvents]) {
     let t_off = std::time::Instant::now();
     let mut offsets = Vec::with_capacity(g.nub + 1);
     offsets.push(0usize);
     for bucket in 0..g.nub {
         let count: usize = parsed
             .iter()
-            .flat_map(|p| p.people.bucket(bucket))
+            .flat_map(|p| p.bucket(bucket))
             .map(<[PersonEvent]>::len)
             .sum();
         offsets.push(offsets[bucket] + count);
@@ -976,11 +1043,11 @@ fn order_events(g: &G, parsed: &[Parsed]) {
                 break;
             }
             for p in parsed {
-                rows.extend(p.people.bucket(bucket).flatten().filter_map(|row| {
+                rows.extend(p.bucket(bucket).flatten().filter_map(|row| {
                     let w0 = row.w0.load(Ordering::Relaxed);
                     (w0 != u64::MAX).then_some(Rec {
                         w0,
-                        w1: row.user as u64,
+                        w1: row.key.load(Ordering::Relaxed),
                     })
                 }));
             }
@@ -1035,6 +1102,8 @@ pub fn stage1(g: &mut G) {
         let flt = std::fs::read_to_string("/proc/self/stat").ok().and_then(|t| t.rsplit(')').next().and_then(|r| r.split_whitespace().nth(7).map(str::to_owned))).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
         sys::LAPS.push(("x.minflt_k", flt / 1e3));
     }
+    resolve_people(g, &users, &parsed);
+    sys::lap("resolve_people");
     let clicks = dedup(g, &parsed);
     sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
     sys::lap("dedup_ids");
@@ -1043,9 +1112,15 @@ pub fn stage1(g: &mut G) {
             sys::LAPS.push((name, LAP_US[i].load(Ordering::Relaxed) as f64 / 1e3 / g.nt as f64));
         }
     }
-    order_events(g, &parsed);
+    let scatter_arena = sys::Arena::new(
+        g.ecap as usize * std::mem::size_of::<PersonEvent>()
+            + g.nt * g.nub * PERSON_BLOCK_ROWS * std::mem::size_of::<PersonEvent>()
+            + (2 << 20),
+    );
+    order_events(g, &parsed, &scatter_arena);
     sys::lap("order_events");
     sys::run_par(g.nt, |tid| people_arena.release_part(tid, g.nt));
+    sys::run_par(g.nt, |tid| scatter_arena.release_part(tid, g.nt));
     g.ids = Some(Dictionaries {
         users: users.into_names(),
         clicks,
