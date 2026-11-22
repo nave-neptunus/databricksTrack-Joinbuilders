@@ -1,8 +1,8 @@
-name: gum v5 Intel gate and timing
+name: gum rewrite gate and timing
 
 on:
   push:
-    branches: [ci/gum]
+    branches: [ci/gum-rewrite]
   workflow_dispatch:
 
 jobs:

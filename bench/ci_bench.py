@@ -161,7 +161,7 @@ def main():
     results = {size: time_size(binaries, size, int(ROUNDS[size])) for size in ("20m", "60m")}
     gate = "PASS" if not GATE_FAILURES else "FAIL — " + "; ".join(GATE_FAILURES)
     baselines = ", ".join(f"`{sha}`" for sha in GATE_BASELINES)
-    lines = ["# gum v5 Intel gate and timing", "", f"- gate baselines: {baselines}", f"- candidate: `{CAND}`", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
+    lines = ["# gum v5 gate and timing", f"Host vendor {os.environ.get('RUNNER_VENDOR', 'unknown')}, logical CPUs {os.environ.get('RUNNER_VCPUS', 'unknown')}", "", f"- gate baselines: {baselines}", f"- candidate: `{CAND}`", f"- NCPU: `{NCPU}`; x86-64-v3; TIMING=1", f"- gate: {gate}", ""]
     for size, rows in results.items():
         lines += [f"## {size} ({len(rows)} interleaved rounds)", "", "| round | order | " + " | ".join(s[:8] for s in TIMING) + " |", "|---:|---|" + "---:|" * len(TIMING)]
         for row in rows:
