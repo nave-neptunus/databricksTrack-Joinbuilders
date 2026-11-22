@@ -76,8 +76,8 @@ jobs:
           rm -rf "$work/perf-output" "$work/perf-scratch"
           mkdir -p "$work/perf-output"
           # The binary runs on the host because the normal hardened container drops perf capabilities.
-          DATA_DIR="$HOME/v5-60m" OUTPUT_DIR="$work/perf-output" SCRATCH_DIR="$work/perf-scratch" NCPU="$NCPU" TIMING=1 GLIBC_TUNABLES=glibc.malloc.hugetlb=1 perf record -g --call-graph dwarf --output "$work/perf.data" -- "$HOME/g7-profile-rproto" 2>"$work/perf.stderr"
-          perf report --stdio --no-children --sort symbol --percent-limit 0 --input "$work/perf.data" >"$work/perf-report.txt"
+          DATA_DIR="$HOME/v5-60m" OUTPUT_DIR="$work/perf-output" SCRATCH_DIR="$work/perf-scratch" NCPU="$NCPU" TIMING=1 GLIBC_TUNABLES=glibc.malloc.hugetlb=1 sudo perf record -g --call-graph dwarf --output "$work/perf.data" -- "$HOME/g7-profile-rproto" 2>"$work/perf.stderr"
+          sudo perf report --stdio --no-children --sort symbol --percent-limit 0 --input "$work/perf.data" >"$work/perf-report.txt"
           test -s "$work/perf-report.txt"
       - name: Publish profile evidence
         if: always()
