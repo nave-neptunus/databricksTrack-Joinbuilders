@@ -3,6 +3,14 @@ name = "rproto"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Nova's claim streams and dedup routers share this compile-time count. Larger
+# values keep each router table closer to cache at the cost of more stream
+# metadata and shorter per-shard work.
+nova-shards-512 = []
+nova-shards-1024 = []
+nova-shards-2048 = []
+
 [dependencies]
 ahash = "0.8.12"
 arrow-array = "60.1.0"

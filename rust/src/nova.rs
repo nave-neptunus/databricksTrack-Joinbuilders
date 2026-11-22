@@ -6,7 +6,40 @@ use rayon::prelude::*;
 use std::mem::{MaybeUninit, size_of};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
+#[cfg(any(
+    all(feature = "nova-shards-512", feature = "nova-shards-1024"),
+    all(feature = "nova-shards-512", feature = "nova-shards-2048"),
+    all(feature = "nova-shards-1024", feature = "nova-shards-2048"),
+))]
+compile_error!("select at most one Nova shard-count feature");
+
+#[cfg(feature = "nova-shards-2048")]
+const SHARDS: usize = 2048;
+#[cfg(all(not(feature = "nova-shards-2048"), feature = "nova-shards-1024"))]
+const SHARDS: usize = 1024;
+#[cfg(all(
+    not(feature = "nova-shards-2048"),
+    not(feature = "nova-shards-1024"),
+    feature = "nova-shards-512",
+))]
+const SHARDS: usize = 512;
+#[cfg(not(any(
+    feature = "nova-shards-512",
+    feature = "nova-shards-1024",
+    feature = "nova-shards-2048",
+)))]
 const SHARDS: usize = 256;
+
+const SHARD_BITS: u32 = SHARDS.ilog2();
+const SHARD_SHIFT: u32 = 63 - SHARD_BITS;
+const _: () = assert!(SHARDS.is_power_of_two());
+
+#[inline]
+fn claim_shard(key: u64) -> usize {
+    // The high bit marks reversible short IDs, rather than contributing hash
+    // entropy. Keep excluding it as the power-of-two stream count grows.
+    ((key >> SHARD_SHIFT) as usize) & (SHARDS - 1)
+}
 const BLOCK_BYTES: usize = 4096;
 const SLAB_BYTES: usize = 16 << 20;
 const SHORT_KEY: u64 = 1 << 63;
@@ -729,7 +762,7 @@ impl Parser<'_, '_, '_> {
                 // they have no payload to keep or tombstone.
                 NO_LOC
             };
-            let shard = (pending.key >> 55) as u8 as usize;
+            let shard = claim_shard(pending.key);
             self.streams.push(shard, Claim { key: pending.key, ingest: pending.ingest, loc });
             if pending.eref != 0 {
                 // The carrier is next in this very stream, so dedup can pair it
@@ -1068,6 +1101,19 @@ pub(super) fn run_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_shard_tracks_the_selected_power_of_two_count() {
+        assert!(SHARDS.is_power_of_two());
+        assert_eq!(claim_shard(0), 0);
+        assert_eq!(claim_shard((SHARDS as u64 - 1) << SHARD_SHIFT), SHARDS - 1);
+        // The packed short-ID marker must not change routing.
+        assert_eq!(claim_shard(SHORT_KEY), 0);
+        assert_eq!(
+            claim_shard(SHORT_KEY | ((SHARDS as u64 - 1) << SHARD_SHIFT)),
+            SHARDS - 1,
+        );
+    }
 
     fn place_long(
         people: &mut PeopleWriter<'_>,
