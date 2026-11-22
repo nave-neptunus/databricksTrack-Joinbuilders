@@ -239,9 +239,12 @@ struct Scan<'a> {
     n_ck: u64,
     tsc_ev: u64,
     tsc_ck: u64,
+    tsc_person: u64,
+    tsc_push: u64,
+    tsc_claim: u64,
 }
 
-static LAP_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static LAP_US: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 #[inline(always)]
 fn tsc() -> u64 {
@@ -419,7 +422,10 @@ impl Scan<'_> {
             && r.ingest.wrapping_sub(r.ts) <= DAY_MS;
         let mut loc = NO_PAYLOAD;
         if valid {
+            let t0 = tsc();
             let user = self.person(r.uid);
+            let t1 = tsc();
+            self.tsc_person += t1 - t0;
             let cat = if r.price == 0 {
                 0
             } else {
@@ -433,6 +439,7 @@ impl Scan<'_> {
                     user,
                 },
             );
+            self.tsc_push += tsc() - t1;
         }
         let (id, hash) = if r.eid & ID_ODD == 0 {
             let key = ids::event_key(r.eid);
@@ -444,7 +451,9 @@ impl Scan<'_> {
             ingest: (ingest / 1000) as u32,
             loc,
         };
+        let t2 = tsc();
         self.claims.push(event_shard(hash), id, copy.pack());
+        self.tsc_claim += tsc() - t2;
     }
 
     #[inline]
@@ -576,6 +585,9 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena) -> Vec<Parsed> {
             n_ck: 0,
             tsc_ev: 0,
             tsc_ck: 0,
+            tsc_person: 0,
+            tsc_push: 0,
+            tsc_claim: 0,
         };
         let (wall0, tsc0) = (std::time::Instant::now(), tsc());
         while let Some(chunk) = g.queue.get(next.fetch_add(1, Ordering::Relaxed)) {
@@ -605,6 +617,9 @@ fn scan(g: &G, users: &Users, arena: &sys::Arena) -> Vec<Parsed> {
         LAP_US[2].fetch_add((s.tsc_ck as f64 * per_tsc) as u64, Ordering::Relaxed);
         let fin0 = std::time::Instant::now();
         s.claims.finish();
+        LAP_US[4].fetch_add((s.tsc_person as f64 * per_tsc) as u64, Ordering::Relaxed);
+        LAP_US[5].fetch_add((s.tsc_push as f64 * per_tsc) as u64, Ordering::Relaxed);
+        LAP_US[6].fetch_add((s.tsc_claim as f64 * per_tsc) as u64, Ordering::Relaxed);
         LAP_US[3].fetch_add(fin0.elapsed().as_micros() as u64, Ordering::Relaxed);
         *workers[tid].lock().unwrap() = Some(Parsed {
             claims: FinishedClaims(s.claims),
@@ -904,9 +919,11 @@ pub fn stage1(g: &mut G) {
     let parsed = scan(g, &users, &claim_arena);
     sys::lap("scan_ids");
     unsafe {
-        for (i, name) in ["x.thr_loop", "x.resolve_ev", "x.resolve_ck", "x.claims_finish"].into_iter().enumerate() {
+        for (i, name) in ["x.thr_loop", "x.resolve_ev", "x.resolve_ck", "x.claims_finish", "x.ev_person", "x.ev_ppush", "x.ev_claim"].into_iter().enumerate() {
             sys::LAPS.push((name, LAP_US[i].load(Ordering::Relaxed) as f64 / 1e3 / g.nt as f64));
         }
+        let flt = std::fs::read_to_string("/proc/self/stat").ok().and_then(|t| t.rsplit(')').next().and_then(|r| r.split_whitespace().nth(7).map(str::to_owned))).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        sys::LAPS.push(("x.minflt_k", flt / 1e3));
     }
     let clicks = dedup(g, &parsed);
     sys::run_par(g.nt, |tid| claim_arena.release_part(tid, g.nt));
