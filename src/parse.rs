@@ -2112,6 +2112,7 @@ pub fn stage1(g: &G, tid: usize) {
     let inq = d.st2q;
     let mut us_open = true;
     let mut sc = crate::links::Scratch::default();
+    let (mut rel_file, mut rel_a, mut rel_b, mut rel_n) = (usize::MAX, 0usize, 0usize, 0usize);
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 1);
     #[cfg(feature = "tl")]
@@ -2173,10 +2174,21 @@ pub fn stage1(g: &G, tid: usize) {
             let a = (f.off + s + 4095) & !4095;
             let b = (f.off + e) & !4095;
             if b > a {
-                unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
+                if rel_file != c.file as usize || rel_b != a {
+                    if rel_n != 0 { unsafe { madvise(g.region.add(rel_a) as *mut u8, rel_b - rel_a, MADV_DONTNEED) }; }
+                    rel_file = c.file as usize; rel_a = a; rel_n = 0;
+                }
+                rel_n += 1;
+                rel_b = b;
+                if rel_n == 4 || e == f.len {
+                    unsafe { madvise(g.region.add(rel_a) as *mut u8, b - rel_a, MADV_DONTNEED) };
+                    rel_a = b;
+                    rel_n = 0;
+                }
             }
         }
     }
+    if unsafe { RELEASE } && rel_n != 0 { unsafe { madvise(g.region.add(rel_a) as *mut u8, rel_b - rel_a, MADV_DONTNEED) }; }
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 4);
     t.ev.finish();
