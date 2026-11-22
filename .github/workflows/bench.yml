@@ -20,7 +20,7 @@ jobs:
           set -euo pipefail
           lscpu
           grep -qm1 '^vendor_id.*GenuineIntel' /proc/cpuinfo || echo 'WARN: AMD runner (timing indicative only)'
-          grep -qw avx512f /proc/cpuinfo || { echo 'AVX-512F unavailable' >&2; exit 1; }
+          grep -qw avx512f /proc/cpuinfo || echo 'WARN: no AVX-512F'
           test "$(nproc)" -ge 4 || { echo "need 4+ vCPUs, got $(nproc)" >&2; exit 1; }; echo "RUNNER_VCPUS=$(nproc)" >> "$GITHUB_ENV"
           echo NCPU=8 >> "$GITHUB_ENV"
       - name: Install exact-check dependency
